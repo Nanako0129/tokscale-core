@@ -2042,12 +2042,15 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
     let single_dbs = [
         &scan_result.synthetic_db,
         &scan_result.kilo_db,
-        &scan_result.hermes_db,
         &scan_result.goose_db,
-        &scan_result.zed_db,
         &scan_result.kiro_db,
     ];
     dbs.extend(single_dbs.into_iter().flatten().cloned());
+    // Hermes/Zed dbs may also be discovered via user-provided extra scan
+    // roots (the `files` lanes) — use the plural helpers so every db gets
+    // its `-wal` sidecar probed, not just the default-path single.
+    dbs.extend(scan_result.hermes_db_paths());
+    dbs.extend(scan_result.zed_db_paths());
     dbs.extend(scan_result.crush_dbs.iter().map(|c| c.db_path.clone()));
     for db in dbs {
         latest = latest.max(file_mtime_ms(&db).unwrap_or(0));
@@ -2067,10 +2070,16 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
 
 /// Drop file-backed session logs older than `threshold_ms` (unix ms, mtime)
 /// from a scan. Database-backed sources are left untouched: SQLite WAL writes
-/// may not update the main db file's mtime, so they are always parsed. Any
-/// stat failure keeps the file — over-parsing is safe, silently skipping is not.
+/// may not update the main db file's mtime, so they are always parsed. The
+/// Hermes/Zed `files` lanes hold SQLite dbs discovered from user scan roots
+/// (see `hermes_db_paths`/`zed_db_paths`), so they are exempt too. Any stat
+/// failure keeps the file — over-parsing is safe, silently skipping is not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
-    for files in scan_result.files.iter_mut() {
+    let db_lanes = [ClientId::Hermes as usize, ClientId::Zed as usize];
+    for (lane, files) in scan_result.files.iter_mut().enumerate() {
+        if db_lanes.contains(&lane) {
+            continue;
+        }
         files.retain(|path| {
             let Ok(meta) = std::fs::metadata(path) else {
                 return true;
@@ -5957,6 +5966,55 @@ mod tests {
         assert_eq!(parsed_with_settings.messages[0].model_id, "claude-sonnet-4");
         assert_eq!(parsed_with_settings.messages[0].input, 100);
         assert_eq!(parsed_with_settings.messages[0].output, 25);
+    }
+
+    #[test]
+    fn test_modified_after_never_prunes_hermes_dbs_from_extra_scan_paths() {
+        // SQLite WAL writes may leave the main db file's mtime untouched, so
+        // `modified_after` must not prune Hermes/Zed dbs even when they come
+        // from user scan roots (the `files` lanes) rather than the default
+        // single-db path. A threshold in the future would prune any mtime.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &conn,
+            "hermes-wal-session",
+            "claude-sonnet-4",
+            1,
+            50,
+            10,
+            0.03,
+        );
+        drop(conn);
+
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_dir]);
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+            modified_after: Some(future_ms),
+        })
+        .unwrap();
+
+        assert_eq!(parsed.counts.get(ClientId::Hermes), 1);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].session_id, "hermes-wal-session");
     }
 
     #[test]
