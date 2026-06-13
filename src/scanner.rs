@@ -385,9 +385,65 @@ pub fn built_in_extra_scan_paths_for(
                 .into_iter()
                 .map(|path| (ClientId::Claude, path)),
         );
+        paths.extend(
+            discover_cowork_project_roots(Path::new(home_dir))
+                .into_iter()
+                .map(|path| (ClientId::Claude, path)),
+        );
     }
 
     paths
+}
+
+/// Claude desktop "Cowork" (local-agent-mode) writes standard Claude Code
+/// transcripts under a fresh per-session directory:
+///
+/// ```text
+/// ~/Library/Application Support/Claude/local-agent-mode-sessions/
+///   <workspace>/<sub>/local_<uuid>/.claude/projects/<encoded>/*.jsonl
+///   <workspace>/<sub>/local_<uuid>/audit.jsonl   # event log — NOT scanned
+/// ```
+///
+/// Each session gets its own `local_<uuid>/.claude/projects`, so a single
+/// static path can't cover future sessions — we recurse to discover every
+/// `.claude/projects` root under the sessions tree. We deliberately return the
+/// `projects` directories (not the sessions root) so the sibling `audit.jsonl`
+/// is never picked up: it mirrors the same assistant `usage` records and would
+/// double-count every Cowork message. macOS-only in practice; on other
+/// platforms the root simply doesn't exist and an empty vec is returned.
+fn discover_cowork_project_roots(home_dir: &Path) -> Vec<PathBuf> {
+    let root = home_dir
+        .join("Library")
+        .join("Application Support")
+        .join("Claude")
+        .join("local-agent-mode-sessions");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::new();
+    let mut it = WalkDir::new(&root).into_iter();
+    while let Some(entry) = it.next() {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let is_projects = entry.file_name().to_str() == Some("projects")
+            && entry
+                .path()
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some(".claude");
+        if is_projects {
+            roots.push(entry.path().to_path_buf());
+            // The transcript subtree is scanned later via this root; no need to
+            // descend into it during discovery.
+            it.skip_current_dir();
+        }
+    }
+    roots.sort_unstable();
+    roots
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2929,5 +2985,84 @@ mod tests {
         // No assertion on result.get(ClientId::Claude) — the outside dir might
         // not match the expected file patterns. The test goal is only liveness:
         // the scan must not panic when an extra path escapes $HOME.
+    }
+
+    /// Build a Claude "Cowork" (local-agent-mode) session tree under `home`
+    /// and return the per-session `.claude/projects` root. Each session also
+    /// gets an `audit.jsonl` sibling, which mirrors the same assistant `usage`
+    /// records and must never be scanned (it would double-count).
+    fn setup_mock_cowork_session(home: &Path, session_uuid: &str) -> PathBuf {
+        let session = home
+            .join("Library/Application Support/Claude/local-agent-mode-sessions")
+            .join("workspace-1")
+            .join("sub-1")
+            .join(format!("local_{session_uuid}"));
+        let projects = session.join(".claude/projects");
+        let encoded = projects.join("-Users-someone-outputs");
+        fs::create_dir_all(&encoded).unwrap();
+        File::create(encoded.join(format!("{session_uuid}.jsonl"))).unwrap();
+
+        // Sub-agent transcript nested under the same projects root.
+        let subagents = encoded.join("00000000-0000-0000-0000-000000000000/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        File::create(subagents.join("agent-1.jsonl")).unwrap();
+
+        // Event/audit log — sibling of `.claude`, NOT under `projects`.
+        File::create(session.join("audit.jsonl")).unwrap();
+
+        projects
+    }
+
+    #[test]
+    fn test_discover_cowork_project_roots_excludes_audit_log() {
+        let home = TempDir::new().unwrap();
+        let projects_a = setup_mock_cowork_session(home.path(), "aaaa");
+        let projects_b = setup_mock_cowork_session(home.path(), "bbbb");
+
+        let roots = discover_cowork_project_roots(home.path());
+
+        // Exactly the two per-session `.claude/projects` roots, nothing else —
+        // crucially not the sessions root (which would sweep in audit.jsonl).
+        assert_eq!(roots, vec![projects_a, projects_b]);
+        assert!(
+            roots.iter().all(|root| root.ends_with(".claude/projects")),
+            "discovery must return projects roots, not the sessions tree: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_cowork_project_roots_absent_when_no_sessions() {
+        let home = TempDir::new().unwrap();
+        assert!(discover_cowork_project_roots(home.path()).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_counts_cowork_transcripts_not_audit_log() {
+        let home = TempDir::new().unwrap();
+        setup_mock_cowork_session(home.path(), "aaaa"); // transcript + subagent + audit
+        setup_mock_cowork_session(home.path(), "bbbb"); // transcript + subagent + audit
+
+        // use_env_roots = false keeps the scan hermetic (no $HOME / env dirs);
+        // built-in extra Claude roots (incl. Cowork) are still discovered.
+        let result = scan_all_clients_with_env_strategy(
+            home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+
+        let claude_files = result.get(ClientId::Claude);
+        // 2 transcripts + 2 sub-agent transcripts = 4; the 2 audit.jsonl files
+        // must be excluded or every Cowork message would be counted twice.
+        assert_eq!(
+            claude_files.len(),
+            4,
+            "expected 4 Cowork transcripts, got: {claude_files:?}"
+        );
+        assert!(
+            claude_files
+                .iter()
+                .all(|path| path.file_name().and_then(|n| n.to_str()) != Some("audit.jsonl")),
+            "audit.jsonl must never be scanned: {claude_files:?}"
+        );
     }
 }
