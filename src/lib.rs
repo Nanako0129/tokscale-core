@@ -510,7 +510,10 @@ fn parse_all_messages_with_pricing(
     )
 }
 
-// TODO: remaining callers: parse_local_unified_messages_resolved (FFI/external, intentional Vec); parse_all_messages_with_pricing (dead_code wrapper). All report consumers have migrated to scan_messages_streaming.
+// All report consumers (graph/model/monthly/hourly/agents) now fold over
+// scan_messages_streaming. The materialized path below survives only behind the
+// public `parse_local_unified_messages` (no in-repo callers — see its footgun
+// doc) and the dead_code `parse_all_messages_with_pricing` wrapper.
 fn parse_all_messages_with_pricing_with_env_strategy(
     home_dir: &str,
     clients: &[String],
@@ -1681,6 +1684,141 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
     Ok(MonthlyReport {
         entries,
         total_cost,
+        processing_time_ms: start.elapsed().as_millis() as u32,
+    })
+}
+
+#[derive(Debug, Default, Clone)]
+struct AgentAccumulator {
+    clients: std::collections::BTreeSet<String>,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+    cost: f64,
+    messages: i32,
+}
+
+impl AgentAccumulator {
+    // Plain `+=` (not saturating_add) folds tokens EXACTLY like the model
+    // report's `aggregate_model_usage_entries`; the per-client parity those two
+    // reports must hold depends on identical arithmetic. `message_count.max(0)`
+    // matches the model/monthly aggregators (not the sessionizer's `.max(1)`).
+    fn add(&mut self, msg: &UnifiedMessage) {
+        self.clients.insert(msg.client.clone());
+        self.input += msg.tokens.input;
+        self.output += msg.tokens.output;
+        self.cache_read += msg.tokens.cache_read;
+        self.cache_write += msg.tokens.cache_write;
+        self.reasoning += msg.tokens.reasoning;
+        self.cost += msg.cost;
+        self.messages += msg.message_count.max(0);
+    }
+}
+
+/// Agent bucket key for a message: the normalized sub-agent name, or "Main"
+/// when the message carries no agent attribution. Mirrors the old FFI
+/// `agents_report.rs` bucketing so the report stays byte-stable across the
+/// streaming migration.
+fn agent_bucket_key(msg: &UnifiedMessage) -> String {
+    match msg.agent.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => sessions::normalize_agent_name(raw),
+        _ => "Main".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentReportEntry {
+    pub agent: String,
+    pub clients: Vec<String>,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub cost: f64,
+    pub messages: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentReport {
+    pub entries: Vec<AgentReportEntry>,
+    pub total_cost: f64,
+    pub total_messages: i32,
+    pub processing_time_ms: u32,
+}
+
+/// Per-sub-agent usage breakdown, ranked by cost then total tokens, with
+/// unattributed messages folded into a single "Main" bucket.
+///
+/// Folds the SAME deduped, per-client-gated, priced message stream that the
+/// model/graph/hourly/monthly reports consume (`scan_messages_streaming`), so
+/// the agents report now agrees with them on copilot/codebuff/kimi/cursor/warp
+/// /amp/droid/etc. totals (issue #6 — previously the agents report alone rode
+/// the materialized path and skipped per-client cross-file dedup). Mirrors
+/// `get_monthly_report`'s fold-in-sink shape.
+pub async fn get_agents_report(options: ReportOptions) -> Result<AgentReport, String> {
+    let start = Instant::now();
+
+    let home_dir = get_home_dir_string(&options.home_dir)?;
+    let clients = resolve_report_clients(&options);
+
+    let pricing = load_pricing_for_local_parse().await;
+    let year_prefix = options.year.as_ref().map(|y| format!("{}-", y));
+    let since_s = options.since.clone();
+    let until_s = options.until.clone();
+    let msg_filter = |m: &UnifiedMessage| -> bool {
+        if let Some(ref yp) = year_prefix { if !m.date.starts_with(yp.as_str()) { return false; } }
+        if let Some(ref s) = since_s { if m.date.as_str() < s.as_str() { return false; } }
+        if let Some(ref u) = until_s { if m.date.as_str() > u.as_str() { return false; } }
+        true
+    };
+
+    let mut by_agent: HashMap<String, AgentAccumulator> = HashMap::new();
+
+    scan_messages_streaming(
+        &home_dir, &clients, pricing.as_deref(), options.use_env_roots, &options.scanner_settings,
+        &msg_filter,
+        &mut |msg: &UnifiedMessage| {
+            by_agent.entry(agent_bucket_key(msg)).or_default().add(msg);
+        },
+    );
+
+    let mut entries: Vec<AgentReportEntry> = by_agent
+        .into_iter()
+        .map(|(agent, agg)| AgentReportEntry {
+            agent,
+            clients: agg.clients.into_iter().collect(),
+            input: agg.input,
+            output: agg.output,
+            cache_read: agg.cache_read,
+            cache_write: agg.cache_write,
+            reasoning: agg.reasoning,
+            cost: agg.cost,
+            messages: agg.messages,
+        })
+        .collect();
+
+    // Cost desc, then total-tokens desc — matches the old FFI agents report
+    // ordering. This token-total formula MUST stay identical to the `total`
+    // computed in the FFI mapper (crates/tb_core_ffi/src/agents_report.rs).
+    entries.sort_by(|a, b| {
+        let a_total = a.input + a.output + a.cache_read + a.cache_write + a.reasoning;
+        let b_total = b.input + b.output + b.cache_read + b.cache_write + b.reasoning;
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b_total.cmp(&a_total))
+    });
+
+    let total_cost: f64 = entries.iter().map(|e| e.cost).sum();
+    let total_messages: i32 = entries.iter().map(|e| e.messages).sum();
+
+    Ok(AgentReport {
+        entries,
+        total_cost,
+        total_messages,
         processing_time_ms: start.elapsed().as_millis() as u32,
     })
 }
@@ -3005,6 +3143,16 @@ pub async fn parse_local_unified_messages_with_pricing(
     parse_local_unified_messages_resolved(options, &home_dir, &clients, pricing)
 }
 
+/// Parse the local unified message stream into a fully materialized `Vec`.
+///
+/// **Footgun:** this rides the old materialized path
+/// (`parse_all_messages_with_pricing_with_env_strategy`), which does NOT apply
+/// per-client cross-file dedup to the `simple_lane!` clients (copilot, codebuff,
+/// kimi, cursor, warp, amp, droid, …) and resolves a narrower client set via
+/// `resolve_local_parse_request`. New report consumers MUST fold over
+/// `scan_messages_streaming` instead (see `get_model_report` / `get_agents_report`)
+/// or their totals will diverge from the other reports. Retained as public
+/// vendored API surface; no in-repo callers after the issue #6 agents migration.
 pub async fn parse_local_unified_messages(
     options: LocalParseOptions,
 ) -> Result<Vec<UnifiedMessage>, String> {
@@ -3099,13 +3247,14 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_model_usage_entries, apply_pricing_if_available, dedupe_latest_trae_messages,
-        fold_messages_streaming, message_cache, normalize_model_for_grouping,
-        parse_all_messages_with_pricing, parse_local_clients, parsed_to_unified, pricing,
+        agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
+        dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_model_report,
+        message_cache, normalize_model_for_grouping, parse_all_messages_with_pricing,
+        parse_local_clients, parse_local_unified_messages, parsed_to_unified, pricing,
         retain_for_requested_clients, scan_messages_streaming, scanner, select_local_parse_pricing,
         unified_to_parsed,
-        ClientId, GroupBy, LocalParseOptions, TokenBreakdown, UnifiedMessage,
-        UNKNOWN_WORKSPACE_LABEL,
+        AgentAccumulator, ClientId, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
+        UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
     };
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -4128,6 +4277,242 @@ mod tests {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    // Issue #6: the agents report must dedup the simple_lane! clients
+    // (copilot/codebuff/kimi/…) like the model/graph/hourly reports. Here
+    // codebuff emits the SAME upstream message id "DUP" in two different
+    // project files. The OLD materialized path (parse_local_unified_messages)
+    // never gated codebuff, so it counts both; the streaming-backed
+    // get_agents_report keeps one — matching get_model_report. Repointing
+    // get_agents_report at the old path makes the parity assertion FAIL (RED).
+    #[test]
+    #[serial_test::serial]
+    fn test_agents_report_dedups_like_model_report_issue6() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+        // Hermetic: cache-only pricing + temp HOME → no network, pricing None.
+        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+
+        {
+            let write_codebuff = |proj: &str| {
+                let dir = source_home
+                    .path()
+                    .join(format!(".config/manicode/projects/{proj}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("chat-messages.json"),
+                    r#"[{"role":"assistant","id":"DUP","metadata":{"model":"claude-sonnet-4","usage":{"inputTokens":200,"outputTokens":80}},"credits":0.02}]"#,
+                )
+                .unwrap();
+            };
+            write_codebuff("projA");
+            write_codebuff("projB");
+
+            let home = source_home.path().to_str().unwrap().to_string();
+            let clients = Some(vec!["codebuff".to_string()]);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let agents = rt
+                .block_on(get_agents_report(ReportOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients: clients.clone(),
+                    ..Default::default()
+                }))
+                .unwrap();
+            let model = rt
+                .block_on(get_model_report(ReportOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients: clients.clone(),
+                    ..Default::default()
+                }))
+                .unwrap();
+            let old = rt
+                .block_on(parse_local_unified_messages(LocalParseOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients: clients.clone(),
+                    since: None,
+                    until: None,
+                    year: None,
+                    scanner_settings: scanner::ScannerSettings::default(),
+                    modified_after: None,
+                }))
+                .unwrap();
+            let old_total: i32 = old.iter().map(|m| m.message_count.max(0)).sum();
+
+            assert_eq!(old_total, 2, "old materialized path must NOT dedup codebuff");
+            assert_eq!(model.total_messages, 1, "model report dedups codebuff");
+            assert_eq!(agents.total_messages, 1, "agents report must dedup codebuff");
+            assert_eq!(
+                agents.total_messages, model.total_messages,
+                "issue #6: agents must agree with the model report"
+            );
+            assert_ne!(
+                old_total, model.total_messages,
+                "the old path diverged from the model report (the #6 bug)"
+            );
+            assert!(
+                (agents.total_cost - model.total_cost).abs() < 1e-9,
+                "agents/model cost parity (agents={}, model={})",
+                agents.total_cost,
+                model.total_cost
+            );
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
+    }
+
+    // Preservation: with no duplicate dedup_keys (and only parse_local==true
+    // clients), the streaming-backed agents report produces the SAME numbers the
+    // old materialized path did. codebuff + kimi, distinct ids, no agent
+    // attribution → a single "Main" bucket.
+    #[test]
+    #[serial_test::serial]
+    fn test_agents_report_preserves_numbers_without_duplicates() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+
+        {
+            let cb_dir = source_home.path().join(".config/manicode/projects/proj");
+            std::fs::create_dir_all(&cb_dir).unwrap();
+            std::fs::write(
+                cb_dir.join("chat-messages.json"),
+                r#"[{"role":"assistant","id":"A","metadata":{"model":"claude-sonnet-4","usage":{"inputTokens":200,"outputTokens":80}},"credits":0.02}]"#,
+            )
+            .unwrap();
+            let kimi_dir = source_home.path().join(".kimi/sessions/g/s");
+            std::fs::create_dir_all(&kimi_dir).unwrap();
+            std::fs::write(
+                kimi_dir.join("wire.jsonl"),
+                "{\"type\": \"metadata\", \"protocol_version\": \"1.3\"}\n{\"timestamp\": 1770983410.0, \"message\": {\"type\": \"StatusUpdate\", \"payload\": {\"token_usage\": {\"input_other\": 100, \"output\": 50, \"input_cache_read\": 0, \"input_cache_creation\": 0}, \"message_id\": \"K\"}}}",
+            )
+            .unwrap();
+
+            let home = source_home.path().to_str().unwrap().to_string();
+            let clients = Some(vec!["codebuff".to_string(), "kimi".to_string()]);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let agents = rt
+                .block_on(get_agents_report(ReportOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients: clients.clone(),
+                    ..Default::default()
+                }))
+                .unwrap();
+
+            assert_eq!(
+                agents.entries.len(),
+                1,
+                "no agent attribution → a single Main bucket"
+            );
+            let main = &agents.entries[0];
+            assert_eq!(main.agent, "Main");
+            assert_eq!(main.messages, 2);
+            // BTreeSet → sorted, both clients fold into Main.
+            assert_eq!(main.clients, vec!["codebuff".to_string(), "kimi".to_string()]);
+
+            // Byte-for-byte equivalence with the old materialized path for the
+            // non-duplicate case (both parse identically; only dedup differs).
+            let old = rt
+                .block_on(parse_local_unified_messages(LocalParseOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients,
+                    since: None,
+                    until: None,
+                    year: None,
+                    scanner_settings: scanner::ScannerSettings::default(),
+                    modified_after: None,
+                }))
+                .unwrap();
+            let old_input: i64 = old.iter().map(|m| m.tokens.input).sum();
+            let old_output: i64 = old.iter().map(|m| m.tokens.output).sum();
+            let old_cache_read: i64 = old.iter().map(|m| m.tokens.cache_read).sum();
+            let old_cache_write: i64 = old.iter().map(|m| m.tokens.cache_write).sum();
+            let old_reasoning: i64 = old.iter().map(|m| m.tokens.reasoning).sum();
+            let old_messages: i32 = old.iter().map(|m| m.message_count.max(0)).sum();
+            let old_cost: f64 = old.iter().map(|m| m.cost).sum();
+
+            assert_eq!(main.input, old_input);
+            assert_eq!(main.output, old_output);
+            assert_eq!(main.cache_read, old_cache_read);
+            assert_eq!(main.cache_write, old_cache_write);
+            assert_eq!(main.reasoning, old_reasoning);
+            assert_eq!(main.messages, old_messages);
+            assert!((agents.total_cost - old_cost).abs() < 1e-9);
+            // Sanity: codebuff contributes its known tokens.
+            assert!(main.input >= 200 && main.output >= 80);
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("TOKSCALE_PRICING_CACHE_ONLY");
+    }
+
+    // Agent bucketing + fold arithmetic in isolation (no fixtures): normalized
+    // names, the "Main" fallback, plain `+=` token sums, and message_count.max(0).
+    #[test]
+    fn test_agent_bucket_key_and_accumulator() {
+        let msg = |agent: Option<&str>| {
+            let mut m = UnifiedMessage::new_with_agent(
+                "codebuff",
+                "m",
+                "p",
+                "s",
+                0,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 2,
+                    cache_write: 1,
+                    reasoning: 3,
+                },
+                0.5,
+                agent.map(|a| a.to_string()),
+            );
+            m.message_count = 2;
+            m
+        };
+
+        assert_eq!(agent_bucket_key(&msg(None)), "Main");
+        assert_eq!(agent_bucket_key(&msg(Some("   "))), "Main");
+        assert_eq!(agent_bucket_key(&msg(Some("OmO"))), "Sisyphus");
+
+        let mut acc = AgentAccumulator::default();
+        acc.add(&msg(None));
+        let mut negative = msg(None);
+        negative.message_count = -3; // .max(0) clamp → contributes 0 messages
+        acc.add(&negative);
+
+        assert_eq!(acc.input, 20);
+        assert_eq!(acc.output, 10);
+        assert_eq!(acc.cache_read, 4);
+        assert_eq!(acc.cache_write, 2);
+        assert_eq!(acc.reasoning, 6);
+        assert!((acc.cost - 1.0).abs() < 1e-9);
+        assert_eq!(acc.messages, 2, "message_count.max(0): 2 + 0");
+        assert!(acc.clients.contains("codebuff"));
     }
 
     #[test]
