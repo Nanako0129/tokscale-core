@@ -546,6 +546,9 @@ pub fn parse_claude_file_with_cache_and_home(
                     Some(m) => m,
                     None => continue,
                 };
+                if is_synthetic_placeholder_model(&raw_model) {
+                    continue;
+                }
                 let provider_choice = claude_provider_choice(
                     &raw_model,
                     message
@@ -841,6 +844,9 @@ fn extract_claude_tool_result_message(
         })
         .or_else(|| context.last_model.map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string());
+    if is_synthetic_placeholder_model(&raw_model) {
+        return None;
+    }
     let provider_hint = extract_claude_provider(&value)
         .or_else(|| {
             context
@@ -1064,6 +1070,13 @@ fn canonicalize_claude_model(model: &str) -> String {
         .to_string()
 }
 
+/// Claude Code stamps `<synthetic>` on assistant turns it fabricates locally
+/// (cancelled requests, injected continuations) — these never hit a real model,
+/// carry no real cost, and only show up as a phantom zero-token row. Drop them.
+fn is_synthetic_placeholder_model(model: &str) -> bool {
+    model.trim() == "<synthetic>"
+}
+
 #[derive(Default)]
 struct ClaudeHeadlessState {
     model: Option<String>,
@@ -1189,6 +1202,9 @@ fn extract_claude_headless_message(
         .get("usage")
         .or_else(|| value.get("message").and_then(|msg| msg.get("usage")))?;
     let raw_model = extract_claude_model(value)?;
+    if is_synthetic_placeholder_model(&raw_model) {
+        return None;
+    }
     let provider_hint = extract_claude_provider(value);
     let provider_id = claude_provider_id(
         &raw_model,
@@ -1414,6 +1430,10 @@ fn finalize_headless_state(
     default_provider_hint: Option<&str>,
 ) -> Option<UnifiedMessage> {
     let raw_model = state.model.clone()?;
+    if is_synthetic_placeholder_model(&raw_model) {
+        *state = ClaudeHeadlessState::default();
+        return None;
+    }
     let provider_id = claude_provider_id(
         &raw_model,
         state.provider_id.as_deref().or(default_provider_hint),
@@ -2025,12 +2045,25 @@ mod tests {
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
 
-        assert_eq!(messages.len(), 5);
+        // The `<synthetic>` placeholder row is dropped (Claude Code fabricates
+        // it locally; it never hit a real model), leaving four real models.
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].provider_id, "anthropic");
         assert_eq!(messages[1].provider_id, "openai");
         assert_eq!(messages[2].provider_id, "google");
         assert_eq!(messages[3].provider_id, "minimax");
-        assert_eq!(messages[4].provider_id, "unknown");
+    }
+
+    #[test]
+    fn test_synthetic_placeholder_model_is_dropped() {
+        let content = r#"{"type":"assistant","timestamp":"2026-02-18T10:00:00.000Z","message":{"model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":10}}}
+{"type":"assistant","timestamp":"2026-02-18T10:00:04.000Z","message":{"model":"<synthetic>","usage":{"input_tokens":500,"output_tokens":50}}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-opus-4-6");
     }
 
     #[test]
@@ -2070,6 +2103,25 @@ mod tests {
         assert_eq!(messages[0].tokens.input, 120);
         assert_eq!(messages[0].tokens.output, 60);
         assert_eq!(messages[0].tokens.cache_read, 10);
+    }
+
+    #[test]
+    fn test_headless_json_output_drops_synthetic_placeholder() {
+        let content = r#"{"type":"message","message":{"model":"<synthetic>","usage":{"input_tokens":120,"output_tokens":60}}}"#;
+        let file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        std::fs::write(file.path(), content).unwrap();
+
+        assert!(parse_claude_file(file.path()).is_empty());
+    }
+
+    #[test]
+    fn test_headless_stream_output_drops_synthetic_placeholder() {
+        let content = r#"{"type":"message_start","timestamp":"2025-01-01T00:00:00Z","message":{"id":"msg_1","model":"<synthetic>","usage":{"input_tokens":200}}}
+{"type":"message_delta","usage":{"output_tokens":80}}
+{"type":"message_stop"}"#;
+        let file = create_test_file(content);
+
+        assert!(parse_claude_file(file.path()).is_empty());
     }
 
     #[test]
