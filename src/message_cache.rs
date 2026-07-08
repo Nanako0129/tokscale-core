@@ -32,7 +32,12 @@ use std::time::UNIX_EPOCH;
 // (#747), fable->anthropic provider inference (#762), and copilot per-message
 // agent attribution (#724/#751) all change cached parser output, so stale
 // entries must be reparsed. (Our own schema counter; do not mirror upstream's.)
-const CACHE_SCHEMA_VERSION: u32 = 22;
+// 23 (PR #30: drop synthetic claude rows): claudecode parsing now discards
+// assistant turns whose model is the `<synthetic>` placeholder (locally
+// fabricated by Claude Code, zero-token, no real cost), so a session cached
+// before this change still carries the phantom zero-token row until reparsed.
+// (Our own schema counter; do not mirror upstream's number.)
+const CACHE_SCHEMA_VERSION: u32 = 23;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
