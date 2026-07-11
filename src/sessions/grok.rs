@@ -662,6 +662,55 @@ mod tests {
     }
 
     #[test]
+    fn compaction_epoch_survives_without_signals_reconciliation() {
+        // Signals-absent compaction: this is the case the local counter-epoch
+        // delta exists for. Upstream treats every counter rewind as jitter and
+        // `continue`s, so without signals.json to backfill the lost total it
+        // reports only the pre-compaction peak (180000). The epoch accumulation
+        // must survive on its own: first epoch 180000 + second epoch 500000.
+        let updates = r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk","_meta":{"modelId":"grok-build"}},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"totalTokens":180000,"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"totalTokens":40000,"agentTimestampMs":1700000002000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":500000,"agentTimestampMs":1700000003000}}}"#;
+
+        let (_temp, path) = write_fixture(updates, None, None);
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 680000);
+        assert_eq!(messages[0].timestamp, 1700000003000);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            680000
+        );
+
+        // Idempotence with signals present: when signals.json's totals match the
+        // epochs the parser already accumulated (before-compaction 180000 +
+        // context-used 500000 = 680000), the difference-based reconciliation
+        // (`extra = signals_total - updates_total`) is <= 0 and contributes
+        // nothing — the two mechanisms are complementary, not additive.
+        let (_temp2, path2) = write_fixture(
+            updates,
+            None,
+            Some(
+                r#"{"primaryModelId":"grok-build","totalTokensBeforeCompaction":180000,"contextTokensUsed":500000}"#,
+            ),
+        );
+        let reconciled = parse_grok_updates_file(&path2);
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].tokens.input, 680000);
+        assert_eq!(
+            reconciled
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            680000
+        );
+    }
+
+    #[test]
     fn preserves_total_tokens_without_model_metadata() {
         let (_temp, path) = write_fixture(
             r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"available_commands_update"},"_meta":{"totalTokens":120,"agentTimestampMs":1700000000000}}}"#,
