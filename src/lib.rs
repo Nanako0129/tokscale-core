@@ -1307,8 +1307,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             .filter(|message| should_keep_deduped_message(&mut gjc_seen, message)),
     );
 
-    // Grok Build: updates.jsonl + sibling signals.json fingerprint (compaction
-    // rollup must invalidate the cache). Cumulative totalTokens deltas land as
+    // Grok Build: updates.jsonl + metadata-sibling fingerprint (signals/summary/
+    // events; a compaction rollup or late model id must invalidate the cache).
+    // Cumulative totalTokens deltas land as
     // input tokens; pricing treats them as input at the resolved xai rates.
     let grok_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Grok)
@@ -2430,8 +2431,9 @@ where
         sessions::jcode::parse_jcode_file,
         message_cache::SourceFingerprint::from_jcode_path
     );
-    // Grok Build: fingerprint updates.jsonl + sibling signals.json so a late
-    // compaction rollup invalidates the cache (parse reconciles signals totals).
+    // Grok Build: fingerprint updates.jsonl + every metadata sibling the parser
+    // reads (signals/summary/events) so a late compaction rollup or sibling-only
+    // model id invalidates the cache (parse reconciles signals totals).
     simple_lane!(
         ClientId::Grok,
         sessions::grok::parse_grok_updates_file,
@@ -3012,12 +3014,17 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
         let journal = message_cache::jcode_journal_path(snapshot);
         latest = latest.max(file_mtime_ms(&journal).unwrap_or(0));
     }
-    // Grok Build reconciles totals from sibling signals.json. That rollup can
-    // rewrite without touching updates.jsonl (compaction / live session
-    // refresh), so probe it for the live-tail change token too.
+    // Grok Build reconciles totals from sibling signals.json and reads the model
+    // id from summary.json / events.jsonl. Any of those metadata siblings can
+    // rewrite without touching updates.jsonl (compaction / live session refresh /
+    // a late-arriving model id), so probe every sibling the fingerprint covers for
+    // the live-tail change token too — otherwise a sibling-only write leaves the
+    // token unchanged and the tail never re-parses the new model.
     for updates in scan_result.get(ClientId::Grok) {
         if let Some(parent) = updates.parent() {
-            latest = latest.max(file_mtime_ms(&parent.join("signals.json")).unwrap_or(0));
+            for sibling in message_cache::GROK_METADATA_SIBLINGS {
+                latest = latest.max(file_mtime_ms(&parent.join(sibling)).unwrap_or(0));
+            }
         }
     }
     Ok(latest)
@@ -3030,14 +3037,21 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
     Some(duration.as_millis() as u64)
 }
 
-/// Newest mtime for a Grok session's scanned updates file and optional signals
-/// sibling. `None` keeps the source during pruning because over-parsing is safer
-/// than dropping a session when either existing file cannot be inspected.
+/// Newest mtime for a Grok session's scanned updates file and every metadata
+/// sibling the parser reads (`signals.json` / `summary.json` / `events.jsonl` —
+/// kept in lockstep with the fingerprint via `GROK_METADATA_SIBLINGS`). `None`
+/// keeps the source during pruning because over-parsing is safer than dropping a
+/// session when the updates file or an existing sibling cannot be inspected.
 fn grok_source_mtime_ms(updates_path: &Path) -> Option<u64> {
     let mut latest = file_mtime_ms(updates_path)?;
-    let signals = updates_path.parent()?.join("signals.json");
-    if signals.exists() {
-        latest = latest.max(file_mtime_ms(&signals)?);
+    let Some(parent) = updates_path.parent() else {
+        return Some(latest);
+    };
+    for name in message_cache::GROK_METADATA_SIBLINGS {
+        let sibling = parent.join(name);
+        if sibling.exists() {
+            latest = latest.max(file_mtime_ms(&sibling)?);
+        }
     }
     Some(latest)
 }
@@ -3049,8 +3063,9 @@ fn grok_source_mtime_ms(updates_path: &Path) -> Option<u64> {
 /// (WAL writes may not bump the main `.db` mtime), while the jcode lane holds a
 /// `session_*.json` snapshot whose sibling `.journal.jsonl` is appended between
 /// snapshot rewrites. Those lanes remain exempt. Grok can still be bounded by
-/// pruning against the newer mtime of `updates.jsonl` and `signals.json`. Any
-/// stat failure keeps the file — over-parsing is safe, silently skipping is not.
+/// pruning against the newest mtime of `updates.jsonl` and every metadata sibling
+/// the parser reads (`signals.json` / `summary.json` / `events.jsonl`). Any stat
+/// failure keeps the file — over-parsing is safe, silently skipping is not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
     // Lanes whose scanned file's mtime does not reflect a sibling write
     // (SQLite `-wal` or jcode's `.journal.jsonl`); kept in lockstep with the
@@ -8338,6 +8353,139 @@ mod tests {
             std::slice::from_ref(&active_updates),
             "stale Grok sessions should be pruned while a fresh signals sibling keeps its session"
         );
+    }
+
+    // The pruning helper must treat a fresh write to *any* metadata sibling the
+    // parser reads (not just signals.json) as source activity — otherwise a
+    // summary.json- or events.jsonl-only write (a late-arriving model id) lets an
+    // otherwise-stale session be pruned and its fresh model never re-parsed.
+    fn prune_grok_keeps_session_with_fresh_sibling(fresh_sibling: &str) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let stale_dir = temp_dir.path().join("stale");
+        let active_dir = temp_dir.path().join("active");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::create_dir_all(&active_dir).unwrap();
+
+        let stale_updates = stale_dir.join("updates.jsonl");
+        let active_updates = active_dir.join("updates.jsonl");
+        let active_fresh = active_dir.join(fresh_sibling);
+        // Every session file starts stale; only the one fresh sibling moves.
+        let mut all_paths = vec![stale_updates.clone(), active_updates.clone()];
+        for name in message_cache::GROK_METADATA_SIBLINGS {
+            all_paths.push(stale_dir.join(name));
+            all_paths.push(active_dir.join(name));
+        }
+        for path in &all_paths {
+            std::fs::File::create(path).unwrap();
+        }
+
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let active_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for path in &all_paths {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let Ok(()) = file.set_modified(stale_time) else {
+                return;
+            };
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active_fresh)
+            .unwrap();
+        let Ok(()) = file.set_modified(active_time) else {
+            return;
+        };
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::Grok)
+            .extend([stale_updates.clone(), active_updates.clone()]);
+
+        crate::prune_scan_result_by_mtime(&mut scan_result, 1_700_043_200_000);
+
+        assert_eq!(
+            scan_result.get(ClientId::Grok),
+            std::slice::from_ref(&active_updates),
+            "a fresh {fresh_sibling} sibling must keep its otherwise-stale Grok session"
+        );
+    }
+
+    #[test]
+    fn test_modified_after_prunes_grok_keeps_session_with_fresh_summary() {
+        prune_grok_keeps_session_with_fresh_sibling("summary.json");
+    }
+
+    #[test]
+    fn test_modified_after_prunes_grok_keeps_session_with_fresh_events() {
+        prune_grok_keeps_session_with_fresh_sibling("events.jsonl");
+    }
+
+    // The live-tail change token must move when Grok rewrites *any* metadata
+    // sibling the parser reads, even though updates.jsonl is unchanged; otherwise
+    // UsageTail short-circuits and the session stays pinned to its fallback model.
+    fn latest_source_mtime_ms_probes_grok_sibling(fresh_sibling: &str) {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let session_dir = source_home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fproject/session-uuid-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let updates = session_dir.join("updates.jsonl");
+        std::fs::write(&updates, b"{\"totalTokens\":1}\n").unwrap();
+        // Every sibling exists and is stale; only the target sibling is newer.
+        for name in message_cache::GROK_METADATA_SIBLINGS {
+            std::fs::write(session_dir.join(name), b"{}").unwrap();
+        }
+
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for name in std::iter::once("updates.jsonl").chain(message_cache::GROK_METADATA_SIBLINGS) {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(session_dir.join(name))
+                .unwrap();
+            let Ok(()) = f.set_modified(stale_time) else {
+                return;
+            };
+        }
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(session_dir.join(fresh_sibling))
+            .unwrap();
+        let Ok(()) = f.set_modified(fresh_time) else {
+            return;
+        };
+
+        let options = LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["grok".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        };
+        let token = crate::latest_source_mtime_ms(&options).unwrap();
+
+        assert_eq!(
+            token, 1_700_086_400_000,
+            "the change token must reflect the fresh {fresh_sibling} mtime, not just updates.jsonl"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_latest_source_mtime_ms_probes_grok_summary() {
+        latest_source_mtime_ms_probes_grok_sibling("summary.json");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_latest_source_mtime_ms_probes_grok_events() {
+        latest_source_mtime_ms_probes_grok_sibling("events.jsonl");
     }
 
     // The live-tail change token must move when jcode appends to the sibling

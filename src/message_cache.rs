@@ -180,6 +180,16 @@ pub(crate) struct RelatedFileFingerprint {
     pub content_hash: [u8; 32],
 }
 
+/// Metadata siblings a Grok `updates.jsonl` session's parse depends on, in the
+/// same session directory. `parse_grok_updates_file` reconciles totals from
+/// `signals.json` and `read_metadata` additionally reads `summary.json` and
+/// `events.jsonl` for the model id. The fingerprint (`from_grok_path`) and every
+/// mtime change probe in `lib.rs` (`latest_source_mtime_ms`, `grok_source_mtime_ms`)
+/// must watch the *same* set, or a sibling-only write goes unnoticed and the
+/// cache serves a stale (fallback-model) session.
+pub(crate) const GROK_METADATA_SIBLINGS: [&str; 3] =
+    ["signals.json", "summary.json", "events.jsonl"];
+
 impl SourceFingerprint {
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         Self::from_path_with_related(path, std::iter::empty())
@@ -221,7 +231,7 @@ impl SourceFingerprint {
     /// upstream. See vendor/README.md.
     pub(crate) fn from_grok_path(path: &Path) -> Option<Self> {
         let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let related_paths = ["signals.json", "summary.json", "events.jsonl"]
+        let related_paths = GROK_METADATA_SIBLINGS
             .into_iter()
             .map(|name| (name.to_string(), session_dir.join(name)));
         Self::from_path_with_related(path, related_paths)
