@@ -203,6 +203,20 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related_paths)
     }
 
+    /// Fingerprint for a Grok `updates.jsonl` session and its sibling
+    /// `signals.json` rollup. `parse_grok_updates_file` reconciles session totals
+    /// from `signals.json` (compaction), so a rollup that is written or rewritten
+    /// after the last `updates.jsonl` write must still invalidate the cache — an
+    /// `updates.jsonl`-only fingerprint would ignore late/updated signals forever.
+    pub(crate) fn from_grok_path(path: &Path) -> Option<Self> {
+        let signals = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("signals.json");
+        let related_paths = std::iter::once(("signals.json".to_string(), signals));
+        Self::from_path_with_related(path, related_paths)
+    }
+
     /// Fingerprint for a Roo-family task (`ui_messages.json`) and its sibling
     /// `api_conversation_history.json`. `parse_roo_kilo_file` reads the history
     /// sibling for the model and agent, so a history-only rewrite (the UI file

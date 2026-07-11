@@ -481,6 +481,24 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Grok Build stores ACP session updates under
+    // `$GROK_HOME/sessions/<urlencoded-workspace>/<session-id>/updates.jsonl`
+    // (default `~/.grok`). Cumulative `totalTokens` deltas are recorded as
+    // input tokens; sibling `signals.json` reconciles compaction undercount.
+    // Upstream numbers this client 27 — intervening clients differ in our
+    // vendor numbering.
+    Grok = 30 => {
+        id: "grok",
+        root: PathRoot::EnvVar {
+            var: "GROK_HOME",
+            fallback_relative: ".grok",
+        },
+        relative: "sessions",
+        pattern: "updates.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -533,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 30);
+        assert_eq!(ClientId::COUNT, 31);
     }
 
     #[test]
@@ -847,5 +865,18 @@ mod tests {
         assert!(ClientId::Kiro.parse_local());
         assert!(ClientId::Kiro.submit_default());
         assert!(!ClientId::Kiro.supports_headless());
+    }
+
+    #[test]
+    fn test_grok_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("grok").expect("grok client should be registered");
+        assert_eq!(client.data().relative_path, "sessions");
+        assert_eq!(client.data().pattern, "updates.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/.grok/sessions"
+        );
     }
 }

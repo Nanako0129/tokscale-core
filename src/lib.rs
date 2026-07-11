@@ -1307,6 +1307,29 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             .filter(|message| should_keep_deduped_message(&mut gjc_seen, message)),
     );
 
+    // Grok Build: updates.jsonl + sibling signals.json fingerprint (compaction
+    // rollup must invalidate the cache). Cumulative totalTokens deltas land as
+    // input tokens; pricing treats them as input at the resolved xai rates.
+    let grok_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Grok)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_grok_path,
+                sessions::grok::parse_grok_updates_file,
+            )
+        })
+        .collect();
+    for outcome in grok_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let mux_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Mux)
         .par_iter()
@@ -2407,6 +2430,13 @@ where
         sessions::jcode::parse_jcode_file,
         message_cache::SourceFingerprint::from_jcode_path
     );
+    // Grok Build: fingerprint updates.jsonl + sibling signals.json so a late
+    // compaction rollup invalidates the cache (parse reconciles signals totals).
+    simple_lane!(
+        ClientId::Grok,
+        sessions::grok::parse_grok_updates_file,
+        message_cache::SourceFingerprint::from_grok_path
+    );
     // micode is WAL-mode SQLite; fingerprint via from_sqlite_path so a `-wal`
     // write invalidates the cache. MiMo Code records an authoritative per-message
     // cost (usage.cost), so this lane is cost-guarded (`true`): apply_pricing
@@ -2982,6 +3012,14 @@ pub fn latest_source_mtime_ms(options: &LocalParseOptions) -> Result<u64, String
         let journal = message_cache::jcode_journal_path(snapshot);
         latest = latest.max(file_mtime_ms(&journal).unwrap_or(0));
     }
+    // Grok Build reconciles totals from sibling signals.json. That rollup can
+    // rewrite without touching updates.jsonl (compaction / live session
+    // refresh), so probe it for the live-tail change token too.
+    for updates in scan_result.get(ClientId::Grok) {
+        if let Some(parent) = updates.parent() {
+            latest = latest.max(file_mtime_ms(&parent.join("signals.json")).unwrap_or(0));
+        }
+    }
     Ok(latest)
 }
 
@@ -2992,19 +3030,31 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
     Some(duration.as_millis() as u64)
 }
 
+/// Newest mtime for a Grok session's scanned updates file and optional signals
+/// sibling. `None` keeps the source during pruning because over-parsing is safer
+/// than dropping a session when either existing file cannot be inspected.
+fn grok_source_mtime_ms(updates_path: &Path) -> Option<u64> {
+    let mut latest = file_mtime_ms(updates_path)?;
+    let signals = updates_path.parent()?.join("signals.json");
+    if signals.exists() {
+        latest = latest.max(file_mtime_ms(&signals)?);
+    }
+    Some(latest)
+}
+
 /// Drop file-backed session logs older than `threshold_ms` (unix ms, mtime)
 /// from a scan. Sources whose freshness is not captured by their scanned
 /// file's own mtime are left untouched, because a sibling can change without
 /// touching it: the Hermes/Zed/Antigravity-CLI/micode lanes hold SQLite dbs
-/// (WAL writes may not bump the main `.db` mtime), and the jcode lane holds a
+/// (WAL writes may not bump the main `.db` mtime), while the jcode lane holds a
 /// `session_*.json` snapshot whose sibling `.journal.jsonl` is appended between
-/// snapshot rewrites. Pruning any of these by the scanned file's mtime would
-/// drop a still-active source, so they are exempt and always parsed. Any stat
-/// failure keeps the file — over-parsing is safe, silently skipping is not.
+/// snapshot rewrites. Those lanes remain exempt. Grok can still be bounded by
+/// pruning against the newer mtime of `updates.jsonl` and `signals.json`. Any
+/// stat failure keeps the file — over-parsing is safe, silently skipping is not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
     // Lanes whose scanned file's mtime does not reflect a sibling write
-    // (SQLite `-wal`, or jcode's `.journal.jsonl`); kept in lockstep with the
-    // `-wal`/journal probes in `latest_source_mtime_ms`.
+    // (SQLite `-wal` or jcode's `.journal.jsonl`); kept in lockstep with the
+    // sibling probes in `latest_source_mtime_ms`.
     let db_lanes = [
         ClientId::Hermes as usize,
         ClientId::Zed as usize,
@@ -3014,6 +3064,12 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
     ];
     for (lane, files) in scan_result.files.iter_mut().enumerate() {
         if db_lanes.contains(&lane) {
+            continue;
+        }
+        if lane == ClientId::Grok as usize {
+            files.retain(|path| {
+                grok_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+            });
             continue;
         }
         files.retain(|path| {
@@ -3385,6 +3441,20 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let gjc_count = summed_parsed_message_count(&gjc_msgs);
     counts.set(ClientId::Gjc, gjc_count);
     messages.extend(gjc_msgs);
+
+    let grok_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Grok)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::grok::parse_grok_updates_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let grok_count = summed_parsed_message_count(&grok_msgs);
+    counts.set(ClientId::Grok, grok_count);
+    messages.extend(grok_msgs);
 
     let mux_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mux)
@@ -8219,6 +8289,54 @@ mod tests {
         assert!(
             scan_result.get(ClientId::Claude).is_empty(),
             "a plain-file client's stale log is still pruned"
+        );
+    }
+
+    #[test]
+    fn test_modified_after_prunes_grok_by_updates_or_signals_mtime() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let stale_dir = temp_dir.path().join("stale");
+        let active_dir = temp_dir.path().join("active");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::create_dir_all(&active_dir).unwrap();
+
+        let stale_updates = stale_dir.join("updates.jsonl");
+        let stale_signals = stale_dir.join("signals.json");
+        let active_updates = active_dir.join("updates.jsonl");
+        let active_signals = active_dir.join("signals.json");
+        for path in [&stale_updates, &stale_signals, &active_updates, &active_signals] {
+            std::fs::File::create(path).unwrap();
+        }
+
+        let stale_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let active_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        for path in [&stale_updates, &stale_signals, &active_updates] {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let Ok(()) = file.set_modified(stale_time) else {
+                return;
+            };
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active_signals)
+            .unwrap();
+        let Ok(()) = file.set_modified(active_time) else {
+            return;
+        };
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::Grok)
+            .extend([stale_updates.clone(), active_updates.clone()]);
+
+        crate::prune_scan_result_by_mtime(&mut scan_result, 1_700_043_200_000);
+
+        assert_eq!(
+            scan_result.get(ClientId::Grok),
+            std::slice::from_ref(&active_updates),
+            "stale Grok sessions should be pruned while a fresh signals sibling keeps its session"
         );
     }
 
