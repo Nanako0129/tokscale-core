@@ -203,17 +203,27 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related_paths)
     }
 
-    /// Fingerprint for a Grok `updates.jsonl` session and its sibling
-    /// `signals.json` rollup. `parse_grok_updates_file` reconciles session totals
-    /// from `signals.json` (compaction), so a rollup that is written or rewritten
-    /// after the last `updates.jsonl` write must still invalidate the cache — an
-    /// `updates.jsonl`-only fingerprint would ignore late/updated signals forever.
+    /// Fingerprint for a Grok `updates.jsonl` session and every sibling
+    /// `read_metadata` consults. `parse_grok_updates_file` reconciles session
+    /// totals from `signals.json` (compaction), and `read_metadata` additionally
+    /// reads `summary.json` (model id + `updated_at`/`created_at` timestamp) and
+    /// `events.jsonl` (model id, session id, `ts` timestamp) — so a sibling that
+    /// is written or rewritten after the last `updates.jsonl` write must still
+    /// invalidate the cache. An `updates.jsonl`-only (or `signals.json`-only)
+    /// fingerprint would leave a session pinned to its fallback model forever
+    /// when a late-arriving `summary.json`/`events.jsonl` is the only carrier of
+    /// the real model id.
+    ///
+    /// LOCAL DIVERGENCE from upstream junhoyeo/tokscale, which fingerprints only
+    /// `signals.json` here even though its `read_metadata` reads all three — the
+    /// same class of gap as our reported #741 (roo history sibling). Must be
+    /// re-applied on any re-vendor of `message_cache.rs`; candidate to report
+    /// upstream. See vendor/README.md.
     pub(crate) fn from_grok_path(path: &Path) -> Option<Self> {
-        let signals = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("signals.json");
-        let related_paths = std::iter::once(("signals.json".to_string(), signals));
+        let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let related_paths = ["signals.json", "summary.json", "events.jsonl"]
+            .into_iter()
+            .map(|name| (name.to_string(), session_dir.join(name)));
         Self::from_path_with_related(path, related_paths)
     }
 
@@ -1040,6 +1050,62 @@ mod tests {
         assert_eq!(
             plain_before, plain_after,
             "from_path ignores the history sibling (control)"
+        );
+    }
+
+    #[test]
+    fn from_grok_path_invalidates_on_summary_only_change() {
+        // read_metadata reads the model id (and timestamp) from the sibling
+        // summary.json when updates.jsonl carries no per-turn model, so a
+        // summary-only rewrite (updates.jsonl + signals.json byte-identical) must
+        // change the fingerprint or the cache keeps a session pinned to its
+        // fallback model. Local divergence: upstream fingerprints only
+        // signals.json here.
+        let dir = TempDir::new().unwrap();
+        let updates = dir.path().join("updates.jsonl");
+        std::fs::write(&updates, b"{\"totalTokens\":10}\n").unwrap();
+        let summary = dir.path().join("summary.json");
+        std::fs::write(&summary, br#"{"current_model_id":"grok-4"}"#).unwrap();
+
+        let grok_before = SourceFingerprint::from_grok_path(&updates).unwrap();
+        let plain_before = SourceFingerprint::from_path(&updates).unwrap();
+
+        // Rewrite summary.json only; leave updates.jsonl byte-identical.
+        std::fs::write(&summary, br#"{"current_model_id":"grok-4-fast"}"#).unwrap();
+
+        let grok_after = SourceFingerprint::from_grok_path(&updates).unwrap();
+        let plain_after = SourceFingerprint::from_path(&updates).unwrap();
+
+        assert_ne!(
+            grok_before, grok_after,
+            "a summary-only change must alter the grok fingerprint"
+        );
+        assert_eq!(
+            plain_before, plain_after,
+            "from_path ignores the summary sibling (control)"
+        );
+    }
+
+    #[test]
+    fn from_grok_path_invalidates_on_events_only_change() {
+        // events.jsonl is the other metadata sibling read_metadata consults for
+        // the model id / session id / timestamp, so an events-only rewrite must
+        // invalidate the cache too.
+        let dir = TempDir::new().unwrap();
+        let updates = dir.path().join("updates.jsonl");
+        std::fs::write(&updates, b"{\"totalTokens\":10}\n").unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(&events, b"{\"model_id\":\"grok-4\"}\n").unwrap();
+
+        let before = SourceFingerprint::from_grok_path(&updates).unwrap();
+
+        std::fs::write(&events, b"{\"model_id\":\"grok-4-fast\"}\n").unwrap();
+
+        let after = SourceFingerprint::from_grok_path(&updates).unwrap();
+
+        assert_ne!(
+            before, after,
+            "an events-only change must alter the grok fingerprint"
         );
     }
 
