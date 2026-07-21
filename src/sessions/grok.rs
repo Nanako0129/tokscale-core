@@ -237,9 +237,17 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                     // Close any open context turn without emitting — usage owns
                     // the completed turn's totals.
                     active_turn = None;
-                    if let Some(total) = last_total {
+                    // If this line also carries a context counter, advance the
+                    // baseline from it but do not open a new ActiveTurn from
+                    // the completed turn's context growth (would double-count).
+                    if let Some(total) = extract_total_tokens(&value).filter(|t| *t >= 0) {
+                        context_baseline_after_usage = Some(total);
+                        last_total = Some(total);
+                        last_total_timestamp = timestamp;
+                    } else if let Some(total) = last_total {
                         context_baseline_after_usage = Some(total);
                     }
+                    continue;
                 }
             }
         }
@@ -344,7 +352,13 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
             }
         }
         // signals.json is context occupancy — do not reconcile against usage.
-        return usage_messages;
+        // Keep any legacy context turns that completed before the first usage
+        // record (pre-upgrade prefix of a mixed session).
+        if context_messages.is_empty() {
+            return usage_messages;
+        }
+        context_messages.extend(usage_messages);
+        return context_messages;
     }
 
     if let Some(turn) = active_turn {
@@ -399,6 +413,13 @@ fn emit_usage_messages(
         } else {
             return Vec::new();
         }
+    } else {
+        // Model entries sometimes only carry token buckets while the parent
+        // usage object holds costUsdTicks / apiDurationMs. Inherit so we do not
+        // drop provider-reported cost. Single-model: full inherit. Multi-model:
+        // put parent totals on the first row only when no model entry has them
+        // (avoids double-counting the parent cost across models).
+        inherit_top_level_cost_and_duration(&mut rows, &top);
     }
 
     let turn_key = prompt_id
@@ -457,11 +478,38 @@ fn emit_usage_messages(
             metadata.workspace_key.clone(),
             metadata.workspace_label.clone(),
         );
+        // Match unified-log semantics: only the first model row of a turn
+        // counts as a user message so report sums do not overcount.
         message.is_turn_start = model_i == 0;
+        message.message_count = i32::from(message.is_turn_start);
         messages.push(message);
     }
 
     messages
+}
+
+/// When `modelUsage` rows omit cost/duration, copy them from the parent usage
+/// object. Single-model inherits fully; multi-model places parent totals on
+/// the first row only if every model entry is missing them.
+fn inherit_top_level_cost_and_duration(rows: &mut [ParsedUsage], top: &ParsedUsage) {
+    if rows.is_empty() {
+        return;
+    }
+    if rows.len() == 1 {
+        if rows[0].cost_usd_ticks <= 0 && top.cost_usd_ticks > 0 {
+            rows[0].cost_usd_ticks = top.cost_usd_ticks;
+        }
+        if rows[0].api_duration_ms.is_none() {
+            rows[0].api_duration_ms = top.api_duration_ms;
+        }
+        return;
+    }
+    if top.cost_usd_ticks > 0 && rows.iter().all(|r| r.cost_usd_ticks <= 0) {
+        rows[0].cost_usd_ticks = top.cost_usd_ticks;
+    }
+    if top.api_duration_ms.is_some() && rows.iter().all(|r| r.api_duration_ms.is_none()) {
+        rows[0].api_duration_ms = top.api_duration_ms;
+    }
 }
 
 /// Parses Grok Build's append-only unified log. Each `shell.turn.inference_done`
@@ -1731,5 +1779,99 @@ mod tests {
             .all(|m| m.dedup_key.as_deref().unwrap().contains("turn:p-split:")));
         // Exactly one turn_start among the split rows.
         assert_eq!(messages.iter().filter(|m| m.is_turn_start).count(), 1);
+        // message_count must not overcount a single turn split across models.
+        assert_eq!(
+            messages.iter().map(|m| m.message_count).sum::<i32>(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .find(|m| m.is_turn_start)
+                .map(|m| m.message_count),
+            Some(1)
+        );
+        assert!(messages
+            .iter()
+            .filter(|m| !m.is_turn_start)
+            .all(|m| m.message_count == 0));
+    }
+
+    #[test]
+    fn skips_context_counter_on_usage_line_with_total_tokens() {
+        // turn_completed carries both usage and _meta.totalTokens. After the
+        // usage path clears active_turn, the context arm must not reopen a
+        // turn from that same line (would double-count completed growth).
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":100000,"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":500,"outputTokens":50,"totalTokens":550,"cachedReadTokens":0,"reasoningTokens":0}},"_meta":{"totalTokens":200000,"agentTimestampMs":1700000002000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 500);
+        assert_eq!(messages[0].tokens.output, 50);
+        assert_eq!(token_all(&messages), 550);
+    }
+
+    #[test]
+    fn preserves_legacy_context_turns_before_first_usage() {
+        // Pre-upgrade turns only have context counters; a later turn has
+        // turn_completed.usage. Keep the early legacy deltas, then usage.
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":100,"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000002000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":250,"agentTimestampMs":1700000003000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000004000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":300,"agentTimestampMs":1700000005000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p-new","usage":{"inputTokens":1000,"outputTokens":20,"totalTokens":1020,"cachedReadTokens":0,"reasoningTokens":0}},"_meta":{"agentTimestampMs":1700000006000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        // First legacy turn: 0→100; second: 100→250; then usage 1000+20.
+        // (Third user_message_chunk opens a turn that is closed without emit
+        // when usage arrives for that turn — only completed legacy turns
+        // before saw_usage are kept via the user_message_chunk flush.)
+        assert!(
+            messages.len() >= 3,
+            "expected legacy turns + usage, got {}",
+            messages.len()
+        );
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.output, 0);
+        assert_eq!(messages[1].tokens.input, 150);
+        assert_eq!(messages[1].tokens.output, 0);
+        let usage = messages
+            .iter()
+            .find(|m| m.dedup_key.as_deref() == Some("grok:session-1:turn:p-new"))
+            .expect("usage turn");
+        assert_eq!(usage.tokens.input, 1000);
+        assert_eq!(usage.tokens.output, 20);
+    }
+
+    #[test]
+    fn inherits_parent_cost_and_duration_onto_single_model_usage() {
+        // Parent usage has cost/duration; model entry only has token buckets.
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p-cost","usage":{"inputTokens":100,"outputTokens":10,"totalTokens":110,"cachedReadTokens":0,"reasoningTokens":0,"apiDurationMs":42000,"costUsdTicks":2500000000,"modelUsage":{"grok-4.5-build":{"inputTokens":100,"outputTokens":10,"totalTokens":110,"cachedReadTokens":0,"reasoningTokens":0}}}},"_meta":{"agentTimestampMs":1700000000000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "grok-4.5-build");
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.output, 10);
+        assert_eq!(messages[0].duration_ms, Some(42000));
+        assert_eq!(messages[0].cost_source, CostSource::ProviderReported);
+        assert!((messages[0].cost - 2.5).abs() < 1e-12);
+        assert_eq!(messages[0].message_count, 1);
     }
 }
