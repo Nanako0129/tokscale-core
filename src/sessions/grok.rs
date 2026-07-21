@@ -196,6 +196,10 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
     // Context baseline after the latest completed usage turn so a live open turn
     // only counts post-completion context growth (no double-count).
     let mut context_baseline_after_usage: Option<i64> = None;
+    // After saw_usage, a user_message_chunk with no known context counter must
+    // not open ActiveTurn at 0 (full occupancy would double-count completed
+    // usage). Defer until the first post-usage totalTokens establishes baseline.
+    let mut pending_post_usage_live_partial = false;
 
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
@@ -237,6 +241,7 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                     // Close any open context turn without emitting — usage owns
                     // the completed turn's totals.
                     active_turn = None;
+                    pending_post_usage_live_partial = false;
                     // If this line also carries a context counter, advance the
                     // baseline from it but do not open a new ActiveTurn from
                     // the completed turn's context growth (would double-count).
@@ -259,23 +264,34 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                         context_messages.push(message);
                     }
                 }
-            }
-            // Usage path: discard any open context turn (completed turns are
-            // owned by usage). Always start a fresh open turn for live partials.
-            let baseline = if saw_usage {
-                context_baseline_after_usage
-                    .or(last_total)
-                    .unwrap_or(0)
+                pending_post_usage_live_partial = false;
+                let baseline = last_total.unwrap_or(0);
+                active_turn = Some(ActiveTurn::new(
+                    baseline,
+                    timestamp,
+                    current_model.clone(),
+                    turn_index,
+                ));
+                turn_index = turn_index.saturating_add(1);
             } else {
-                last_total.unwrap_or(0)
-            };
-            active_turn = Some(ActiveTurn::new(
-                baseline,
-                timestamp,
-                current_model.clone(),
-                turn_index,
-            ));
-            turn_index = turn_index.saturating_add(1);
+                // Usage path: discard any open context turn (completed turns are
+                // owned by usage). Never zero-base a post-usage live partial —
+                // without a known context counter, wait for the first post-usage
+                // totalTokens instead of treating full occupancy as delta.
+                if let Some(baseline) = context_baseline_after_usage.or(last_total) {
+                    pending_post_usage_live_partial = false;
+                    active_turn = Some(ActiveTurn::new(
+                        baseline,
+                        timestamp,
+                        current_model.clone(),
+                        turn_index,
+                    ));
+                    turn_index = turn_index.saturating_add(1);
+                } else {
+                    pending_post_usage_live_partial = true;
+                    active_turn = None;
+                }
+            }
         }
 
         let Some(total_tokens) = extract_total_tokens(&value) else {
@@ -296,6 +312,18 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                             last_total_timestamp = timestamp;
                             last_total = Some(total_tokens);
                             context_baseline_after_usage = Some(total_tokens);
+                            // First known counter after deferred user turn:
+                            // open at the post-compaction total (baseline only).
+                            if pending_post_usage_live_partial {
+                                pending_post_usage_live_partial = false;
+                                active_turn = Some(ActiveTurn::new(
+                                    total_tokens,
+                                    timestamp,
+                                    current_model.clone(),
+                                    turn_index,
+                                ));
+                                turn_index = turn_index.saturating_add(1);
+                            }
                             continue;
                         }
                         let mut turn = ActiveTurn::new(
@@ -333,6 +361,18 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                         last_total_timestamp = timestamp;
                         last_total = Some(total_tokens);
                         context_baseline_after_usage = Some(total_tokens);
+                        if pending_post_usage_live_partial {
+                            // Deferred user turn: first/next counter is baseline
+                            // only (no zero-base full-occupancy emission).
+                            pending_post_usage_live_partial = false;
+                            active_turn = Some(ActiveTurn::new(
+                                total_tokens,
+                                timestamp,
+                                current_model.clone(),
+                                turn_index,
+                            ));
+                            turn_index = turn_index.saturating_add(1);
+                        }
                         continue;
                     }
                     let baseline = previous;
@@ -351,11 +391,31 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                 last_total = Some(total_tokens);
             }
             None => {
-                if let Some(turn) = active_turn.as_mut() {
-                    turn.observe_total(total_tokens, timestamp);
-                }
+                // First context counter observed in this file.
                 last_total_timestamp = timestamp;
                 last_total = Some(total_tokens);
+                if saw_usage {
+                    context_baseline_after_usage = Some(total_tokens);
+                    if pending_post_usage_live_partial {
+                        // User already opened a post-usage turn with no known
+                        // baseline: use this first counter as baseline only
+                        // (delta 0), not as growth from zero.
+                        pending_post_usage_live_partial = false;
+                        active_turn = Some(ActiveTurn::new(
+                            total_tokens,
+                            timestamp,
+                            current_model.clone(),
+                            turn_index,
+                        ));
+                        turn_index = turn_index.saturating_add(1);
+                    } else if let Some(turn) = active_turn.as_mut() {
+                        // Should not zero-base after usage; observe only if a
+                        // turn already exists with a real baseline.
+                        turn.observe_total(total_tokens, timestamp);
+                    }
+                } else if let Some(turn) = active_turn.as_mut() {
+                    turn.observe_total(total_tokens, timestamp);
+                }
             }
         }
     }
@@ -423,6 +483,11 @@ fn emit_usage_messages(
         }
     }
 
+    // True only when parent costUsdTicks was copied onto a modelUsage row.
+    // Multi-model zero-cost siblings may then be ProviderReported $0; otherwise
+    // an omitting sibling stays Unknown for apply_pricing estimation.
+    let mut parent_cost_inherited = false;
+
     if rows.is_empty() {
         if top.has_positive_tokens() {
             rows.push(top);
@@ -435,7 +500,7 @@ fn emit_usage_messages(
         // drop provider-reported cost. Single-model: full inherit. Multi-model:
         // put parent totals on the first row only when no model entry has them
         // (avoids double-counting the parent cost across models).
-        inherit_top_level_cost_and_duration(&mut rows, &top);
+        parent_cost_inherited = inherit_top_level_cost_and_duration(&mut rows, &top);
     }
 
     let turn_key = prompt_id
@@ -444,12 +509,11 @@ fn emit_usage_messages(
         .unwrap_or_else(|| format!("turn:{turn_index}"));
 
     let multi_model = rows.len() > 1;
-    // When multi-model inherits parent cost onto the first row only (or any
-    // sibling already carries provider cost), remaining zero-cost rows must
-    // not stay CostSource::Unknown — apply_pricing_if_available would estimate
-    // them on top of the parent total. Mark them ProviderReported at $0 so
-    // pricing is blocked without inventing tokens or double-counting cost.
-    let any_row_has_provider_cost = rows.iter().any(|r| r.cost_usd_ticks > 0);
+    // Only when multi-model inherits parent cost onto the first row must
+    // remaining zero-cost siblings be ProviderReported at $0 so pricing cannot
+    // stack estimates on top of that once-inherited total. If a model entry has
+    // its own costUsdTicks and a sibling simply omits cost (no parent inherit),
+    // the omitting row stays Unknown so apply_pricing can estimate it.
     let mut messages = Vec::with_capacity(rows.len());
     for (model_i, row) in rows.into_iter().enumerate() {
         let model_id = row
@@ -477,7 +541,7 @@ fn emit_usage_messages(
 
         let (cost, cost_source) = match row.cost_usd() {
             Some(cost) => (cost, CostSource::ProviderReported),
-            None if multi_model && any_row_has_provider_cost => {
+            None if multi_model && parent_cost_inherited => {
                 (0.0, CostSource::ProviderReported)
             }
             None => (0.0, CostSource::Unknown),
@@ -516,25 +580,32 @@ fn emit_usage_messages(
 /// When `modelUsage` rows omit cost/duration, copy them from the parent usage
 /// object. Single-model inherits fully; multi-model places parent totals on
 /// the first row only if every model entry is missing them.
-fn inherit_top_level_cost_and_duration(rows: &mut [ParsedUsage], top: &ParsedUsage) {
+///
+/// Returns `true` when parent `costUsdTicks` was copied onto a row (so multi-
+/// model zero-cost siblings may be sealed as ProviderReported $0).
+fn inherit_top_level_cost_and_duration(rows: &mut [ParsedUsage], top: &ParsedUsage) -> bool {
     if rows.is_empty() {
-        return;
+        return false;
     }
+    let mut cost_inherited = false;
     if rows.len() == 1 {
         if rows[0].cost_usd_ticks <= 0 && top.cost_usd_ticks > 0 {
             rows[0].cost_usd_ticks = top.cost_usd_ticks;
+            cost_inherited = true;
         }
         if rows[0].api_duration_ms.is_none() {
             rows[0].api_duration_ms = top.api_duration_ms;
         }
-        return;
+        return cost_inherited;
     }
     if top.cost_usd_ticks > 0 && rows.iter().all(|r| r.cost_usd_ticks <= 0) {
         rows[0].cost_usd_ticks = top.cost_usd_ticks;
+        cost_inherited = true;
     }
     if top.api_duration_ms.is_some() && rows.iter().all(|r| r.api_duration_ms.is_none()) {
         rows[0].api_duration_ms = top.api_duration_ms;
     }
+    cost_inherited
 }
 
 /// Parses Grok Build's append-only unified log. Each `shell.turn.inference_done`
@@ -2030,5 +2101,116 @@ mod tests {
         assert!(messages
             .iter()
             .all(|m| m.cost_source == CostSource::ProviderReported));
+    }
+
+    #[test]
+    fn post_usage_live_partial_does_not_zero_base_without_counter() {
+        // Completed usage with no _meta.totalTokens ever seen, then a new user
+        // turn whose first context counter is full occupancy. Must not emit
+        // that occupancy as delta-from-0 (would double-count completed usage).
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":10000,"outputTokens":100,"totalTokens":10100,"cachedReadTokens":0,"reasoningTokens":0}},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":50000,"agentTimestampMs":1700000002000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":55000,"agentTimestampMs":1700000003000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 2, "usage + live partial only, got {messages:?}");
+        assert_eq!(messages[0].tokens.input, 10000);
+        assert_eq!(messages[0].tokens.output, 100);
+        // First counter (50000) is baseline only; live partial is 55000-50000.
+        assert_eq!(
+            messages[1].tokens.input, 5000,
+            "must not emit full occupancy 50000 as zero-based input"
+        );
+        assert_eq!(messages[1].tokens.output, 0);
+        assert!(messages[1].is_turn_start);
+        assert_eq!(token_all(&messages), 10000 + 100 + 5000);
+    }
+
+    #[test]
+    fn post_usage_live_partial_waits_for_baseline_when_only_first_counter() {
+        // Same shape but open turn ends at the first post-usage counter: that
+        // counter establishes baseline only, so no live partial is emitted.
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":8000,"outputTokens":80,"totalTokens":8080,"cachedReadTokens":0,"reasoningTokens":0}},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":42000,"agentTimestampMs":1700000002000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(
+            messages.len(),
+            1,
+            "first post-usage counter is baseline only, got {messages:?}"
+        );
+        assert_eq!(messages[0].tokens.input, 8000);
+        assert_eq!(messages[0].tokens.output, 80);
+        assert_eq!(token_all(&messages), 8080);
+    }
+
+    #[test]
+    fn multi_model_own_cost_leaves_omitting_sibling_unknown() {
+        // One modelUsage entry has its own costUsdTicks; the other omits cost
+        // and parent does not cover both (parent has no cost). Omitting sibling
+        // must stay Unknown so apply_pricing can estimate — not ProviderReported $0.
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p-partial-cost","usage":{"inputTokens":300,"outputTokens":30,"totalTokens":330,"cachedReadTokens":0,"reasoningTokens":0,"modelUsage":{"grok-a":{"inputTokens":200,"outputTokens":20,"totalTokens":220,"cachedReadTokens":0,"reasoningTokens":0,"costUsdTicks":1500000000},"grok-b":{"inputTokens":100,"outputTokens":10,"totalTokens":110,"cachedReadTokens":0,"reasoningTokens":0}}}},"_meta":{"agentTimestampMs":1700000000000}}}"#,
+            None,
+            None,
+        );
+
+        let mut messages = parse_grok_updates_file(&path);
+        messages.sort_by(|a, b| a.model_id.cmp(&b.model_id));
+        assert_eq!(messages.len(), 2);
+        let a = messages.iter().find(|m| m.model_id == "grok-a").unwrap();
+        let b = messages.iter().find(|m| m.model_id == "grok-b").unwrap();
+        assert_eq!(a.cost_source, CostSource::ProviderReported);
+        assert!((a.cost - 1.5).abs() < 1e-12);
+        assert_eq!(
+            b.cost_source,
+            CostSource::Unknown,
+            "omitting sibling must stay Unknown when parent cost was not inherited"
+        );
+        assert_eq!(b.cost, 0.0);
+        assert!(!b.has_authoritative_cost());
+
+        // Pricing may estimate the Unknown sibling; authoritative row stays put.
+        let mut litellm = std::collections::HashMap::new();
+        litellm.insert(
+            "grok-b".to_string(),
+            crate::pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = crate::pricing::PricingService::new(litellm, std::collections::HashMap::new());
+        for message in &mut messages {
+            if message.has_authoritative_cost() {
+                continue;
+            }
+            let calculated = pricing.calculate_cost_with_provider(
+                &message.model_id,
+                Some(&message.provider_id),
+                &message.tokens,
+            );
+            if calculated > 0.0 {
+                message.cost = calculated;
+                message.mark_estimated_cost();
+            }
+        }
+        let a = messages.iter().find(|m| m.model_id == "grok-a").unwrap();
+        let b = messages.iter().find(|m| m.model_id == "grok-b").unwrap();
+        assert_eq!(a.cost_source, CostSource::ProviderReported);
+        assert!((a.cost - 1.5).abs() < 1e-12);
+        assert_eq!(b.cost_source, CostSource::Estimated);
+        // 100 input * 0.01 + 10 output * 0.02 = 1.2
+        assert!((b.cost - 1.2).abs() < 1e-12);
     }
 }
