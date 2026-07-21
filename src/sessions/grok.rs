@@ -289,6 +289,15 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
             Some(previous) if total_tokens < previous => {
                 if is_compaction_reset(previous, total_tokens) {
                     if active_turn.is_none() {
+                        // After usage, only user_message_chunk may open a live
+                        // partial. Compaction without an open user turn only
+                        // advances the counter baseline.
+                        if saw_usage {
+                            last_total_timestamp = timestamp;
+                            last_total = Some(total_tokens);
+                            context_baseline_after_usage = Some(total_tokens);
+                            continue;
+                        }
                         let mut turn = ActiveTurn::new(
                             0,
                             last_total_timestamp,
@@ -315,11 +324,18 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
             }
             Some(previous) => {
                 if active_turn.is_none() {
-                    let baseline = if saw_usage {
-                        context_baseline_after_usage.unwrap_or(previous)
-                    } else {
-                        previous
-                    };
+                    // After saw_usage / completed usage, do not open a new
+                    // ActiveTurn from non-user updates that only bump
+                    // `_meta.totalTokens`. Only user_message_chunk may start a
+                    // post-usage live partial; context-only growth advances the
+                    // baseline so the next user turn does not inherit it.
+                    if saw_usage {
+                        last_total_timestamp = timestamp;
+                        last_total = Some(total_tokens);
+                        context_baseline_after_usage = Some(total_tokens);
+                        continue;
+                    }
+                    let baseline = previous;
                     active_turn = Some(ActiveTurn::new(
                         baseline,
                         timestamp,
@@ -428,6 +444,12 @@ fn emit_usage_messages(
         .unwrap_or_else(|| format!("turn:{turn_index}"));
 
     let multi_model = rows.len() > 1;
+    // When multi-model inherits parent cost onto the first row only (or any
+    // sibling already carries provider cost), remaining zero-cost rows must
+    // not stay CostSource::Unknown — apply_pricing_if_available would estimate
+    // them on top of the parent total. Mark them ProviderReported at $0 so
+    // pricing is blocked without inventing tokens or double-counting cost.
+    let any_row_has_provider_cost = rows.iter().any(|r| r.cost_usd_ticks > 0);
     let mut messages = Vec::with_capacity(rows.len());
     for (model_i, row) in rows.into_iter().enumerate() {
         let model_id = row
@@ -455,6 +477,9 @@ fn emit_usage_messages(
 
         let (cost, cost_source) = match row.cost_usd() {
             Some(cost) => (cost, CostSource::ProviderReported),
+            None if multi_model && any_row_has_provider_cost => {
+                (0.0, CostSource::ProviderReported)
+            }
             None => (0.0, CostSource::Unknown),
         };
 
@@ -1873,5 +1898,137 @@ mod tests {
         assert_eq!(messages[0].cost_source, CostSource::ProviderReported);
         assert!((messages[0].cost - 2.5).abs() < 1e-12);
         assert_eq!(messages[0].message_count, 1);
+    }
+
+    #[test]
+    fn post_usage_context_partials_require_user_message_chunk() {
+        // After turn_completed.usage, non-user updates that only bump
+        // `_meta.totalTokens` must not open a live partial ActiveTurn.
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":50000,"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":10000,"outputTokens":100,"totalTokens":10100,"cachedReadTokens":0,"reasoningTokens":0}},"_meta":{"agentTimestampMs":1700000002000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":60000,"agentTimestampMs":1700000003000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"totalTokens":65000,"agentTimestampMs":1700000004000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(
+            messages.len(),
+            1,
+            "context-only growth after usage must not emit a partial, got {messages:?}"
+        );
+        assert_eq!(messages[0].tokens.input, 10000);
+        assert_eq!(messages[0].tokens.output, 100);
+        assert_eq!(token_all(&messages), 10100);
+    }
+
+    #[test]
+    fn post_usage_user_turn_baseline_skips_inter_turn_context_growth() {
+        // Context-only growth between completed usage and the next user turn
+        // advances the baseline only; the live partial starts from the latest
+        // counter, not the post-usage snapshot.
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":50000,"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":10000,"outputTokens":100,"totalTokens":10100,"cachedReadTokens":0,"reasoningTokens":0}},"_meta":{"agentTimestampMs":1700000002000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":60000,"agentTimestampMs":1700000003000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000004000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":65000,"agentTimestampMs":1700000005000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tokens.input, 10000);
+        assert_eq!(messages[0].tokens.output, 100);
+        // Live partial: 65000 - 60000 (inter-turn growth was baselined away).
+        assert_eq!(messages[1].tokens.input, 5000);
+        assert_eq!(messages[1].tokens.output, 0);
+        assert!(messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn multi_model_parent_cost_blocks_sibling_repricing() {
+        // Parent cost lands on the first modelUsage row only; siblings must be
+        // ProviderReported at $0 so a later pricing pass cannot estimate them
+        // on top of the parent total.
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"p-multi-cost","usage":{"inputTokens":300,"outputTokens":30,"totalTokens":330,"cachedReadTokens":0,"reasoningTokens":0,"costUsdTicks":2500000000,"modelUsage":{"grok-a":{"inputTokens":200,"outputTokens":20,"totalTokens":220,"cachedReadTokens":0,"reasoningTokens":0},"grok-b":{"inputTokens":100,"outputTokens":10,"totalTokens":110,"cachedReadTokens":0,"reasoningTokens":0}}}},"_meta":{"agentTimestampMs":1700000000000}}}"#,
+            None,
+            None,
+        );
+
+        let mut messages = parse_grok_updates_file(&path);
+        messages.sort_by(|a, b| a.model_id.cmp(&b.model_id));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].model_id, "grok-a");
+        assert_eq!(messages[1].model_id, "grok-b");
+
+        let parent_cost = 2.5;
+        let total_before: f64 = messages.iter().map(|m| m.cost).sum();
+        assert!(
+            (total_before - parent_cost).abs() < 1e-12,
+            "parent cost must appear once before pricing, got {total_before}"
+        );
+        assert!(messages
+            .iter()
+            .all(|m| m.cost_source == CostSource::ProviderReported));
+        assert!(messages.iter().all(|m| m.has_authoritative_cost()));
+        // Exactly one row carries the parent dollars; the sibling is $0.
+        assert_eq!(
+            messages.iter().filter(|m| m.cost > 0.0).count(),
+            1,
+            "only the first inherited row should carry parent cost"
+        );
+        assert!(messages.iter().any(|m| m.cost == 0.0));
+
+        // Hermetic pricing pass mirroring apply_pricing_if_available: models
+        // are resolvable at non-zero rates, but authoritative rows must not
+        // be overwritten.
+        let mut litellm = std::collections::HashMap::new();
+        litellm.insert(
+            "grok-a".to_string(),
+            crate::pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "grok-b".to_string(),
+            crate::pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = crate::pricing::PricingService::new(litellm, std::collections::HashMap::new());
+        for message in &mut messages {
+            if message.has_authoritative_cost() {
+                continue;
+            }
+            let calculated = pricing.calculate_cost_with_provider(
+                &message.model_id,
+                Some(&message.provider_id),
+                &message.tokens,
+            );
+            if calculated > 0.0 {
+                message.cost = calculated;
+                message.mark_estimated_cost();
+            }
+        }
+
+        let total_after: f64 = messages.iter().map(|m| m.cost).sum();
+        assert!(
+            (total_after - parent_cost).abs() < 1e-12,
+            "total cost must equal parent only once after pricing, got {total_after}"
+        );
+        assert!(messages
+            .iter()
+            .all(|m| m.cost_source == CostSource::ProviderReported));
     }
 }
