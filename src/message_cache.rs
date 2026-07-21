@@ -70,7 +70,11 @@ use std::time::UNIX_EPOCH;
 // anchors, duration merges, provider identity, or model aliases. Schema-30
 // entries can replay stale output under unchanged fingerprints, so rebuild them
 // once instead of importing upstream's per-parser shard versions.)
-const CACHE_SCHEMA_VERSION: u32 = 31;
+// 32 (Grok Build: prefer turn_completed.params.update.usage over the
+// context-window _meta.totalTokens delta. Schema-31 caches can replay
+// undercounted context-only rows for sessions that already have authoritative
+// per-turn usage, so unchanged sources must be rebuilt.)
+const CACHE_SCHEMA_VERSION: u32 = 32;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
