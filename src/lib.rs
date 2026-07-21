@@ -168,6 +168,22 @@ fn retain_for_requested_clients(
             && sessions::synthetic::matches_synthetic_filter(client, model_id, provider_id))
 }
 
+fn prefer_copilot_otel_messages(
+    mut otel_messages: Vec<UnifiedMessage>,
+    desktop_messages: Vec<UnifiedMessage>,
+) -> Vec<UnifiedMessage> {
+    let otel_sessions: HashSet<String> = otel_messages
+        .iter()
+        .map(|message| message.session_id.clone())
+        .collect();
+    otel_messages.extend(
+        desktop_messages
+            .into_iter()
+            .filter(|message| !otel_sessions.contains(message.session_id.as_str())),
+    );
+    otel_messages
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub enum GroupBy {
     Model,
@@ -350,11 +366,12 @@ pub struct LocalParseOptions {
     /// Persistent scanner config loaded from `~/.config/tokscale/settings.json`.
     /// Defaults to empty when callers don't care about user-configured paths.
     pub scanner_settings: scanner::ScannerSettings,
-    /// Skip parsing file-backed session logs whose mtime (unix ms) is older
-    /// than this. Lets high-frequency callers (live tails) avoid re-parsing
-    /// an entire history when they only need recent messages — callers align
-    /// it with `since`. Database-backed sources (SQLite) are always parsed:
-    /// WAL writes may not touch the main db file's mtime.
+    /// Skip parsing session sources whose newest relevant mtime (unix ms) is
+    /// older than this. Lets high-frequency callers (live tails) avoid
+    /// re-parsing an entire history when they only need recent messages —
+    /// callers align it with `since`. SQLite lanes are either retained or use
+    /// source-specific DB/WAL/dependency probes because WAL writes may not touch
+    /// the main database mtime.
     pub modified_after: Option<u64>,
 }
 
@@ -1030,17 +1047,40 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Copilot)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
+            load_or_parse_source(path, &source_cache, None, |path| {
                 sessions::copilot::parse_copilot_file(path)
             })
         })
         .collect();
+    let mut copilot_otel_messages = Vec::new();
     for outcome in copilot_outcomes {
-        all_messages.extend(outcome.messages);
+        copilot_otel_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
+    let mut copilot_desktop_messages = Vec::new();
+    if let Some(db_path) = &scan_result.copilot_desktop_db {
+        let outcome = load_or_parse_source_with_fingerprint(
+            db_path,
+            &source_cache,
+            None,
+            message_cache::SourceFingerprint::from_copilot_desktop_path,
+            sessions::copilot_desktop::parse_copilot_desktop_db,
+        );
+        copilot_desktop_messages = outcome.messages;
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    all_messages.extend(
+        prefer_copilot_otel_messages(copilot_otel_messages, copilot_desktop_messages)
+            .into_iter()
+            .map(|mut message| {
+                apply_pricing_if_available(&mut message, pricing);
+                message
+            }),
+    );
 
     let gemini_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
         .get(ClientId::Gemini)
@@ -2927,7 +2967,97 @@ where
             }
         }};
     }
-    simple_lane!(ClientId::Copilot,   sessions::copilot::parse_copilot_file);
+    // ---- Copilot OTEL + Desktop aggregate (whole-session OTEL authority) ----
+    {
+        let otel_paths = scan_result.get(ClientId::Copilot);
+        let mut raw_by_path: Vec<Option<Vec<UnifiedMessage>>> =
+            (0..otel_paths.len()).map(|_| None).collect();
+        let mut miss_paths: Vec<(usize, &PathBuf)> = Vec::new();
+
+        for (index, path) in otel_paths.iter().enumerate() {
+            let fingerprint = message_cache::SourceFingerprint::from_path(path);
+            let cache_hit = fingerprint.as_ref().and_then(|fingerprint| {
+                source_cache.get(path).filter(|cached| {
+                    cached.fingerprint == *fingerprint && !cached.messages.is_empty()
+                })
+            });
+            if let Some(cached) = cache_hit {
+                raw_by_path[index] = Some(cached.messages.clone());
+            } else {
+                miss_paths.push((index, path));
+            }
+        }
+
+        let parsed_misses: Vec<(usize, &PathBuf, Vec<UnifiedMessage>)> = miss_paths
+            .par_iter()
+            .map(|(index, path)| (*index, *path, sessions::copilot::parse_copilot_file(path)))
+            .collect();
+        for (index, path, messages) in parsed_misses {
+            if !messages.is_empty() {
+                if let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) {
+                    source_cache.insert(message_cache::CachedSourceEntry::new(
+                        path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            }
+            raw_by_path[index] = Some(messages);
+        }
+
+        let otel_messages = raw_by_path
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>();
+        let desktop_messages = scan_result
+            .copilot_desktop_db
+            .as_ref()
+            .map(|db_path| {
+                let fingerprint =
+                    message_cache::SourceFingerprint::from_copilot_desktop_path(db_path);
+                if let Some(cached) = fingerprint.as_ref().and_then(|fingerprint| {
+                    source_cache.get(db_path).filter(|cached| {
+                        cached.fingerprint == *fingerprint && !cached.messages.is_empty()
+                    })
+                }) {
+                    return cached.messages.clone();
+                }
+
+                let messages = sessions::copilot_desktop::parse_copilot_desktop_db(db_path);
+                if !messages.is_empty() {
+                    if let Some(fingerprint) = fingerprint {
+                        source_cache.insert(message_cache::CachedSourceEntry::new(
+                            db_path,
+                            fingerprint,
+                            messages.clone(),
+                            Vec::new(),
+                            None,
+                        ));
+                    }
+                }
+                messages
+            })
+            .unwrap_or_default();
+
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        for mut message in prefer_copilot_otel_messages(otel_messages, desktop_messages) {
+            message.refresh_derived_fields();
+            reprice_lane_message(&mut message, pricing, false);
+            if !passes_client(&message) {
+                continue;
+            }
+            let keep = message
+                .dedup_key
+                .as_ref()
+                .is_none_or(|key| key.is_empty() || dedup_gate_passes(key, &mut seen_keys));
+            if keep && filter(&message) {
+                sink(&message);
+            }
+        }
+    }
     simple_lane!(ClientId::Cursor,    sessions::cursor::parse_cursor_file);
     simple_lane!(ClientId::Warp,      sessions::warp::parse_warp_file);
     simple_lane!(ClientId::Amp,       sessions::amp::parse_amp_file);
@@ -3677,6 +3807,9 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
         wal.push("-wal");
         latest = latest.max(file_mtime_ms(Path::new(&wal)).unwrap_or(0));
     }
+    if let Some(db_path) = &scan_result.copilot_desktop_db {
+        latest = latest.max(copilot_desktop_source_mtime_ms(db_path).unwrap_or(0));
+    }
     // jcode snapshots (`session_*.json`) carry a sibling `.journal.jsonl`
     // append-log; jcode writes new turns there between snapshot rewrites,
     // leaving the snapshot's mtime untouched. The snapshot itself is already
@@ -3759,6 +3892,33 @@ pub fn local_source_change_token(options: &LocalParseOptions) -> Result<u64, Str
         wal.push("-wal");
         paths.push(PathBuf::from(wal));
     }
+    if let Some(db_path) = &scan_result.copilot_desktop_db {
+        probe_readable_dependency(db_path, false).map_err(|error| {
+            format!(
+                "Failed to read Copilot Desktop database {}: {error}",
+                db_path.display()
+            )
+        })?;
+        paths.push(db_path.clone());
+        let mut wal = db_path.clone().into_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        probe_readable_dependency(&wal, true).map_err(|error| {
+            format!(
+                "Failed to read Copilot Desktop WAL {}: {error}",
+                wal.display()
+            )
+        })?;
+        paths.push(wal);
+        paths.extend(
+            sessions::copilot_desktop::session_state_event_paths(db_path).map_err(|error| {
+                format!(
+                    "Failed to probe Copilot Desktop session-state dependencies for {}: {error}",
+                    db_path.display()
+                )
+            })?,
+        );
+    }
 
     for snapshot in scan_result.get(ClientId::Jcode) {
         paths.push(message_cache::jcode_journal_path(snapshot));
@@ -3820,6 +3980,14 @@ pub fn local_source_change_token(options: &LocalParseOptions) -> Result<u64, Str
     Ok(hasher.finish())
 }
 
+fn probe_readable_dependency(path: &Path, optional: bool) -> std::io::Result<()> {
+    match std::fs::File::open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// File mtime as unix ms; `None` on any stat failure.
 fn file_mtime_ms(path: &Path) -> Option<u64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
@@ -3876,6 +4044,16 @@ fn kiro_source_mtime_ms(session_path: &Path) -> Option<u64> {
     )
 }
 
+fn copilot_desktop_source_mtime_ms(db_path: &Path) -> Option<u64> {
+    probe_readable_dependency(db_path, false).ok()?;
+    let mut wal = db_path.to_path_buf().into_os_string();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    probe_readable_dependency(&wal, true).ok()?;
+    let events = sessions::copilot_desktop::session_state_event_paths(db_path).ok()?;
+    source_with_related_mtime_ms(db_path, std::iter::once(wal).chain(events))
+}
+
 /// Newest mtime for a Grok source and every file that affects its parse. The
 /// unified log is self-contained; legacy updates include metadata siblings kept
 /// in lockstep with `SourceFingerprint::from_grok_path`. `None` keeps the source
@@ -3910,6 +4088,13 @@ fn grok_source_mtime_ms(source_path: &Path) -> Option<u64> {
 /// Any stat failure keeps the file — over-parsing is safe, silently skipping is
 /// not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
+    let copilot_desktop_fresh = scan_result.copilot_desktop_db.as_ref().is_some_and(|path| {
+        copilot_desktop_source_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
+    });
+    if !copilot_desktop_fresh {
+        scan_result.copilot_desktop_db = None;
+    }
+
     // Lanes whose scanned file's mtime does not reflect a sibling write
     // (SQLite `-wal` or jcode's `.journal.jsonl`); kept in lockstep with the
     // sibling probes in `latest_source_mtime_ms`.
@@ -3926,6 +4111,12 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
         ClientId::Cline as usize,
     ];
     for (lane, files) in scan_result.files.iter_mut().enumerate() {
+        if lane == ClientId::Copilot as usize && copilot_desktop_fresh {
+            // A fresh Desktop aggregate may overlap any older OTEL row from the
+            // same session. Keep the complete OTEL cohort so the shared selector
+            // cannot reopen Desktop usage that a full scan suppresses.
+            continue;
+        }
         if db_lanes.contains(&lane) {
             continue;
         }
@@ -4127,16 +4318,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Codex, codex_count);
     messages.extend(codex_msgs);
 
-    let copilot_msgs: Vec<ParsedMessage> = scan_result
+    let copilot_otel_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Copilot)
         .par_iter()
-        .flat_map(|path| {
-            sessions::copilot::parse_copilot_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::copilot::parse_copilot_file(path))
         .collect();
+    let copilot_desktop_messages = scan_result
+        .copilot_desktop_db
+        .as_ref()
+        .map(|path| sessions::copilot_desktop::parse_copilot_desktop_db(path))
+        .unwrap_or_default();
+    let copilot_msgs: Vec<ParsedMessage> =
+        prefer_copilot_otel_messages(copilot_otel_messages, copilot_desktop_messages)
+            .iter()
+            .map(unified_to_parsed)
+            .collect();
     let copilot_count = copilot_msgs.len() as i32;
     counts.set(ClientId::Copilot, copilot_count);
     messages.extend(copilot_msgs);
@@ -4721,10 +4917,10 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 mod tests {
     use super::{
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
-        canonical_model_id, clear_model_aliases, dedupe_latest_trae_messages,
-        fold_messages_streaming, get_agents_report, get_hourly_report, get_model_report,
-        get_monthly_report, latest_source_mtime_ms, local_source_change_token, message_cache,
-        model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
+        canonical_model_id, clear_model_aliases, copilot_desktop_source_mtime_ms,
+        dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
+        get_model_report, get_monthly_report, latest_source_mtime_ms, local_source_change_token,
+        message_cache, model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
         opencode_authoritative_sources, opencode_identity_group,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
         parse_local_unified_messages, parsed_to_unified, pricing, prune_scan_result_by_mtime,
@@ -4812,6 +5008,757 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
         )
+    }
+
+    fn copilot_desktop_test_db(home: &Path) -> (PathBuf, rusqlite::Connection) {
+        let root = home.join(".copilot");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("data.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                    id TEXT,
+                    model TEXT,
+                    total_input_tokens INTEGER,
+                    total_output_tokens INTEGER,
+                    total_cached_tokens INTEGER,
+                    total_reasoning_tokens INTEGER,
+                    total_nano_aiu INTEGER,
+                    created_at TEXT,
+                    agent TEXT
+                );
+                "#,
+            )
+            .unwrap();
+        (path, connection)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_copilot_desktop_session(
+        connection: &rusqlite::Connection,
+        session_id: &str,
+        model: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        reasoning: i64,
+        created_at: &str,
+        agent: Option<&str>,
+    ) {
+        connection
+            .execute(
+                r#"
+                INSERT INTO sessions (
+                    id, model, total_input_tokens, total_output_tokens,
+                    total_cached_tokens, total_reasoning_tokens, total_nano_aiu,
+                    created_at, agent
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)
+                "#,
+                rusqlite::params![
+                    session_id, model, input, output, cache_read, reasoning, created_at, agent
+                ],
+            )
+            .unwrap();
+    }
+
+    fn write_copilot_otel_message(
+        home: &Path,
+        session_id: &str,
+        unix_seconds: i64,
+        input: i64,
+        output: i64,
+        agent: Option<&str>,
+    ) -> PathBuf {
+        let root = home.join(".copilot/otel");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("copilot.jsonl");
+        let record = serde_json::json!({
+            "type": "span",
+            "traceId": format!("trace-{session_id}"),
+            "spanId": format!("span-{session_id}"),
+            "name": "chat gpt-5.4-mini",
+            "startTime": [unix_seconds, 0],
+            "attributes": {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.response.model": "gpt-5.4-mini",
+                "gen_ai.conversation.id": session_id,
+                "gen_ai.usage.input_tokens": input,
+                "gen_ai.usage.output_tokens": output,
+                "gen_ai.agent.id": agent,
+            }
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{record}").unwrap();
+        path
+    }
+
+    fn write_copilot_desktop_events(
+        home: &Path,
+        session_id: &str,
+        model: &str,
+        workspace: &str,
+    ) -> PathBuf {
+        let root = home.join(".copilot/session-state").join(session_id);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session.start\",\"data\":{{\"context\":{{\"cwd\":\"{workspace}\"}}}}}}\n{{\"type\":\"session.model_change\",\"data\":{{\"newModel\":\"{model}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn copilot_local_options(home: &Path) -> LocalParseOptions {
+        LocalParseOptions {
+            home_dir: Some(home.to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["copilot".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    fn copilot_report_options(home: &Path) -> ReportOptions {
+        ReportOptions {
+            home_dir: Some(home.to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["copilot".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn copilot_desktop_selector_prefers_otel_per_session() {
+        let message = |session_id: &str, dedup_key: &str, input: i64| {
+            UnifiedMessage::new_with_dedup(
+                "copilot",
+                "gpt-5.4-mini",
+                "openai",
+                session_id,
+                1_782_909_296_000,
+                TokenBreakdown {
+                    input,
+                    ..Default::default()
+                },
+                0.0,
+                Some(dedup_key.to_string()),
+            )
+        };
+        let selected = super::prefer_copilot_otel_messages(
+            vec![message("shared", "otel:shared", 10)],
+            vec![
+                message("shared", "copilot-desktop:shared", 100),
+                message("desktop-only", "copilot-desktop:desktop-only", 20),
+            ],
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected
+            .iter()
+            .any(|message| message.dedup_key.as_deref() == Some("otel:shared")));
+        assert!(selected.iter().any(|message| {
+            message.dedup_key.as_deref() == Some("copilot-desktop:desktop-only")
+        }));
+        assert!(!selected
+            .iter()
+            .any(|message| { message.dedup_key.as_deref() == Some("copilot-desktop:shared") }));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_desktop_authority_precedes_date_filters_in_all_consumers() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (_, connection) = copilot_desktop_test_db(source_home.path());
+        insert_copilot_desktop_session(
+            &connection,
+            "shared",
+            "gpt-5.4-mini",
+            100,
+            10,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            Some("github.copilot.default"),
+        );
+        drop(connection);
+        write_copilot_otel_message(
+            source_home.path(),
+            "shared",
+            1_735_689_600,
+            10,
+            1,
+            Some("github.copilot.default"),
+        );
+
+        let mut options = copilot_local_options(source_home.path());
+        options.since = Some("2026-07-01".to_string());
+        options.until = Some("2026-07-01".to_string());
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+        let materialized =
+            super::parse_local_unified_messages_resolved(options.clone(), home, &clients, None)
+                .unwrap();
+        assert!(materialized.is_empty());
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|message| message.date == "2026-07-01",
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert!(streamed.is_empty());
+
+        let counted = parse_local_clients(options).unwrap();
+        assert!(counted.messages.is_empty());
+        assert_eq!(counted.counts.get(ClientId::Copilot), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_desktop_cache_tracks_events_and_wal_updates() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        insert_copilot_desktop_session(
+            &connection,
+            "session-1",
+            "auto",
+            100,
+            10,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            Some("github.copilot.default"),
+        );
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+
+        let initial_fingerprint =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        let initial_token =
+            local_source_change_token(&copilot_local_options(source_home.path())).unwrap();
+        let cold = parse_all_messages_with_pricing(home, &clients, None);
+        let warm = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(cold, warm);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].model_id, "auto");
+
+        let events = write_copilot_desktop_events(
+            source_home.path(),
+            "session-1",
+            "claude-sonnet-4-5",
+            "/tmp/copilot-workspace",
+        );
+        let event_fingerprint =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        assert_ne!(event_fingerprint, initial_fingerprint);
+        assert_ne!(
+            local_source_change_token(&copilot_local_options(source_home.path())).unwrap(),
+            initial_token
+        );
+        let event_refresh = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(event_refresh.len(), 1);
+        assert_eq!(event_refresh[0].model_id, "claude-sonnet-4-5");
+        assert_eq!(
+            event_refresh[0].workspace_label.as_deref(),
+            Some("copilot-workspace")
+        );
+
+        let event_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        std::fs::File::open(&events)
+            .unwrap()
+            .set_modified(event_time)
+            .unwrap();
+        assert_eq!(
+            latest_source_mtime_ms(&copilot_local_options(source_home.path())).unwrap(),
+            1_800_000_000_000
+        );
+
+        let before_wal =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        insert_copilot_desktop_session(
+            &connection,
+            "session-2",
+            "gpt-5.4-mini",
+            20,
+            2,
+            0,
+            0,
+            "2026-07-01T13:00:00Z",
+            None,
+        );
+        let after_wal =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        assert_ne!(after_wal, before_wal);
+        let wal_refresh = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(wal_refresh.len(), 2);
+
+        let cache = message_cache::SourceMessageCache::load();
+        assert!(cache
+            .get(&db_path)
+            .is_some_and(|entry| entry.messages.iter().all(|message| message.cost == 0.0)));
+    }
+
+    #[test]
+    fn copilot_desktop_modified_after_keeps_otel_suppressors_and_fails_open() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        drop(connection);
+        let otel_path =
+            write_copilot_otel_message(source_home.path(), "shared", 1_735_689_600, 10, 1, None);
+        let events = write_copilot_desktop_events(
+            source_home.path(),
+            "shared",
+            "gpt-5.4-mini",
+            "/tmp/workspace",
+        );
+        let stale_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let fresh_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        std::fs::File::open(&db_path)
+            .unwrap()
+            .set_modified(stale_time)
+            .unwrap();
+        std::fs::File::open(&otel_path)
+            .unwrap()
+            .set_modified(stale_time)
+            .unwrap();
+        std::fs::File::open(&events)
+            .unwrap()
+            .set_modified(fresh_time)
+            .unwrap();
+
+        let mut event_fresh = scanner::ScanResult {
+            copilot_desktop_db: Some(db_path.clone()),
+            ..Default::default()
+        };
+        event_fresh
+            .get_mut(ClientId::Copilot)
+            .push(otel_path.clone());
+        prune_scan_result_by_mtime(&mut event_fresh, 1_700_043_200_000);
+        assert_eq!(event_fresh.copilot_desktop_db.as_ref(), Some(&db_path));
+        assert_eq!(event_fresh.get(ClientId::Copilot), &vec![otel_path.clone()]);
+
+        std::fs::File::open(&events)
+            .unwrap()
+            .set_modified(stale_time)
+            .unwrap();
+        let mut all_stale = scanner::ScanResult {
+            copilot_desktop_db: Some(db_path),
+            ..Default::default()
+        };
+        all_stale.get_mut(ClientId::Copilot).push(otel_path);
+        prune_scan_result_by_mtime(&mut all_stale, 1_700_043_200_000);
+        assert!(all_stale.copilot_desktop_db.is_none());
+        assert!(all_stale.get(ClientId::Copilot).is_empty());
+
+        let mut stat_failure = scanner::ScanResult {
+            copilot_desktop_db: Some(source_home.path().join("missing.db")),
+            ..Default::default()
+        };
+        stat_failure
+            .get_mut(ClientId::Copilot)
+            .push(source_home.path().join("missing-otel.jsonl"));
+        prune_scan_result_by_mtime(&mut stat_failure, u64::MAX);
+        assert!(stat_failure.copilot_desktop_db.is_some());
+        assert_eq!(stat_failure.get(ClientId::Copilot).len(), 1);
+    }
+
+    #[test]
+    fn copilot_desktop_dependency_probe_failure_fails_open() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        drop(connection);
+        let session_state = source_home.path().join(".copilot/session-state");
+        std::fs::create_dir_all(&session_state).unwrap();
+        std::fs::File::create(session_state.join("not-a-directory")).unwrap();
+        let otel_path =
+            write_copilot_otel_message(source_home.path(), "shared", 1_735_689_600, 10, 1, None);
+
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_none());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_err());
+
+        let mut scan_result = scanner::ScanResult {
+            copilot_desktop_db: Some(db_path.clone()),
+            ..Default::default()
+        };
+        scan_result
+            .get_mut(ClientId::Copilot)
+            .push(otel_path.clone());
+        prune_scan_result_by_mtime(&mut scan_result, u64::MAX);
+
+        assert_eq!(scan_result.copilot_desktop_db.as_ref(), Some(&db_path));
+        assert_eq!(scan_result.get(ClientId::Copilot), &vec![otel_path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copilot_desktop_unreadable_event_bypasses_caches_and_pruning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        insert_copilot_desktop_session(
+            &connection,
+            "shared",
+            "auto",
+            100,
+            10,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            None,
+        );
+        drop(connection);
+        let events = write_copilot_desktop_events(
+            source_home.path(),
+            "shared",
+            "gpt-5.4-mini",
+            "/tmp/workspace",
+        );
+        let otel_path =
+            write_copilot_otel_message(source_home.path(), "shared", 1_735_689_600, 10, 1, None);
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_some());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_ok());
+
+        std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_none());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_err());
+
+        let mut scan_result = scanner::ScanResult {
+            copilot_desktop_db: Some(db_path.clone()),
+            ..Default::default()
+        };
+        scan_result
+            .get_mut(ClientId::Copilot)
+            .push(otel_path.clone());
+        prune_scan_result_by_mtime(&mut scan_result, u64::MAX);
+        std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(scan_result.copilot_desktop_db.as_ref(), Some(&db_path));
+        assert_eq!(scan_result.get(ClientId::Copilot), &vec![otel_path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn copilot_desktop_unreadable_wal_never_reuses_db_only_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        insert_copilot_desktop_session(
+            &connection,
+            "one",
+            "gpt-5.4-mini",
+            10,
+            1,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            None,
+        );
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(connection);
+        let mut wal = db_path.clone().into_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        if wal.exists() {
+            std::fs::remove_file(&wal).unwrap();
+        }
+
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+        assert_eq!(
+            parse_all_messages_with_pricing(home, &clients, None).len(),
+            1
+        );
+        let db_only_fingerprint =
+            message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).unwrap();
+        let sentinel = UnifiedMessage::new_with_dedup(
+            "copilot",
+            "cached-sentinel",
+            "github-copilot",
+            "cached-sentinel",
+            1_782_909_296_000,
+            TokenBreakdown {
+                input: 999,
+                ..Default::default()
+            },
+            0.0,
+            Some("copilot-desktop:cached-sentinel".to_string()),
+        );
+        let mut cache = message_cache::SourceMessageCache::load();
+        cache.insert(message_cache::CachedSourceEntry::new(
+            &db_path,
+            db_only_fingerprint,
+            vec![sentinel],
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        insert_copilot_desktop_session(
+            &writer,
+            "two",
+            "gpt-5.4-mini",
+            20,
+            2,
+            0,
+            0,
+            "2026-07-01T13:00:00Z",
+            None,
+        );
+        assert!(wal.is_file());
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_some());
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_none());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_err());
+        assert!(copilot_desktop_source_mtime_ms(&db_path).is_none());
+        let materialized = parse_all_messages_with_pricing(home, &clients, None);
+        assert!(!materialized
+            .iter()
+            .any(|message| message.model_id == "cached-sentinel"));
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert!(!streamed
+            .iter()
+            .any(|message| message.model_id == "cached-sentinel"));
+
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(writer);
+        assert_eq!(
+            parse_all_messages_with_pricing(home, &clients, None).len(),
+            2
+        );
+
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(message_cache::SourceFingerprint::from_copilot_desktop_path(&db_path).is_none());
+        assert!(local_source_change_token(&copilot_local_options(source_home.path())).is_err());
+        assert!(copilot_desktop_source_mtime_ms(&db_path).is_none());
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_desktop_materialized_streaming_count_and_report_parity() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let (db_path, connection) = copilot_desktop_test_db(source_home.path());
+        insert_copilot_desktop_session(
+            &connection,
+            "shared",
+            "gpt-5.4-mini",
+            100,
+            10,
+            0,
+            0,
+            "2026-07-01T12:34:56Z",
+            Some("github.copilot.default"),
+        );
+        insert_copilot_desktop_session(
+            &connection,
+            "desktop-only",
+            "gpt-5.4-mini",
+            40,
+            10,
+            0,
+            0,
+            "2026-07-01T13:00:00Z",
+            Some("github.copilot.default"),
+        );
+        drop(connection);
+        let otel_path = write_copilot_otel_message(
+            source_home.path(),
+            "shared",
+            1_782_909_296,
+            20,
+            5,
+            Some("github.copilot.default"),
+        );
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["copilot".to_string()];
+
+        let mut materialized = parse_all_messages_with_pricing(home, &clients, None);
+        let cold_materialized = materialized.clone();
+        let mut warm_materialized = parse_all_messages_with_pricing(home, &clients, None);
+        materialized.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        warm_materialized.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        assert_eq!(materialized, warm_materialized);
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            60
+        );
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.output)
+                .sum::<i64>(),
+            15
+        );
+        assert!(!materialized
+            .iter()
+            .any(|message| { message.dedup_key.as_deref() == Some("copilot-desktop:shared") }));
+
+        let cache = message_cache::SourceMessageCache::load();
+        assert!(cache
+            .get(&db_path)
+            .is_some_and(|entry| entry.messages.len() == 2));
+        assert!(cache
+            .get(&otel_path)
+            .is_some_and(|entry| entry.messages.len() == 1));
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        streamed.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        assert_eq!(streamed, materialized);
+
+        let counted = parse_local_clients(copilot_local_options(source_home.path())).unwrap();
+        assert_eq!(counted.counts.get(ClientId::Copilot), 2);
+        assert_eq!(counted.messages.len(), 2);
+        for message in &counted.messages {
+            let source = materialized
+                .iter()
+                .find(|source| source.session_id == message.session_id)
+                .unwrap();
+            assert_eq!(message.client, source.client);
+            assert_eq!(message.model_id, source.model_id);
+            assert_eq!(message.provider_id, source.provider_id);
+            assert_eq!(message.workspace_key, source.workspace_key);
+            assert_eq!(message.workspace_label, source.workspace_label);
+            assert_eq!(message.timestamp, source.timestamp);
+            assert_eq!(message.date, source.date);
+            assert_eq!(message.input, source.tokens.input);
+            assert_eq!(message.output, source.tokens.output);
+            assert_eq!(message.cache_read, source.tokens.cache_read);
+            assert_eq!(message.cache_write, source.tokens.cache_write);
+            assert_eq!(message.reasoning, source.tokens.reasoning);
+            assert_eq!(message.duration_ms, source.duration_ms);
+            assert_eq!(message.message_count, source.message_count);
+            assert_eq!(message.agent, source.agent);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let options = copilot_report_options(source_home.path());
+        let graph = runtime
+            .block_on(super::generate_graph_with_loaded_pricing(
+                options.clone(),
+                None,
+            ))
+            .unwrap();
+        let model = runtime.block_on(get_model_report(options.clone())).unwrap();
+        let monthly = runtime
+            .block_on(get_monthly_report(options.clone()))
+            .unwrap();
+        let hourly = runtime
+            .block_on(get_hourly_report(options.clone()))
+            .unwrap();
+        let agents = runtime.block_on(get_agents_report(options)).unwrap();
+        let expected_tokens = cold_materialized
+            .iter()
+            .map(|message| message.tokens.total())
+            .sum::<i64>();
+
+        assert_eq!(graph.summary.total_tokens, expected_tokens);
+        assert_eq!(
+            graph
+                .contributions
+                .iter()
+                .map(|entry| entry.totals.messages)
+                .sum::<i32>(),
+            2
+        );
+        assert_eq!(model.total_messages, 2);
+        assert_eq!(model.total_input, 60);
+        assert_eq!(model.total_output, 15);
+        assert_eq!(
+            monthly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            2
+        );
+        assert_eq!(
+            hourly
+                .entries
+                .iter()
+                .map(|entry| entry.message_count)
+                .sum::<i32>(),
+            2
+        );
+        assert_eq!(agents.total_messages, 2);
+        assert_eq!(
+            agents.entries.iter().map(|entry| entry.input).sum::<i64>(),
+            60
+        );
     }
 
     #[test]
