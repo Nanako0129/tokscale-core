@@ -489,6 +489,38 @@ pub(crate) fn discover_hermes_profile_state_dbs(hermes_home: &Path) -> Vec<PathB
     dbs
 }
 
+/// Candidate Hermes homes for the default database and named profiles.
+///
+/// An explicit `HERMES_HOME` is authoritative, including when it scopes the
+/// scan to one profile. Otherwise Windows also uses `%LOCALAPPDATA%/hermes`;
+/// the supplied-home fallback is always included so isolated scans can resolve
+/// the equivalent `AppData/Local/hermes` layout without process environment.
+fn hermes_home_candidates(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let mut homes = vec![PathBuf::from(
+        ClientId::Hermes
+            .data()
+            .root
+            .resolve_with_env_strategy(home_dir, use_env_roots),
+    )];
+
+    let hermes_home_set = use_env_roots
+        && std::env::var("HERMES_HOME")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    if !hermes_home_set {
+        if cfg!(target_os = "windows") && use_env_roots {
+            if let Some(local_app_data) =
+                std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty())
+            {
+                homes.push(PathBuf::from(local_app_data).join("hermes"));
+            }
+        }
+        homes.push(PathBuf::from(home_dir).join("AppData/Local/hermes"));
+    }
+
+    homes
+}
+
 /// Claude desktop "Cowork" (local-agent-mode) writes standard Claude Code
 /// transcripts under a fresh per-session directory:
 ///
@@ -1183,20 +1215,21 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     if enabled.contains(&ClientId::Hermes) {
-        let hermes_db_path = PathBuf::from(
-            ClientId::Hermes
-                .data()
-                .resolve_path_with_env_strategy(home_dir, use_env_roots),
-        );
-        let hermes_home = hermes_db_path.parent().map(Path::to_path_buf);
-        if hermes_db_path.is_file() {
-            result.hermes_db = Some(hermes_db_path);
+        let mut extra_dbs = Vec::new();
+        for hermes_home in hermes_home_candidates(home_dir, use_env_roots) {
+            let default_db = hermes_home.join("state.db");
+            if default_db.is_file() {
+                if result.hermes_db.is_none() {
+                    result.hermes_db = Some(default_db);
+                } else if result.hermes_db.as_ref() != Some(&default_db) {
+                    extra_dbs.push(default_db);
+                }
+            }
+            extra_dbs.extend(discover_hermes_profile_state_dbs(&hermes_home));
         }
-        if let Some(hermes_home) = hermes_home {
-            result
-                .get_mut(ClientId::Hermes)
-                .extend(discover_hermes_profile_state_dbs(&hermes_home));
-        }
+        extra_dbs.sort_unstable();
+        extra_dbs.dedup();
+        result.get_mut(ClientId::Hermes).extend(extra_dbs);
     }
 
     if enabled.contains(&ClientId::Goose) {
@@ -2451,6 +2484,89 @@ mod tests {
         assert_eq!(result.hermes_db.as_ref(), Some(&aliased_db));
         assert_eq!(result.hermes_db_paths(), vec![aliased_db]);
         assert!(!result.hermes_db_paths().contains(&nested_db));
+    }
+
+    #[test]
+    fn test_scan_discovers_hermes_windows_local_appdata_home() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(&windows_home).unwrap();
+        let default_db = windows_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_dir = windows_home.join("profiles/research");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(result.hermes_db_paths(), vec![default_db, profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_explicit_hermes_home_does_not_widen_to_windows_fallback() {
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let explicit_home = home.join("custom-hermes-home");
+        fs::create_dir_all(&explicit_home).unwrap();
+        let explicit_db = explicit_home.join("state.db");
+        File::create(&explicit_db).unwrap();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(&windows_home).unwrap();
+        File::create(windows_home.join("state.db")).unwrap();
+
+        _hermes.set("HERMES_HOME", &explicit_home);
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&explicit_db));
+        assert_eq!(result.hermes_db_paths(), vec![explicit_db]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hermes_windows_fallback_dedups_physical_database_overlaps() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(windows_home.join("profiles/research")).unwrap();
+        File::create(windows_home.join("state.db")).unwrap();
+        File::create(windows_home.join("profiles/research/state.db")).unwrap();
+        std::os::unix::fs::symlink(&windows_home, home.join(".hermes")).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        let paths = result.hermes_db_paths();
+        assert_eq!(paths.len(), 2, "physical dbs must be parsed exactly once");
+        let canonical: HashSet<PathBuf> = paths
+            .iter()
+            .map(|path| std::fs::canonicalize(path).unwrap())
+            .collect();
+        assert_eq!(canonical.len(), 2);
     }
 
     #[test]
