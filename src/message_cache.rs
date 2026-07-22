@@ -239,6 +239,45 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related_paths)
     }
 
+    pub(crate) fn from_copilot_desktop_path(path: &Path) -> Option<Self> {
+        let root = path.parent().unwrap_or_else(|| Path::new("."));
+        File::open(path).ok()?;
+        let events = crate::sessions::copilot_desktop::session_state_event_paths(path).ok()?;
+        let mut fingerprint = Self::from_path(path)?;
+        let wal_path = append_path_suffix(path, "-wal");
+        match fs::metadata(&wal_path) {
+            Ok(metadata) if metadata.is_file() => {
+                File::open(&wal_path).ok()?;
+                fingerprint
+                    .related_files
+                    .push(RelatedFileFingerprint::from_path(
+                        "-wal".to_string(),
+                        &wal_path,
+                    )?);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        fingerprint.related_files.extend(
+            events
+                .into_iter()
+                .map(|event| {
+                    let label = event
+                        .strip_prefix(root)
+                        .unwrap_or(&event)
+                        .to_string_lossy()
+                        .into_owned();
+                    RelatedFileFingerprint::from_path(label, &event)
+                })
+                .collect::<Option<Vec<_>>>()?,
+        );
+        fingerprint
+            .related_files
+            .sort_by(|left, right| left.suffix.cmp(&right.suffix));
+        Some(fingerprint)
+    }
+
     /// Fingerprint for a jcode session snapshot plus its sibling
     /// `<session>.journal.jsonl` append-log. jcode appends new turns to the
     /// journal between snapshot rewrites, so a journal-only write leaves the
