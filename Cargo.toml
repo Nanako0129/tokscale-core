@@ -1,14 +1,16 @@
-# Vendored from https://github.com/junhoyeo/tokscale (crates/tokscale-core).
-# Workspace inheritance was flattened so this builds standalone as a path
-# dependency inside TokenBar. Dependency versions mirror tokscale's root
-# [workspace.dependencies]; bump them together when re-vendoring upstream.
+# Originally vendored from https://github.com/junhoyeo/tokscale
+# (crates/tokscale-core), then extracted from TokenBar. Workspace inheritance
+# remains flattened so this builds standalone and as a consumer path dependency.
+# Dependency versions mirror tokscale's root [workspace.dependencies]; bump them
+# together when selectively syncing upstream.
 [package]
 name = "tokscale-core"
 version = "3.0.0"
+publish = false
 edition = "2021"
 authors = ["Junho Yeo <hello@junho.io>"]
 license = "MIT"
-repository = "https://github.com/junhoyeo/tokscale"
+repository = "https://github.com/Nanako0129/tokscale-core"
 description = "Core library for tokscale - session parsing, scanning, aggregation, pricing"
 
 [lib]
