@@ -1006,13 +1006,15 @@ fn collect_unified_child_evidence(
         }
 
         // Generation-scoped parent evidence: exactly the observations pass 2
-        // uses to populate `fallback_model_by_pid`, so pass-1 evidence and
-        // pass-2 fallback authority stay in lockstep.
+        // uses to populate `fallback_model_by_pid`, in the same precedence.
+        // Pass 2 accepts current `parent_model` first and stops there, so a
+        // legacy `model_id`/`model` on the same event is authority only when
+        // no parent field is present; consulting both here would mark an
+        // unambiguous generation `Conflict` and suppress the retro fill.
         if let Some((pid, model_id)) = unified_log_parent_model(&value) {
             let generation = current_unified_generation(&mut generations, pid);
             record_model_evidence(&mut evidence.parent_models, &(pid, generation), model_id);
-        }
-        if let Some((Some(pid), None, model_id)) = unified_log_model_change(&value) {
+        } else if let Some((Some(pid), None, model_id)) = unified_log_model_change(&value) {
             let generation = current_unified_generation(&mut generations, pid);
             record_model_evidence(&mut evidence.parent_models, &(pid, generation), model_id);
         }
@@ -1805,6 +1807,23 @@ mod tests {
         assert_eq!(
             messages[0].model_id, UNKNOWN_MODEL,
             "two conflicting parent models in the same generation must fail closed"
+        );
+    }
+
+    #[test]
+    fn unified_log_parent_retro_ignores_legacy_model_beside_parent_model() {
+        let (_temp, path) = write_unified_fixture(
+            r#"{"ts":"2026-07-31T00:00:00Z","pid":24,"sid":"row-mixed-schema","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":10,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:01Z","pid":24,"msg":"subagent model resolved","ctx":{"parent_model":"grok-4.7","model_id":"grok-legacy-other"}}"#,
+        );
+
+        let messages = parse_grok_unified_log_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].model_id, "grok-4.7",
+            "a legacy model field beside current parent_model is not parent authority, \
+             so it must not turn an unambiguous generation into a conflict"
         );
     }
 
