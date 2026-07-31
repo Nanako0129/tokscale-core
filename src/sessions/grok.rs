@@ -67,6 +67,12 @@ struct UnifiedChildEvidence {
     terminal_scopes: HashSet<UnifiedChildScope>,
     terminal_models: HashMap<UnifiedChildScope, UnifiedModelEvidence>,
     child_session_ids: HashSet<String>,
+    /// Generation-scoped parent model evidence, gathered from exactly the
+    /// observations that write `fallback_model_by_pid` in pass 2
+    /// (`unified_log_parent_model` and the `(Some(pid), None)` case of
+    /// `unified_log_model_change`). Used to retro-attribute inference rows
+    /// that precede the first model-bearing event for their own process.
+    parent_models: HashMap<UnifiedProcessKey, UnifiedModelEvidence>,
 }
 
 fn authoritative_model(value: Option<&Value>) -> Option<String> {
@@ -76,9 +82,9 @@ fn authoritative_model(value: Option<&Value>) -> Option<String> {
     })
 }
 
-fn record_model_evidence(
-    evidence: &mut HashMap<UnifiedChildScope, UnifiedModelEvidence>,
-    scope: &UnifiedChildScope,
+fn record_model_evidence<K: Eq + std::hash::Hash + Clone>(
+    evidence: &mut HashMap<K, UnifiedModelEvidence>,
+    scope: &K,
     model: String,
 ) {
     match evidence.entry(scope.clone()) {
@@ -154,6 +160,13 @@ fn unique_terminal_model<'a>(
     };
     let child_model = unique_child_model(evidence, scope)?;
     (terminal_model == child_model).then_some(child_model)
+}
+
+fn unique_parent_model(evidence: &UnifiedChildEvidence, key: UnifiedProcessKey) -> Option<&str> {
+    let UnifiedModelEvidence::Unique(model) = evidence.parent_models.get(&key)? else {
+        return None;
+    };
+    Some(model)
 }
 
 #[derive(Debug, Clone)]
@@ -932,12 +945,15 @@ fn parse_grok_unified_log_snapshot(
                 .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
         } else if known_child_session {
             UNKNOWN_MODEL.to_string()
+        } else if let Some(model_id) = model_by_session
+            .get(&session_id)
+            .or_else(|| fallback_model_by_pid.get(&(pid, generation)))
+        {
+            model_id.clone()
+        } else if let Some(model_id) = unique_parent_model(&evidence, (pid, generation)) {
+            model_id.to_string()
         } else {
-            model_by_session
-                .get(&session_id)
-                .or_else(|| fallback_model_by_pid.get(&(pid, generation)))
-                .cloned()
-                .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
+            UNKNOWN_MODEL.to_string()
         };
         let mut message = UnifiedMessage::new_with_dedup(
             CLIENT_ID,
@@ -987,6 +1003,18 @@ fn collect_unified_child_evidence(
         if let Some(pid) = unified_log_process_start_pid(&value) {
             advance_unified_generation(&mut generations, pid);
             continue;
+        }
+
+        // Generation-scoped parent evidence: exactly the observations pass 2
+        // uses to populate `fallback_model_by_pid`, so pass-1 evidence and
+        // pass-2 fallback authority stay in lockstep.
+        if let Some((pid, model_id)) = unified_log_parent_model(&value) {
+            let generation = current_unified_generation(&mut generations, pid);
+            record_model_evidence(&mut evidence.parent_models, &(pid, generation), model_id);
+        }
+        if let Some((Some(pid), None, model_id)) = unified_log_model_change(&value) {
+            let generation = current_unified_generation(&mut generations, pid);
+            record_model_evidence(&mut evidence.parent_models, &(pid, generation), model_id);
         }
 
         let message_name = value.get("msg").and_then(Value::as_str);
@@ -1653,7 +1681,10 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].model_id, "grok-old");
         assert_eq!(messages[1].model_id, "grok-session");
-        assert_eq!(messages[2].model_id, UNKNOWN_MODEL);
+        // Row precedes its own generation's only model evidence ("grok-new" at
+        // ts23), so parent retro attribution now resolves it — the gen0 model
+        // ("grok-old") still does not leak across the AuthManager::new restart.
+        assert_eq!(messages[2].model_id, "grok-new");
         assert_eq!(messages[3].model_id, "grok-new");
     }
 
@@ -1740,6 +1771,76 @@ mod tests {
         assert_eq!(messages[2].model_id, UNKNOWN_MODEL);
         assert_eq!(messages[3].model_id, UNKNOWN_MODEL);
         assert_eq!(messages[4].model_id, UNKNOWN_MODEL);
+    }
+
+    #[test]
+    fn unified_log_retrofits_parent_rows_to_unique_generation_model() {
+        let (_temp, path) = write_unified_fixture(
+            r#"{"ts":"2026-07-31T00:00:00Z","pid":21,"sid":"row-early","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":10,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:01Z","pid":21,"msg":"subagent read parent config (live)","ctx":{"session_model_id":"grok-4.7"}}
+{"ts":"2026-07-31T00:00:02Z","pid":21,"sid":"row-early","msg":"shell.turn.inference_done","ctx":{"loop_index":2,"prompt_tokens":11,"completion_tokens":2}}"#,
+        );
+
+        let messages = parse_grok_unified_log_file(&path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].model_id, "grok-4.7",
+            "row preceding the only model evidence for its (pid, generation) must be retrofitted"
+        );
+        assert_eq!(messages[1].model_id, "grok-4.7");
+    }
+
+    #[test]
+    fn unified_log_skips_parent_retro_on_conflicting_generation_models() {
+        let (_temp, path) = write_unified_fixture(
+            r#"{"ts":"2026-07-31T00:00:00Z","pid":22,"sid":"row-conflict","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":10,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:01Z","pid":22,"msg":"subagent read parent config (live)","ctx":{"session_model_id":"grok-4.7"}}
+{"ts":"2026-07-31T00:00:02Z","pid":22,"msg":"subagent spawn credentials","ctx":{"subagent_id":"unrelated-child","parent_model":"grok-4.8"}}"#,
+        );
+
+        let messages = parse_grok_unified_log_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].model_id, UNKNOWN_MODEL,
+            "two conflicting parent models in the same generation must fail closed"
+        );
+    }
+
+    #[test]
+    fn unified_log_skips_parent_retro_across_generation_change() {
+        let (_temp, path) = write_unified_fixture(
+            r#"{"ts":"2026-07-31T00:00:00Z","pid":23,"sid":"row-old-gen","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":10,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:01Z","pid":23,"msg":"AuthManager::new","ctx":{}}
+{"ts":"2026-07-31T00:00:02Z","pid":23,"msg":"subagent read parent config (live)","ctx":{"session_model_id":"grok-4.7"}}"#,
+        );
+
+        let messages = parse_grok_unified_log_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].model_id, UNKNOWN_MODEL,
+            "parent evidence from a later generation (post AuthManager::new) must not reach an earlier generation's row"
+        );
+    }
+
+    #[test]
+    fn unified_log_skips_parent_retro_for_known_child_session() {
+        let (_temp, path) = write_unified_fixture(
+            r#"{"ts":"2026-07-31T00:00:00Z","pid":25,"msg":"subagent read parent config (live)","ctx":{"session_model_id":"grok-4.7"}}
+{"ts":"2026-07-31T00:00:01Z","pid":25,"sid":"childsess","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":10,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:02Z","pid":25,"msg":"AuthManager::new","ctx":{}}
+{"ts":"2026-07-31T00:00:03Z","pid":25,"msg":"subagent completed","ctx":{"subagent_id":"childsess","effective_model":"grok-4.8"}}"#,
+        );
+
+        let messages = parse_grok_unified_log_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].model_id, UNKNOWN_MODEL,
+            "a row whose session is a known child session must stay fail-closed even with unique parent evidence"
+        );
     }
 
     #[test]

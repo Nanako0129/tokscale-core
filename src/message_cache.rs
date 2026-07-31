@@ -816,7 +816,7 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Codex => 4,
         ClientId::Jcode => 4,
         ClientId::Copilot => 4,
-        ClientId::Grok => 2,
+        ClientId::Grok => 3,
         _ => 1,
     }
 }
@@ -2834,9 +2834,13 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_grok_parser_v1_same_fingerprint_rebuilds_model_attribution() {
+    /// Shared body for the Grok same-fingerprint parser-invalidation tests:
+    /// a shard written under an older parser version, with an unchanged
+    /// source file, must be treated as stale and cold-rebuilt rather than
+    /// trusted. Parameterized over the stale version so both the v1->v2 and
+    /// v2->v3 (generation-scoped parent retro attribution) invalidations are
+    /// covered.
+    fn run_grok_parser_same_fingerprint_rebuild(stale_parser_version: u32) {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
         let source_dir = TempDir::new().unwrap();
@@ -2852,7 +2856,7 @@ mod tests {
         let current = CacheIdentity::for_client(ClientId::Grok);
         let stale = CacheIdentity {
             namespace: current.namespace,
-            parser_version: 1,
+            parser_version: stale_parser_version,
         };
         let fingerprint = SourceFingerprint::from_grok_path(&source).unwrap();
         let stale_message = UnifiedMessage::new(
@@ -2924,6 +2928,18 @@ mod tests {
             rebuilt_messages
         );
         restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_grok_parser_v1_same_fingerprint_rebuilds_model_attribution() {
+        run_grok_parser_same_fingerprint_rebuild(1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_grok_parser_v2_same_fingerprint_rebuilds_model_attribution() {
+        run_grok_parser_same_fingerprint_rebuild(2);
     }
 
     #[test]
@@ -3171,7 +3187,7 @@ mod tests {
         assert_eq!(parser_version(ClientId::Codex), 4);
         assert_eq!(parser_version(ClientId::Jcode), 4);
         assert_eq!(parser_version(ClientId::Copilot), 4);
-        assert_eq!(parser_version(ClientId::Grok), 2);
+        assert_eq!(parser_version(ClientId::Grok), 3);
         assert_eq!(CacheIdentity::synthetic().parser_version, 1);
         for client in ClientId::iter() {
             if !matches!(
