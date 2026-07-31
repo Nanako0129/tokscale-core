@@ -106,17 +106,19 @@ fn advance_unified_generation(generations: &mut HashMap<i64, UnifiedGeneration>,
     *generation = generation.saturating_add(1);
 }
 
+fn unified_subagent_id(value: &Value) -> Option<String> {
+    extract_string(value.get("ctx")?.get("subagent_id")).filter(|id| !id.trim().is_empty())
+}
+
 fn unified_child_scope(
     value: &Value,
     generations: &mut HashMap<i64, UnifiedGeneration>,
 ) -> Option<UnifiedChildScope> {
     let pid = required_non_negative_i64(value.get("pid"))?;
-    let subagent_id =
-        extract_string(value.get("ctx")?.get("subagent_id")).filter(|id| !id.trim().is_empty())?;
     Some(UnifiedChildScope {
         pid,
         generation: current_unified_generation(generations, pid),
-        session_id: subagent_id,
+        session_id: unified_subagent_id(value)?,
     })
 }
 
@@ -130,6 +132,16 @@ fn unified_terminal_model(value: &Value) -> Option<String> {
     authoritative_model(value.get("ctx")?.get("effective_model"))
 }
 
+fn unique_child_model<'a>(
+    evidence: &'a UnifiedChildEvidence,
+    scope: &UnifiedChildScope,
+) -> Option<&'a str> {
+    let UnifiedModelEvidence::Unique(model) = evidence.child_models.get(scope)? else {
+        return None;
+    };
+    Some(model)
+}
+
 fn unique_terminal_model<'a>(
     evidence: &'a UnifiedChildEvidence,
     scope: &UnifiedChildScope,
@@ -140,10 +152,8 @@ fn unique_terminal_model<'a>(
     let UnifiedModelEvidence::Unique(terminal_model) = evidence.terminal_models.get(scope)? else {
         return None;
     };
-    let UnifiedModelEvidence::Unique(child_model) = evidence.child_models.get(scope)? else {
-        return None;
-    };
-    (terminal_model == child_model).then_some(child_model.as_str())
+    let child_model = unique_child_model(evidence, scope)?;
+    (terminal_model == child_model).then_some(child_model)
 }
 
 #[derive(Debug, Clone)]
@@ -777,12 +787,19 @@ fn parse_grok_unified_log_snapshot(
 
         let message_name = value.get("msg").and_then(Value::as_str);
         match message_name {
-            Some("subagent read parent config (live)") | Some("subagent model resolved") => {
+            Some("subagent read parent config (live)") => {
                 if let Some((pid, model_id)) = unified_log_parent_model(&value) {
                     let generation = current_unified_generation(&mut generations, pid);
                     fallback_model_by_pid.insert((pid, generation), model_id);
                 }
                 continue;
+            }
+            Some("subagent model resolved") => {
+                if let Some((pid, model_id)) = unified_log_parent_model(&value) {
+                    let generation = current_unified_generation(&mut generations, pid);
+                    fallback_model_by_pid.insert((pid, generation), model_id);
+                    continue;
+                }
             }
             Some("subagent spawn credentials") => {
                 if let Some((pid, model_id)) = unified_log_parent_model(&value) {
@@ -791,9 +808,11 @@ fn parse_grok_unified_log_snapshot(
                 }
                 if let Some(scope) = unified_child_scope(&value, &mut generations) {
                     if let Some(model_id) = unified_spawn_model(&value) {
-                        model_by_pid_and_session
-                            .entry((scope.pid, scope.generation, scope.session_id))
-                            .or_insert(model_id);
+                        if unique_child_model(&evidence, &scope) == Some(model_id.as_str()) {
+                            model_by_pid_and_session
+                                .entry((scope.pid, scope.generation, scope.session_id))
+                                .or_insert(model_id);
+                        }
                     }
                 }
                 continue;
@@ -900,23 +919,22 @@ fn parse_grok_unified_log_snapshot(
             .as_ref()
             .is_some_and(|scope| evidence.known_scopes.contains(scope));
         let known_child_session = evidence.child_session_ids.contains(&session_id);
-        let model_id = if known_scope {
-            model_by_pid_and_session
-                .get(&(pid, generation, session_id.clone()))
-                .cloned()
-                .or_else(|| {
-                    child_scope
-                        .as_ref()
-                        .and_then(|scope| unique_terminal_model(&evidence, scope))
-                        .map(str::to_string)
-                })
+        let exact_model = model_by_pid_and_session
+            .get(&(pid, generation, session_id.clone()))
+            .cloned();
+        let model_id = if let Some(model_id) = exact_model {
+            model_id
+        } else if known_scope {
+            child_scope
+                .as_ref()
+                .and_then(|scope| unique_terminal_model(&evidence, scope))
+                .map(str::to_string)
                 .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
         } else if known_child_session {
             UNKNOWN_MODEL.to_string()
         } else {
-            model_by_pid_and_session
-                .get(&(pid, generation, session_id.clone()))
-                .or_else(|| model_by_session.get(&session_id))
+            model_by_session
+                .get(&session_id)
                 .or_else(|| fallback_model_by_pid.get(&(pid, generation)))
                 .cloned()
                 .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
@@ -977,10 +995,13 @@ fn collect_unified_child_evidence(
         if !is_spawn && !is_terminal {
             continue;
         }
+        let Some(subagent_id) = unified_subagent_id(&value) else {
+            continue;
+        };
+        evidence.child_session_ids.insert(subagent_id);
         let Some(scope) = unified_child_scope(&value, &mut generations) else {
             continue;
         };
-        evidence.child_session_ids.insert(scope.session_id.clone());
         evidence.known_scopes.insert(scope.clone());
         if is_terminal {
             evidence.terminal_scopes.insert(scope.clone());
@@ -1135,6 +1156,8 @@ fn unified_log_model_change(value: &Value) -> Option<(Option<i64>, Option<String
         "backend_search: model switch" => authoritative_model(context.get("new_model"))
             .or_else(|| authoritative_model(context.get("model")))
             .or_else(|| authoritative_model(context.get("current_model_id"))),
+        "subagent model resolved" => authoritative_model(context.get("model_id"))
+            .or_else(|| authoritative_model(context.get("model"))),
         _ => None,
     }?;
 
@@ -1647,7 +1670,12 @@ mod tests {
 {"ts":"2026-07-31T00:00:07Z","sid":"child-a","msg":"model changed","ctx":{"model":"grok-global"}}
 {"ts":"2026-07-31T00:00:08Z","pid":17,"sid":"child-a","msg":"shell.turn.inference_done","ctx":{"loop_index":2,"prompt_tokens":13,"completion_tokens":2}}
 {"ts":"2026-07-31T00:00:09Z","sid":"ordinary","msg":"model changed","ctx":{"model":" grok-global "}}
-{"ts":"2026-07-31T00:00:10Z","pid":17,"sid":"ordinary","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":14,"completion_tokens":2}}"#,
+{"ts":"2026-07-31T00:00:10Z","pid":17,"sid":"ordinary","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":14,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:11Z","pid":17,"msg":"subagent spawn credentials","ctx":{"subagent_id":"child-reused","effective_model":"grok-4.7"}}
+{"ts":"2026-07-31T00:00:12Z","pid":18,"sid":"child-reused","msg":"model changed","ctx":{"model":"grok-exact"}}
+{"ts":"2026-07-31T00:00:13Z","pid":18,"sid":"child-reused","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":15,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:14Z","pid":19,"msg":"model catalog: notifying clients","ctx":{"current_model_id":"grok-parent-other"}}
+{"ts":"2026-07-31T00:00:15Z","pid":19,"sid":"child-reused","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":16,"completion_tokens":2}}"#,
         );
 
         let messages = parse_grok_unified_log_file(&path);
@@ -1662,8 +1690,32 @@ mod tests {
                 "grok-4.8",
                 "grok-4.7",
                 "grok-global",
+                "grok-exact",
+                UNKNOWN_MODEL,
             ]
         );
+    }
+
+    #[test]
+    fn unified_log_preserves_legacy_resolution_and_marks_malformed_children() {
+        let (_temp, path) = write_unified_fixture(
+            r#"{"ts":"2026-07-31T00:00:00Z","pid":31,"msg":"subagent model resolved","ctx":{"model_id":"grok-legacy-id"}}
+{"ts":"2026-07-31T00:00:01Z","pid":31,"sid":"legacy-id","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":10,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:02Z","pid":32,"msg":"subagent model resolved","ctx":{"model":"grok-legacy-model"}}
+{"ts":"2026-07-31T00:00:03Z","pid":32,"sid":"legacy-model","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":11,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:04Z","pid":33,"msg":"model catalog: notifying clients","ctx":{"current_model_id":"grok-parent"}}
+{"ts":"2026-07-31T00:00:05Z","msg":"subagent spawn credentials","ctx":{"subagent_id":"malformed-spawn","effective_model":"grok-child"}}
+{"ts":"2026-07-31T00:00:06Z","pid":33,"sid":"malformed-spawn","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":12,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:07Z","pid":"bad","msg":"subagent failed","ctx":{"subagent_id":"malformed-terminal","effective_model":"grok-child"}}
+{"ts":"2026-07-31T00:00:08Z","pid":33,"sid":"malformed-terminal","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":13,"completion_tokens":2}}"#,
+        );
+
+        let messages = parse_grok_unified_log_file(&path);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].model_id, "grok-legacy-id");
+        assert_eq!(messages[1].model_id, "grok-legacy-model");
+        assert_eq!(messages[2].model_id, UNKNOWN_MODEL);
+        assert_eq!(messages[3].model_id, UNKNOWN_MODEL);
     }
 
     #[test]
@@ -1674,18 +1726,20 @@ mod tests {
 {"ts":"2026-07-31T00:00:02Z","pid":19,"sid":"conflict","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":11,"completion_tokens":2}}
 {"ts":"2026-07-31T00:00:03Z","pid":19,"msg":"subagent spawn credentials","ctx":{"subagent_id":"conflict","effective_model":"grok-4.8"}}
 {"ts":"2026-07-31T00:00:04Z","pid":19,"msg":"subagent failed","ctx":{"subagent_id":"conflict","effective_model":"grok-4.9"}}
-{"ts":"2026-07-31T00:00:05Z","pid":19,"msg":"AuthManager::new","ctx":{}}
-{"ts":"2026-07-31T00:00:06Z","pid":19,"sid":"child","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":12,"completion_tokens":2}}
-{"ts":"2026-07-31T00:00:07Z","pid":19,"sid":"missing","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":13,"completion_tokens":2}}
-{"ts":"2026-07-31T00:00:08Z","pid":19,"msg":"subagent failed","ctx":{"subagent_id":"missing","effective_model":null}}"#,
+{"ts":"2026-07-31T00:00:05Z","pid":19,"sid":"conflict","msg":"shell.turn.inference_done","ctx":{"loop_index":2,"prompt_tokens":12,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:06Z","pid":19,"msg":"AuthManager::new","ctx":{}}
+{"ts":"2026-07-31T00:00:07Z","pid":19,"sid":"child","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":13,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:08Z","pid":19,"sid":"missing","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":14,"completion_tokens":2}}
+{"ts":"2026-07-31T00:00:09Z","pid":19,"msg":"subagent failed","ctx":{"subagent_id":"missing","effective_model":null}}"#,
         );
 
         let messages = parse_grok_unified_log_file(&path);
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].model_id, "grok-4.7");
         assert_eq!(messages[1].model_id, UNKNOWN_MODEL);
         assert_eq!(messages[2].model_id, UNKNOWN_MODEL);
         assert_eq!(messages[3].model_id, UNKNOWN_MODEL);
+        assert_eq!(messages[4].model_id, UNKNOWN_MODEL);
     }
 
     #[test]
