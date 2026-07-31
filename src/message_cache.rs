@@ -816,6 +816,7 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Codex => 4,
         ClientId::Jcode => 4,
         ClientId::Copilot => 4,
+        ClientId::Grok => 2,
         _ => 1,
     }
 }
@@ -2835,6 +2836,98 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_grok_parser_v1_same_fingerprint_rebuilds_model_attribution() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source_dir = TempDir::new().unwrap();
+        let source = source_dir.path().join("unified.jsonl");
+        std::fs::write(
+            &source,
+            concat!(
+                "{\"ts\":\"2023-11-14T22:13:20Z\",\"pid\":7,\"sid\":\"child-cache\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{\"loop_index\":1,\"prompt_tokens\":10,\"completion_tokens\":2}}\n",
+                "{\"ts\":\"2023-11-14T22:13:21Z\",\"pid\":7,\"msg\":\"subagent completed\",\"ctx\":{\"subagent_id\":\"child-cache\",\"effective_model\":\"grok-4.7\"}}\n",
+            ),
+        )
+        .unwrap();
+        let current = CacheIdentity::for_client(ClientId::Grok);
+        let stale = CacheIdentity {
+            namespace: current.namespace,
+            parser_version: 1,
+        };
+        let fingerprint = SourceFingerprint::from_grok_path(&source).unwrap();
+        let stale_message = UnifiedMessage::new(
+            "grok",
+            "grok-unknown",
+            "xai",
+            "child-cache",
+            1_700_000_000_000,
+            TokenBreakdown {
+                input: 10,
+                output: 2,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let stale_entry = CachedSourceEntry::new(
+            stale,
+            &source,
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        );
+        let payload = bincode::options().serialize(&vec![stale_entry]).unwrap();
+        let stale_key = CacheKey::new(current, &source).shard();
+        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        let stale_envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: stale.namespace.to_string(),
+            parser_version: stale.parser_version,
+            payload,
+        };
+        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &stale_envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            SourceFingerprint::from_grok_path(&source).unwrap(),
+            fingerprint,
+            "the parser-only invalidation must rebuild an unchanged source"
+        );
+        assert!(matches!(
+            read_shard(&stale_path, current),
+            ShardReadStatus::Stale
+        ));
+        let mut cache = SourceMessageCache::load();
+        assert!(cache.get(current, &source).is_none());
+
+        let rebuilt_messages = crate::sessions::grok::parse_grok_unified_log_file(&source);
+        assert_eq!(rebuilt_messages.len(), 1);
+        assert_eq!(rebuilt_messages[0].model_id, "grok-4.7");
+        cache.insert(CachedSourceEntry::new(
+            current,
+            &source,
+            fingerprint,
+            rebuilt_messages.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let loaded = SourceMessageCache::load();
+        assert_eq!(
+            loaded.get(current, &source).unwrap().messages,
+            rebuilt_messages
+        );
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_format_one_shard_is_stale_without_hiding_format_two_namespace() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
@@ -3078,11 +3171,12 @@ mod tests {
         assert_eq!(parser_version(ClientId::Codex), 4);
         assert_eq!(parser_version(ClientId::Jcode), 4);
         assert_eq!(parser_version(ClientId::Copilot), 4);
+        assert_eq!(parser_version(ClientId::Grok), 2);
         assert_eq!(CacheIdentity::synthetic().parser_version, 1);
         for client in ClientId::iter() {
             if !matches!(
                 client,
-                ClientId::Codex | ClientId::Jcode | ClientId::Copilot
+                ClientId::Codex | ClientId::Jcode | ClientId::Copilot | ClientId::Grok
             ) {
                 assert_eq!(
                     parser_version(client),

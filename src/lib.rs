@@ -14113,6 +14113,203 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn grok_scoped_attribution_keeps_cache_lane_and_pricing_boundaries() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let materialized_cache = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let logs_dir = source_home.path().join(".grok/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let unified = logs_dir.join("unified.jsonl");
+        std::fs::write(
+            &unified,
+            concat!(
+                "{\"ts\":\"2026-07-31T00:00:00Z\",\"pid\":7,\"msg\":\"subagent read parent config (live)\",\"ctx\":{\"session_model_id\":\"grok-4.6\"}}\n",
+                "{\"ts\":\"2026-07-31T00:00:01Z\",\"pid\":7,\"sid\":\"parent\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{\"loop_index\":1,\"prompt_tokens\":10,\"cached_prompt_tokens\":2,\"completion_tokens\":4,\"reasoning_tokens\":1}}\n",
+                "{\"ts\":\"2026-07-31T00:00:02Z\",\"pid\":7,\"msg\":\"subagent spawn credentials\",\"ctx\":{\"subagent_id\":\"child-a\",\"effective_model\":\"grok-4.7\",\"parent_model\":\"grok-4.6\"}}\n",
+                "{\"ts\":\"2026-07-31T00:00:03Z\",\"pid\":7,\"sid\":\"child-a\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{\"loop_index\":1,\"prompt_tokens\":11,\"completion_tokens\":2}}\n",
+                "{\"ts\":\"2026-07-31T00:00:04Z\",\"pid\":7,\"msg\":\"subagent spawn credentials\",\"ctx\":{\"subagent_id\":\"child-b\",\"effective_model\":\"grok-4.8\",\"parent_model\":\"grok-4.6\"}}\n",
+                "{\"ts\":\"2026-07-31T00:00:05Z\",\"pid\":7,\"sid\":\"child-b\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{\"loop_index\":1,\"prompt_tokens\":12,\"completion_tokens\":3,\"reasoning_tokens\":1}}\n",
+                "{\"ts\":\"2026-07-31T00:00:06Z\",\"pid\":7,\"sid\":\"child-retro\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{\"loop_index\":1,\"prompt_tokens\":13,\"cached_prompt_tokens\":3,\"completion_tokens\":5,\"reasoning_tokens\":2}}\n",
+                "{\"ts\":\"2026-07-31T00:00:07Z\",\"pid\":7,\"msg\":\"subagent completed\",\"ctx\":{\"subagent_id\":\"child-retro\",\"effective_model\":\"grok-4.9\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let provider_dir = source_home
+            .path()
+            .join(".grok/sessions/%2Fworkspace/provider");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let provider_updates = provider_dir.join("updates.jsonl");
+        std::fs::write(
+            &provider_updates,
+            "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"provider\",\"update\":{\"sessionUpdate\":\"turn_completed\",\"prompt_id\":\"provider-turn\",\"usage\":{\"inputTokens\":20,\"outputTokens\":5,\"cachedReadTokens\":4,\"reasoningTokens\":1,\"costUsdTicks\":1250000000,\"modelUsage\":{\"grok-provider\":{\"inputTokens\":20,\"outputTokens\":5,\"cachedReadTokens\":4,\"reasoningTokens\":1,\"costUsdTicks\":1250000000}}}},\"_meta\":{\"agentTimestampMs\":1785456010000}}}\n",
+        )
+        .unwrap();
+
+        let raw_unified = sessions::grok::parse_grok_unified_log_file(&unified);
+        assert_eq!(raw_unified.len(), 4);
+        assert_eq!(
+            raw_unified
+                .iter()
+                .map(|message| message.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["grok-4.6", "grok-4.7", "grok-4.8", "grok-4.9"]
+        );
+        assert!(raw_unified
+            .iter()
+            .all(|message| { message.cost == 0.0 && message.cost_source == CostSource::Unknown }));
+        let provider_raw = sessions::grok::parse_grok_file(&provider_updates);
+        assert_eq!(provider_raw.len(), 1);
+        assert_eq!(provider_raw[0].cost, 1.25);
+        assert_eq!(provider_raw[0].cost_source, CostSource::ProviderReported);
+
+        let mut litellm = HashMap::new();
+        for (model, input, output, cache_read) in [
+            ("grok-4.6", 0.001, 0.002, 0.0005),
+            ("grok-4.7", 0.003, 0.004, 0.0015),
+            ("grok-4.8", 0.005, 0.006, 0.0025),
+            ("grok-4.9", 0.007, 0.008, 0.0035),
+            ("grok-provider", 1.0, 1.0, 1.0),
+        ] {
+            litellm.insert(
+                model.to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(input),
+                    output_cost_per_token: Some(output),
+                    cache_read_input_token_cost: Some(cache_read),
+                    ..Default::default()
+                },
+            );
+        }
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let expected_estimated_cost = raw_unified
+            .iter()
+            .map(|message| {
+                pricing.calculate_cost_with_provider(
+                    &message.model_id,
+                    Some(&message.provider_id),
+                    &message.tokens,
+                )
+            })
+            .sum::<f64>();
+        assert!(expected_estimated_cost > 0.0);
+
+        let clients = vec!["grok".to_string()];
+        let scanner_settings = scanner::ScannerSettings::default();
+        let sort_messages = |mut messages: Vec<UnifiedMessage>| {
+            messages.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
+            messages
+        };
+        let materialized = |cache_home: &std::path::Path| {
+            with_isolated_tokscale_cache(cache_home, || {
+                sort_messages(parse_all_messages_with_pricing_with_env_strategy(
+                    source_home.path().to_str().unwrap(),
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner_settings,
+                ))
+            })
+        };
+        let streaming = |cache_home: &std::path::Path| {
+            with_isolated_tokscale_cache(cache_home, || {
+                let mut messages = Vec::new();
+                scan_messages_streaming(
+                    source_home.path().to_str().unwrap(),
+                    &clients,
+                    Some(&pricing),
+                    false,
+                    &scanner_settings,
+                    &|_| true,
+                    &mut |message| messages.push(message.clone()),
+                );
+                sort_messages(messages)
+            })
+        };
+
+        let cold_materialized = materialized(materialized_cache.path());
+        let cold_streaming = streaming(streaming_cache.path());
+        assert_eq!(cold_materialized, cold_streaming);
+        assert_eq!(materialized(materialized_cache.path()), cold_materialized);
+        assert_eq!(streaming(streaming_cache.path()), cold_streaming);
+        assert_eq!(cold_materialized.len(), 5);
+
+        for raw in &raw_unified {
+            let actual = cold_materialized
+                .iter()
+                .find(|message| message.dedup_key == raw.dedup_key)
+                .unwrap();
+            assert_eq!(actual.client, raw.client);
+            assert_eq!(actual.model_id, raw.model_id);
+            assert_eq!(actual.provider_id, raw.provider_id);
+            assert_eq!(actual.session_id, raw.session_id);
+            assert_eq!(actual.timestamp, raw.timestamp);
+            assert_eq!(actual.date, raw.date);
+            assert_eq!(actual.tokens, raw.tokens);
+            assert_eq!(actual.message_count, raw.message_count);
+            assert_eq!(actual.dedup_key, raw.dedup_key);
+            assert_eq!(actual.is_turn_start, raw.is_turn_start);
+            assert_eq!(actual.cost_source, CostSource::Estimated);
+            assert_eq!(
+                actual.cost,
+                pricing.calculate_cost_with_provider(
+                    &raw.model_id,
+                    Some(&raw.provider_id),
+                    &raw.tokens,
+                )
+            );
+        }
+
+        let provider = cold_materialized
+            .iter()
+            .find(|message| message.session_id == "provider")
+            .unwrap();
+        assert_eq!(provider.model_id, provider_raw[0].model_id);
+        assert_eq!(provider.tokens, provider_raw[0].tokens);
+        assert_eq!(provider.dedup_key, provider_raw[0].dedup_key);
+        assert_eq!(provider.cost, provider_raw[0].cost);
+        assert_eq!(provider.cost_source, CostSource::ProviderReported);
+        let total_cost = cold_materialized
+            .iter()
+            .map(|message| message.cost)
+            .sum::<f64>();
+        assert!((total_cost - (1.25 + expected_estimated_cost)).abs() < 1e-12);
+
+        let entries = aggregate_model_usage_entries(cold_materialized.clone(), &GroupBy::Model);
+        let mut models = entries
+            .iter()
+            .map(|entry| entry.model.clone())
+            .collect::<Vec<_>>();
+        models.sort();
+        assert_eq!(
+            models,
+            [
+                "grok-4.6",
+                "grok-4.7",
+                "grok-4.8",
+                "grok-4.9",
+                "grok-provider",
+            ]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.input).sum::<i64>(),
+            cold_materialized
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>()
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.message_count).sum::<i32>(),
+            cold_materialized
+                .iter()
+                .map(|message| message.message_count)
+                .sum::<i32>()
+        );
+        assert!((entries.iter().map(|entry| entry.cost).sum::<f64>() - total_cost).abs() < 1e-12);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn m17_grok_unified_precedence_tracks_source_lifecycle_across_all_lanes() {
         let source_home = tempfile::TempDir::new().unwrap();
         let cache_home = tempfile::TempDir::new().unwrap();
