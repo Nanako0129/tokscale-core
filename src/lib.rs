@@ -6193,16 +6193,28 @@ mod tests {
         // Tamper the now-persisted retained entry's date directly, standing
         // in for "this was cached while a different local timezone was
         // active" without depending on the test process's real timezone.
-        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
         let mut cache = message_cache::SourceMessageCache::load();
+        // Locate the entry by provenance rather than by path.
+        // `CachedPath` compares raw OS strings, so a lookup keyed on the path
+        // this test constructed is sensitive to separator and short-name
+        // differences that do not affect what the scanner actually stored.
+        // Retention only ever populates `retained_keys` for Claude, so the key
+        // alone identifies the entry without naming a namespace.
         let mut entry = cache
-            .get(identity, &transcript)
-            .expect("the rewrite scan must have persisted a cache entry")
+            .entries
+            .values()
+            .find(|entry| entry.retained_keys.contains(target_dedup_key))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the rewrite scan must have persisted an entry holding {target_dedup_key} as retained; cache holds {:?}",
+                    cache
+                        .entries
+                        .values()
+                        .map(|e| (e.messages.len(), e.retained_keys.len()))
+                        .collect::<Vec<_>>()
+                )
+            })
             .clone();
-        assert!(
-            entry.retained_keys.contains(target_dedup_key),
-            "the target turn must be recorded as retained provenance"
-        );
         let target_message = entry
             .messages
             .iter_mut()
