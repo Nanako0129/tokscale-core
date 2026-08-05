@@ -594,16 +594,36 @@ enum HistoryRetention {
 /// Returns the dedup keys of the messages it carried forward, so a caller
 /// that later merges this file's messages against other files can tell a
 /// retained copy apart from a live one and make the live copy win.
+///
+/// Test-only call counter (see `RETAIN_OBSERVED_MESSAGES_CALLS`): this
+/// function is only ever reached from a fingerprint-changed miss branch, so
+/// its call count is a proxy for "the miss-branch work — including the
+/// per-retained-message clone it does — ran", letting a test assert a warm
+/// cache hit skips it entirely without instrumenting the clone itself.
+#[cfg(test)]
+static RETAIN_OBSERVED_MESSAGES_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn retain_observed_messages(
     parsed: &mut Vec<UnifiedMessage>,
     cached: &[UnifiedMessage],
     key_is_globally_stable: fn(&str) -> bool,
+    refresh_retained: &mut dyn FnMut(&mut UnifiedMessage, Option<&str>),
 ) -> HashSet<String> {
+    #[cfg(test)]
+    RETAIN_OBSERVED_MESSAGES_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     let mut seen: HashSet<String> = parsed
         .iter()
         .filter_map(|message| message.dedup_key.clone())
         .collect();
     let mut retained_keys = HashSet::new();
+    // Every message a single parse of one file produces shares the same
+    // sidechain agent (see claudecode::parse_claude_file_with_cache_and_home),
+    // so a live sibling from this same scan already carries the current
+    // value — cheaper and more correct than re-deriving it per retained
+    // message. Owned rather than borrowed: `parsed` is pushed into below.
+    let live_agent: Option<String> = parsed.first().and_then(|message| message.agent.clone());
 
     for message in cached {
         let Some(key) = message.dedup_key.as_ref() else {
@@ -614,7 +634,9 @@ fn retain_observed_messages(
         }
         if seen.insert(key.clone()) {
             retained_keys.insert(key.clone());
-            parsed.push(message.clone());
+            let mut retained = message.clone();
+            refresh_retained(&mut retained, live_agent.as_deref());
+            parsed.push(retained);
         }
     }
     retained_keys
@@ -849,6 +871,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         messages
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_or_parse_source_with_fingerprint_and_policy<F, FingerprintFn>(
         path: &Path,
         identity: message_cache::CacheIdentity,
@@ -857,6 +880,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         history: HistoryRetention,
         fingerprint_from_path: FingerprintFn,
         parse: F,
+        refresh_retained: &mut dyn FnMut(&mut UnifiedMessage, Option<&str>),
     ) -> CachedParseOutcome
     where
         F: Fn(&Path) -> (Vec<UnifiedMessage>, bool),
@@ -928,6 +952,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                         &mut messages,
                         &cached.messages,
                         key_is_globally_stable,
+                        refresh_retained,
                     );
                 }
             }
@@ -980,11 +1005,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             HistoryRetention::LiveFileOnly,
             fingerprint_from_path,
             |path| (parse(path), true),
+            &mut |_, _| {},
         )
     }
 
     /// Same as `load_or_parse_source_with_fingerprint`, for clients that
     /// rewrite an existing transcript instead of only appending to it.
+    #[allow(clippy::too_many_arguments)]
     fn load_or_parse_source_with_fingerprint_retaining_history<F, FingerprintFn>(
         path: &Path,
         identity: message_cache::CacheIdentity,
@@ -993,6 +1020,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         key_is_globally_stable: fn(&str) -> bool,
         fingerprint_from_path: FingerprintFn,
         parse: F,
+        refresh_retained: &mut dyn FnMut(&mut UnifiedMessage, Option<&str>),
     ) -> CachedParseOutcome
     where
         F: Fn(&Path) -> Vec<UnifiedMessage>,
@@ -1011,6 +1039,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             },
             fingerprint_from_path,
             |path| (parse(path), true),
+            refresh_retained,
         )
     }
 
@@ -1173,6 +1202,14 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                     )
                 },
                 |path| sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home)),
+                &mut |message, live_agent| {
+                    sessions::claudecode::refresh_retained_message_context(
+                        message,
+                        path,
+                        Some(&claude_home),
+                        live_agent,
+                    )
+                },
             )
         })
         .collect();
@@ -1304,6 +1341,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                     let parsed = sessions::gemini::parse_gemini_file_with_cache_status(path);
                     (parsed.messages, parsed.cacheable)
                 },
+                &mut |_, _| {},
             );
             (path.clone(), outcome)
         })
@@ -3116,7 +3154,6 @@ where
     for path in scan_result.get(ClientId::Claude) {
         let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
         let cached = source_cache.get(identity, path);
-        let cached_messages = cached.map(|entry| entry.messages.clone());
         let fingerprint_status =
             message_cache::SourceFingerprint::check_claude_code_path_with_home_samples_only(
                 path,
@@ -3168,8 +3205,16 @@ where
             if let Some(fingerprint) = fingerprint {
                 retained_keys = retain_observed_messages(
                     &mut msgs,
-                    cached_messages.as_deref().unwrap_or(&[]),
+                    cached.map(|entry| entry.messages.as_slice()).unwrap_or(&[]),
                     sessions::claudecode::dedup_key_is_globally_stable,
+                    &mut |message, live_agent| {
+                        sessions::claudecode::refresh_retained_message_context(
+                            message,
+                            path,
+                            Some(&claude_home),
+                            live_agent,
+                        )
+                    },
                 );
                 if !msgs.is_empty() {
                     source_cache.insert(
@@ -5378,7 +5423,8 @@ mod tests {
         scan_messages_streaming, scanner, select_local_parse_pricing, sessions, set_model_aliases,
         snapshot_grouping_aliases, unified_to_parsed, AgentAccumulator, ClientId, CostSource,
         GroupBy, LocalParseOptions, ModelAliasMap, OpenCodeSelection, OpenCodeSourceIdentity,
-        ReportOptions, TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
+        ReportOptions, TokenBreakdown, UnifiedMessage, RETAIN_OBSERVED_MESSAGES_CALLS,
+        UNKNOWN_WORKSPACE_LABEL,
     };
     use bincode::Options;
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -5864,6 +5910,169 @@ mod tests {
             "the streaming lane must retain turn one across the rewrite too"
         );
         assert_eq!(after.iter().map(|m| m.tokens.output).sum::<i64>(), 50 + 60);
+    }
+
+    /// A warm cache hit (unchanged fingerprint) must never run the retention
+    /// machinery at all — it used to clone the entire cached vector before
+    /// even checking the fingerprint, discarding the clone on every warm hit.
+    /// `retain_observed_messages` is only reachable from the fingerprint-
+    /// changed miss branch, so its call count is a faithful proxy for "the
+    /// discarded clone work ran" without instrumenting the clone directly.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_warm_cache_hit_skips_retention_clone_work() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("conversation.jsonl");
+
+        let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let turn_two = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+
+        std::fs::write(&transcript, format!("{turn_one}\n{turn_two}\n")).unwrap();
+        collect_streamed_claude_fixture(source_home.path());
+
+        // The rewrite drops turn one, forcing a fingerprint-changed miss that
+        // retains it — this is the only kind of scan allowed to run
+        // retention, so it establishes the "after a real miss" baseline.
+        std::fs::write(&transcript, format!("{turn_two}\n")).unwrap();
+        let after_rewrite = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(
+            after_rewrite.len(),
+            2,
+            "turn one must be retained after the rewrite"
+        );
+        let calls_after_miss =
+            RETAIN_OBSERVED_MESSAGES_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            calls_after_miss > 0,
+            "the miss branch must have run retention at least once"
+        );
+
+        // The file is now unchanged since the last scan: this must be a warm
+        // cache hit that never touches retention (and therefore never clones
+        // the cached vector the finding described).
+        let warm = collect_streamed_claude_fixture(source_home.path());
+        let calls_after_warm =
+            RETAIN_OBSERVED_MESSAGES_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            calls_after_warm, calls_after_miss,
+            "a warm cache hit on an unchanged file must not run the miss-branch retention/clone work"
+        );
+        assert_eq!(
+            warm.len(),
+            2,
+            "the warm hit must still return the retained turn"
+        );
+        assert_eq!(warm.iter().map(|m| m.tokens.output).sum::<i64>(), 50 + 60);
+    }
+
+    /// Finding 2: a retained message must not keep the client/provider/
+    /// workspace metadata of the parse that first cached it. A `cc-mirror`
+    /// variant edit changes the Claude fingerprint (variant.json rides along
+    /// as a related file — see `check_claude_code_path_with_home_mode`)
+    /// without touching the transcript body, so a rescan re-derives live
+    /// messages' metadata from the new variant file while a message carried
+    /// forward by retention must be rebuilt to match, not left on the stale
+    /// values from the scan that cached it.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_retained_message_refreshes_stale_cc_mirror_metadata() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let variant_dir = source_home.path().join(".cc-mirror").join("zai-worker");
+        let config_dir = variant_dir.join("config");
+        let project_dir = config_dir.join("projects").join("-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let variant_path = variant_dir.join("variant.json");
+        std::fs::write(
+            &variant_path,
+            serde_json::json!({
+                "name": "zai-worker",
+                "provider": "zai",
+                "configDir": config_dir,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let transcript = project_dir.join("session.jsonl");
+
+        let turn_a = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let turn_b = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_b","message":{"id":"msg_b","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+
+        std::fs::write(&transcript, format!("{turn_a}\n{turn_b}\n")).unwrap();
+        let before = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2);
+        assert!(
+            before
+                .iter()
+                .all(|m| m.client == "cc-mirror/zai-worker" && m.provider_id == "zai"),
+            "cold scan must attribute both turns to the original variant"
+        );
+
+        // Turn A drops out of the live file, so it becomes a retained
+        // message cached under the original variant's client/provider.
+        std::fs::write(&transcript, format!("{turn_b}\n")).unwrap();
+        let after_drop = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(after_drop.len(), 2, "turn A must be retained");
+
+        // The variant is renamed and rehomed to a different provider. The
+        // transcript itself is untouched, but variant.json riding along in
+        // the fingerprint means this alone forces a fresh scan.
+        std::fs::write(
+            &variant_path,
+            serde_json::json!({
+                "name": "zai-worker-mk2",
+                "provider": "moonshot",
+                "configDir": config_dir,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let after_rename = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(
+            after_rename.len(),
+            2,
+            "turn A must still be retained after the variant edit"
+        );
+        let retained = after_rename
+            .iter()
+            .find(|m| m.dedup_key.as_deref() == Some("msg_a:req_a"))
+            .expect("turn A must survive as a retained message");
+        let live = after_rename
+            .iter()
+            .find(|m| m.dedup_key.as_deref() == Some("msg_b:req_b"))
+            .expect("turn B must be present as a live message");
+        assert_eq!(
+            live.client, "cc-mirror/zai-worker-mk2",
+            "sanity check: the live message picks up the renamed variant"
+        );
+        assert_eq!(live.provider_id, "moonshotai");
+        assert_eq!(
+            retained.client, live.client,
+            "the retained turn must be rebuilt onto the new variant's client id, not kept on the stale one"
+        );
+        assert_eq!(
+            retained.provider_id, live.provider_id,
+            "the retained turn must be rebuilt onto the new variant's provider, not kept on the stale one"
+        );
+        assert_eq!(retained.tokens.output, 50, "token counts stay intrinsic");
     }
 
     /// Streaming-lane counterpart of

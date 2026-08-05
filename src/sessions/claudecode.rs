@@ -948,6 +948,59 @@ pub(crate) fn dedup_key_is_globally_stable(key: &str) -> bool {
     !key.contains(PATH_SCOPED_KEY_MARKER)
 }
 
+/// Rebuild the parser-derived context on a message retained across an
+/// in-place transcript rewrite (see RET-CLAUDE-001), so it reflects the
+/// *current* parse of `path` rather than the parse that first cached it.
+///
+/// `client`, `provider_id` and the workspace fields are recomputed from
+/// `path`/`home_dir` exactly as a fresh parse would derive them — a
+/// `cc-mirror/variant.json` name or provider edit changes the Claude
+/// fingerprint without touching the transcript body, and a retained message
+/// must not keep the stale values from the parse that originally cached it.
+/// `provider_id` reuses the same confidence-based override
+/// (`stored_claude_provider_confidence` / `update_claude_provider_id`) a live
+/// parse uses to merge duplicate entries, so a higher-confidence hint still
+/// wins and a lower-confidence one does not clobber an explicit value.
+///
+/// `agent` (sidechain resolution) is uniform across every message a single
+/// parse of one file produces, so the caller threads it through from a live
+/// sibling in this same scan (`live_agent`) instead of re-deriving it here;
+/// re-deriving it would need the file's first raw entry and a parent-session
+/// cache, neither of which is reachable at this point. When the live parse
+/// produced no sibling at all (the whole file's messages are now retained),
+/// `live_agent` is `None` and the message's agent is cleared to match — the
+/// same default a fresh non-sidechain parse would produce.
+///
+/// Token counts, timestamps and the dedup key are intrinsic to the message
+/// and are left untouched.
+pub(crate) fn refresh_retained_message_context(
+    message: &mut UnifiedMessage,
+    path: &Path,
+    home_dir: Option<&Path>,
+    live_agent: Option<&str>,
+) {
+    let (workspace_key, workspace_label) = claude_workspace_from_path(path);
+    message.set_workspace(workspace_key, workspace_label);
+
+    let cc_mirror_metadata = cc_mirror_variant_metadata_from_path(path, home_dir);
+    message.client = cc_mirror_metadata
+        .as_ref()
+        .map(CcMirrorVariantMetadata::client_id)
+        .unwrap_or_else(|| "claude".to_string());
+
+    let provider_hint = cc_mirror_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.provider_id.as_deref());
+    let mut confidence = stored_claude_provider_confidence(&message.provider_id);
+    if let Some(choice) =
+        claude_provider_choice_from_parts(Some(message.model_id.as_str()), provider_hint)
+    {
+        update_claude_provider_id(&mut message.provider_id, &mut confidence, choice);
+    }
+
+    message.agent = live_agent.map(str::to_string);
+}
+
 /// A tool_use id is only unique within the conversation that issued it, so the
 /// key is deliberately scoped to the session. See `dedup_key_is_globally_stable`
 /// for what that costs.
