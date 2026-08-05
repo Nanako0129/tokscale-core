@@ -8,7 +8,7 @@ use crate::{
     SessionContribution, TokenBreakdown, YearSummary,
 };
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Aggregate messages into daily contributions
 pub fn aggregate_by_date(messages: Vec<UnifiedMessage>) -> Vec<DailyContribution> {
@@ -234,6 +234,10 @@ struct DayAccumulator {
     totals: DailyTotals,
     token_breakdown: TokenBreakdown,
     clients: HashMap<String, ClientContribution>,
+    /// Turn starts for this day, by exact client id. Separate from `clients`
+    /// because that map is keyed by client *and* model — see the field docs on
+    /// `DailyContribution::turns_by_client`.
+    turns_by_client: BTreeMap<String, i64>,
 }
 
 impl Default for DayAccumulator {
@@ -242,6 +246,7 @@ impl Default for DayAccumulator {
             totals: DailyTotals::default(),
             token_breakdown: TokenBreakdown::default(),
             clients: HashMap::with_capacity(8),
+            turns_by_client: BTreeMap::new(),
         }
     }
 }
@@ -262,6 +267,15 @@ impl DayAccumulator {
             .totals
             .messages
             .saturating_add(msg.message_count.max(0));
+
+        // The parsers mark the first assistant reply after genuine human input;
+        // this fold only counts those markers, it does not re-derive them. The
+        // key is the exact client id, so a produced id such as `cc-mirror/*`
+        // stays separate from the lane that discovered it.
+        if msg.is_turn_start {
+            let entry = self.turns_by_client.entry(msg.client.clone()).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
 
         self.token_breakdown.input = self.token_breakdown.input.saturating_add(msg.tokens.input);
         self.token_breakdown.output = self
@@ -342,6 +356,13 @@ impl DayAccumulator {
         self.totals.tokens = self.totals.tokens.saturating_add(other.totals.tokens);
         self.totals.cost += other.totals.cost;
         self.totals.messages = self.totals.messages.saturating_add(other.totals.messages);
+
+        // Parallel reduction splits one day across accumulators, so a turn
+        // counted in `other` is lost unless it is merged here.
+        for (client, count) in other.turns_by_client {
+            let entry = self.turns_by_client.entry(client).or_insert(0);
+            *entry = entry.saturating_add(count);
+        }
 
         self.token_breakdown.input = self
             .token_breakdown
@@ -451,6 +472,14 @@ impl DayAccumulator {
             token_breakdown,
             clients,
             active_time_ms: None,
+            // Drop non-positive counts rather than emitting a zero entry: a
+            // client with no turns should be absent, not present-with-zero, so
+            // a consumer can tell "no turns recorded" from "client absent".
+            turns_by_client: self
+                .turns_by_client
+                .into_iter()
+                .filter(|(_, count)| *count > 0)
+                .collect(),
         }
     }
 }
@@ -876,6 +905,106 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     // Helper function to create mock UnifiedMessage
+    /// LP1 — per-day turns keyed by exact client.
+    ///
+    /// The turn markers already ride this stream, so the value of counting them
+    /// here is that a day/month view no longer needs a second full report. What
+    /// has to hold is that the count is per exact client: `cc-mirror/*` is a
+    /// produced id from the Claude lane, and folding it into `claude` would
+    /// inflate a client the user can hide independently.
+    #[test]
+    fn daily_turns_are_counted_per_exact_client() {
+        let turn = |date: &str, client: &str, is_turn: bool| {
+            let mut m = mock_unified_message(date, 10, 0.1, "model-a", client);
+            m.is_turn_start = is_turn;
+            m
+        };
+        let messages = vec![
+            turn("2026-01-01", "claude", true),
+            turn("2026-01-01", "claude", false), // tool loop inside the same turn
+            turn("2026-01-01", "claude", true),
+            turn("2026-01-01", "codex", true),
+            turn("2026-01-01", "cc-mirror/kimi-code", true),
+            turn("2026-01-02", "claude", true),
+            turn("2026-01-02", "gemini", false), // no turn marker at all
+        ];
+        let contributions = aggregate_by_date(messages);
+        let day1 = contributions
+            .iter()
+            .find(|c| c.date == "2026-01-01")
+            .unwrap();
+        assert_eq!(
+            day1.turns_by_client.get("claude"),
+            Some(&2),
+            "only the marked messages count; the tool-loop message is not a turn"
+        );
+        assert_eq!(day1.turns_by_client.get("codex"), Some(&1));
+        assert_eq!(
+            day1.turns_by_client.get("cc-mirror/kimi-code"),
+            Some(&1),
+            "a produced mirror id keeps its own count and must not merge into claude"
+        );
+        let day2 = contributions
+            .iter()
+            .find(|c| c.date == "2026-01-02")
+            .unwrap();
+        assert_eq!(day2.turns_by_client.get("claude"), Some(&1));
+        assert_eq!(
+            day2.turns_by_client.get("gemini"),
+            None,
+            "a client with no turn markers is absent, not present with zero"
+        );
+    }
+
+    /// The streaming fold is what production reports use; a count that only
+    /// worked in the materialized path would be invisible to every consumer.
+    /// Feeding one day through several accumulators also covers the merge that
+    /// parallel reduction performs.
+    #[test]
+    fn streaming_and_merged_folds_agree_on_daily_turns() {
+        let turn = |client: &str, is_turn: bool| {
+            let mut m = mock_unified_message("2026-03-04", 10, 0.1, "model-a", client);
+            m.is_turn_start = is_turn;
+            m
+        };
+        let messages = vec![
+            turn("claude", true),
+            turn("codex", true),
+            turn("claude", true),
+            turn("codex", false),
+        ];
+        let materialized = aggregate_by_date(messages.clone());
+
+        let mut streaming = StreamingAggregator::new();
+        for m in &messages {
+            streaming.feed_pre_deduped(m);
+        }
+        let streamed = streaming.finalize();
+
+        let mut left = DayAccumulator::default();
+        let mut right = DayAccumulator::default();
+        for (index, m) in messages.iter().enumerate() {
+            if index % 2 == 0 {
+                left.add_message(m)
+            } else {
+                right.add_message(m)
+            }
+        }
+        left.merge(right);
+        let merged = left.into_contribution("2026-03-04".to_string());
+
+        assert_eq!(
+            materialized[0].turns_by_client, streamed[0].turns_by_client,
+            "streaming must agree with the materialized fold"
+        );
+        assert_eq!(
+            materialized[0].turns_by_client, merged.turns_by_client,
+            "a day split across accumulators must not lose turns in the merge"
+        );
+        assert_eq!(merged.turns_by_client.get("claude"), Some(&2));
+        assert_eq!(merged.turns_by_client.get("codex"), Some(&1));
+    }
+
     fn mock_unified_message(
         date: &str,
         tokens: i64,
@@ -1065,6 +1194,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-02".to_string(),
@@ -1077,6 +1207,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
         ];
 
@@ -1100,6 +1231,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-02".to_string(),
@@ -1112,6 +1244,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-03".to_string(),
@@ -1124,6 +1257,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
         ];
 
@@ -1212,6 +1346,7 @@ mod tests {
             token_breakdown: TokenBreakdown::default(),
             clients: Vec::new(),
             active_time_ms: None,
+            turns_by_client: BTreeMap::new(),
         }];
 
         let years = calculate_years(&contributions);
@@ -1237,6 +1372,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-02".to_string(),
@@ -1249,6 +1385,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
         ];
 
@@ -1276,6 +1413,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-02".to_string(),
@@ -1288,6 +1426,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
         ];
 
@@ -1352,6 +1491,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-02".to_string(),
@@ -1364,6 +1504,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
         ];
 
@@ -1386,6 +1527,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-02".to_string(),
@@ -1398,6 +1540,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-03".to_string(),
@@ -1410,6 +1553,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-04".to_string(),
@@ -1422,6 +1566,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-05".to_string(),
@@ -1434,6 +1579,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
         ];
 
@@ -1460,6 +1606,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-02".to_string(),
@@ -1472,6 +1619,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-03".to_string(),
@@ -1484,6 +1632,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
             DailyContribution {
                 date: "2024-01-04".to_string(),
@@ -1496,6 +1645,7 @@ mod tests {
                 token_breakdown: TokenBreakdown::default(),
                 clients: Vec::new(),
                 active_time_ms: None,
+                turns_by_client: BTreeMap::new(),
             },
         ];
 
