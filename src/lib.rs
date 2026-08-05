@@ -570,6 +570,56 @@ fn parse_kimi_source(path: &Path) -> Vec<UnifiedMessage> {
     }
 }
 
+/// What a changed source file is allowed to do to the history the cache
+/// already holds for it.
+#[derive(Clone, Copy)]
+enum HistoryRetention {
+    /// The live file is the whole truth. Anything it no longer contains leaves
+    /// the totals, which is correct for a faithful append-only source.
+    LiveFileOnly,
+    /// Carry forward messages this exact file was previously observed to
+    /// contain. This is only sound for a source that rewrites transcripts in
+    /// place and supplies globally stable dedup keys.
+    RetainObserved {
+        key_is_globally_stable: fn(&str) -> bool,
+    },
+}
+
+/// Merge messages a previous scan recorded for this exact file back into a
+/// fresh parse of it. The live parse wins a duplicate so corrected token
+/// values are not frozen in the cache. Unkeyed and path-scoped messages are
+/// never retained: without a key that survives a fork, a retained copy could
+/// not collapse against a live replay and would double count.
+///
+/// Returns the dedup keys of the messages it carried forward, so a caller
+/// that later merges this file's messages against other files can tell a
+/// retained copy apart from a live one and make the live copy win.
+fn retain_observed_messages(
+    parsed: &mut Vec<UnifiedMessage>,
+    cached: &[UnifiedMessage],
+    key_is_globally_stable: fn(&str) -> bool,
+) -> HashSet<String> {
+    let mut seen: HashSet<String> = parsed
+        .iter()
+        .filter_map(|message| message.dedup_key.clone())
+        .collect();
+    let mut retained_keys = HashSet::new();
+
+    for message in cached {
+        let Some(key) = message.dedup_key.as_ref() else {
+            continue;
+        };
+        if !key_is_globally_stable(key) {
+            continue;
+        }
+        if seen.insert(key.clone()) {
+            retained_keys.insert(key.clone());
+            parsed.push(message.clone());
+        }
+    }
+    retained_keys
+}
+
 #[allow(dead_code)]
 fn parse_all_messages_with_pricing(
     home_dir: &str,
@@ -750,6 +800,15 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         messages: Vec<UnifiedMessage>,
         cache_entry: Option<message_cache::CachedSourceEntry>,
         invalidate_cache: bool,
+        /// Dedup keys of messages in `messages` that came from
+        /// `retain_observed_messages` rather than the live parse. Never
+        /// persisted — `CachedSourceEntry` has no such field — used only so a
+        /// caller merging outcomes across files can make a live copy outrank
+        /// a retained one in cross-file dedup. Empty for every non-retaining
+        /// lane and for the cache-hit early returns below, since those
+        /// messages are the file's whole truth, not a carried-forward
+        /// partial.
+        retained_keys: HashSet<String>,
     }
 
     fn apply_pricing_to_messages(
@@ -795,6 +854,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         identity: message_cache::CacheIdentity,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        history: HistoryRetention,
         fingerprint_from_path: FingerprintFn,
         parse: F,
     ) -> CachedParseOutcome
@@ -815,6 +875,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 messages,
                 cache_entry: None,
                 invalidate_cache: false,
+                retained_keys: HashSet::new(),
             };
         };
 
@@ -828,6 +889,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                         messages: cached_messages(cached, pricing),
                         cache_entry: None,
                         invalidate_cache: false,
+                        // Reconstructed from persisted provenance so a cache
+                        // hit still makes a live copy elsewhere outrank a
+                        // retained one here — see RET-CLAUDE-001.
+                        retained_keys: cached.retained_keys.clone(),
                     };
                 }
                 cached.fingerprint.clone()
@@ -841,22 +906,46 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                     messages: cached_messages(cached, pricing),
                     cache_entry: None,
                     invalidate_cache: false,
+                    retained_keys: cached.retained_keys.clone(),
                 };
             }
         }
 
         let (mut messages, cacheable) = parse(path);
+        // A changed fingerprint can mean that a client rewrote a transcript
+        // and dropped messages it had already published, not only that new
+        // content appeared. Retain only cacheable, keyed messages for the
+        // explicitly opting-in lane; an untrustworthy parse must not synthesize
+        // a cache entry or history.
+        let mut retained_keys = HashSet::new();
+        if let HistoryRetention::RetainObserved {
+            key_is_globally_stable,
+        } = history
+        {
+            if cacheable {
+                if let Some(cached) = cached {
+                    retained_keys = retain_observed_messages(
+                        &mut messages,
+                        &cached.messages,
+                        key_is_globally_stable,
+                    );
+                }
+            }
+        }
         let cache_entry = if messages.is_empty() || !cacheable {
             None
         } else {
-            Some(message_cache::CachedSourceEntry::new(
-                identity,
-                path,
-                fingerprint,
-                messages.clone(),
-                Vec::new(),
-                None,
-            ))
+            Some(
+                message_cache::CachedSourceEntry::new(
+                    identity,
+                    path,
+                    fingerprint,
+                    messages.clone(),
+                    Vec::new(),
+                    None,
+                )
+                .with_retained_keys(retained_keys.clone()),
+            )
         };
         apply_pricing_to_messages(&mut messages, pricing);
 
@@ -864,6 +953,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             messages,
             cache_entry,
             invalidate_cache: !cacheable,
+            retained_keys,
         }
     }
 
@@ -887,6 +977,38 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             identity,
             source_cache,
             pricing,
+            HistoryRetention::LiveFileOnly,
+            fingerprint_from_path,
+            |path| (parse(path), true),
+        )
+    }
+
+    /// Same as `load_or_parse_source_with_fingerprint`, for clients that
+    /// rewrite an existing transcript instead of only appending to it.
+    fn load_or_parse_source_with_fingerprint_retaining_history<F, FingerprintFn>(
+        path: &Path,
+        identity: message_cache::CacheIdentity,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+        key_is_globally_stable: fn(&str) -> bool,
+        fingerprint_from_path: FingerprintFn,
+        parse: F,
+    ) -> CachedParseOutcome
+    where
+        F: Fn(&Path) -> Vec<UnifiedMessage>,
+        FingerprintFn: Fn(
+            &Path,
+            Option<&message_cache::SourceFingerprint>,
+        ) -> Option<message_cache::FingerprintStatus>,
+    {
+        load_or_parse_source_with_fingerprint_and_policy(
+            path,
+            identity,
+            source_cache,
+            pricing,
+            HistoryRetention::RetainObserved {
+                key_is_globally_stable,
+            },
             fingerprint_from_path,
             |path| (parse(path), true),
         )
@@ -950,6 +1072,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             messages,
             cache_entry: raw.cache_entry,
             invalidate_cache: raw.invalidate_cache,
+            retained_keys: HashSet::new(),
         }
     }
 
@@ -1036,11 +1159,12 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Claude)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
+            load_or_parse_source_with_fingerprint_retaining_history(
                 path,
                 message_cache::CacheIdentity::for_client(ClientId::Claude),
                 &source_cache,
                 pricing,
+                sessions::claudecode::dedup_key_is_globally_stable,
                 |path, cached| {
                     message_cache::SourceFingerprint::check_claude_code_path_with_home_samples_only(
                         path,
@@ -1052,23 +1176,45 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             )
         })
         .collect();
-    let mut claude_messages_raw: Vec<(String, UnifiedMessage)> = Vec::new();
+    // (key, message, is_retained) — is_retained is checked against the
+    // *owning* outcome's retained_keys, so the same key can be live in one
+    // file and retained in another without either instance losing its
+    // identity.
+    let mut claude_messages_raw: Vec<(String, UnifiedMessage, bool)> = Vec::new();
     for outcome in claude_outcomes {
+        let retained_keys = outcome.retained_keys;
         claude_messages_raw.extend(outcome.messages.into_iter().map(|msg| {
             let dedup_key = msg.dedup_key.clone().unwrap_or_default();
-            (dedup_key, msg)
+            let is_retained = !dedup_key.is_empty() && retained_keys.contains(&dedup_key);
+            (dedup_key, msg, is_retained)
         }));
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
 
+    // Two passes so a live copy always outranks a retained one: a retained
+    // message survives an in-place transcript rewrite (see
+    // `HistoryRetention::RetainObserved`), but if the same key's completed
+    // form shows up live in another file (e.g. a forked/resumed transcript),
+    // the live copy must win regardless of file iteration order.
     let mut seen_keys: HashSet<String> = HashSet::new();
-    let claude_messages: Vec<UnifiedMessage> = claude_messages_raw
-        .into_iter()
-        .filter(|(key, _)| key.is_empty() || seen_keys.insert(key.clone()))
-        .map(|(_, msg)| msg)
-        .collect();
+    let mut claude_messages: Vec<UnifiedMessage> = Vec::new();
+    let mut deferred_retained: Vec<(String, UnifiedMessage)> = Vec::new();
+    for (key, msg, is_retained) in claude_messages_raw {
+        if is_retained {
+            deferred_retained.push((key, msg));
+            continue;
+        }
+        if key.is_empty() || seen_keys.insert(key) {
+            claude_messages.push(msg);
+        }
+    }
+    for (key, msg) in deferred_retained {
+        if key.is_empty() || seen_keys.insert(key) {
+            claude_messages.push(msg);
+        }
+    }
     all_messages.extend(claude_messages);
 
     let codex_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
@@ -1152,6 +1298,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 message_cache::CacheIdentity::for_client(ClientId::Gemini),
                 &source_cache,
                 pricing,
+                HistoryRetention::LiveFileOnly,
                 message_cache::SourceFingerprint::check_path_samples_only,
                 |path| {
                     let parsed = sessions::gemini::parse_gemini_file_with_cache_status(path);
@@ -2958,9 +3105,18 @@ where
     // ---- Claude Code JSONL (cache-aware, reference-iterate on hit) ----
     let claude_home = PathBuf::from(home_dir);
     let mut claude_seen: HashSet<String> = HashSet::new();
+    // Retained messages (see `retain_observed_messages`) are buffered instead
+    // of sunk immediately, so every live Claude message across every file
+    // gets first claim on `claude_seen`. Without this, a retained partial
+    // from a file that happens to sort earlier could win the dedup race
+    // against a completed live copy in a later file (e.g. a forked/resumed
+    // transcript) — sinking retained messages only after the whole loop
+    // makes file iteration order irrelevant to that outcome.
+    let mut deferred_retained: Vec<UnifiedMessage> = Vec::new();
     for path in scan_result.get(ClientId::Claude) {
         let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
         let cached = source_cache.get(identity, path);
+        let cached_messages = cached.map(|entry| entry.messages.clone());
         let fingerprint_status =
             message_cache::SourceFingerprint::check_claude_code_path_with_home_samples_only(
                 path,
@@ -2985,7 +3141,19 @@ where
             None => (None, None),
         };
         if let Some(cached) = cache_hit {
+            // Reconstructed from persisted provenance (`cached.retained_keys`)
+            // so a cache hit still defers a retained message behind every
+            // live Claude message across every file, exactly like the fresh
+            // parse below — see RET-CLAUDE-001.
             for msg in cached.messages.iter() {
+                let is_retained = msg
+                    .dedup_key
+                    .as_ref()
+                    .is_some_and(|k| cached.retained_keys.contains(k));
+                if is_retained {
+                    deferred_retained.push(msg.clone());
+                    continue;
+                }
                 let mut m = msg.clone();
                 m.refresh_derived_fields();
                 apply_pricing_if_available(&mut m, pricing);
@@ -2994,25 +3162,57 @@ where
                 if keep && filter(&m) { sink(&m); }
             }
         } else {
-            let msgs = sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home));
-            if !msgs.is_empty() {
-                if let Some(fingerprint) = fingerprint {
-                    source_cache.insert(message_cache::CachedSourceEntry::new(
-                        identity,
-                        path,
-                        fingerprint,
-                        msgs.clone(),
-                        Vec::new(),
-                        None,
-                    ));
+            let mut msgs =
+                sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home));
+            let mut retained_keys: HashSet<String> = HashSet::new();
+            if let Some(fingerprint) = fingerprint {
+                retained_keys = retain_observed_messages(
+                    &mut msgs,
+                    cached_messages.as_deref().unwrap_or(&[]),
+                    sessions::claudecode::dedup_key_is_globally_stable,
+                );
+                if !msgs.is_empty() {
+                    source_cache.insert(
+                        message_cache::CachedSourceEntry::new(
+                            identity,
+                            path,
+                            fingerprint,
+                            msgs.clone(),
+                            Vec::new(),
+                            None,
+                        )
+                        .with_retained_keys(retained_keys.clone()),
+                    );
                 }
             }
             for mut m in msgs {
+                let is_retained = m
+                    .dedup_key
+                    .as_ref()
+                    .is_some_and(|k| retained_keys.contains(k));
+                if is_retained {
+                    deferred_retained.push(m);
+                    continue;
+                }
                 apply_pricing_if_available(&mut m, pricing);
                 if !passes_client(&m) { continue; }
                 let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut claude_seen));
                 if keep && filter(&m) { sink(&m); }
             }
+        }
+    }
+    for mut m in deferred_retained {
+        m.refresh_derived_fields();
+        apply_pricing_if_available(&mut m, pricing);
+        if !passes_client(&m) {
+            continue;
+        }
+        let keep = m
+            .dedup_key
+            .as_ref()
+            .is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut claude_seen));
+        if keep && filter(&m) {
+            sink(&m);
         }
     }
 
@@ -5258,6 +5458,760 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
         )
+    }
+
+    fn parse_claude_fixture(source_home: &Path) -> Vec<UnifiedMessage> {
+        parse_all_messages_with_pricing_with_env_strategy(
+            source_home.to_str().unwrap(),
+            &["claude".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        )
+    }
+
+    fn collect_streamed_claude_fixture(source_home: &Path) -> Vec<UnifiedMessage> {
+        let mut messages = Vec::new();
+        scan_messages_streaming(
+            source_home.to_str().unwrap(),
+            &["claude".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| messages.push(message.clone()),
+        );
+        messages
+    }
+
+    /// Claude Code rewrites a session transcript in place on resume/compact:
+    /// the file keeps its path and session id but loses already-written
+    /// assistant turns. Because the source cache tracks live file content, a
+    /// rescan after such a rewrite used to drop those turns from history for
+    /// good.
+    ///
+    /// This is also the hermetic end-to-end reproduction of the defect: every
+    /// expected total below is hand-derived from the fixture bytes written
+    /// here, never read back from the code under test.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_in_place_rewrite_preserves_previously_seen_messages() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("conversation.jsonl");
+
+        let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#;
+        let turn_two = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60,"cache_read_input_tokens":11,"cache_creation_input_tokens":5}}}"#;
+        let turn_three = r#"{"type":"assistant","timestamp":"2024-12-01T10:10:00.000Z","requestId":"req_003","message":{"id":"msg_003","model":"claude-3-5-sonnet","usage":{"input_tokens":300,"output_tokens":70,"cache_read_input_tokens":13,"cache_creation_input_tokens":17}}}"#;
+
+        std::fs::write(
+            &transcript,
+            format!("{turn_one}\n{turn_two}\n{turn_three}\n"),
+        )
+        .unwrap();
+
+        let before = parse_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 3, "cold scan must see all three turns");
+        // Hand-derived from the fixture literals above, not from the parse output.
+        let expected_output = 50 + 60 + 70;
+        let expected_cache_read = 7 + 11 + 13;
+        let expected_cache_write = 3 + 5 + 17;
+        assert_eq!(
+            before.iter().map(|m| m.tokens.output).sum::<i64>(),
+            expected_output
+        );
+
+        // The rewrite: same path, same session, two assistant turns gone.
+        std::fs::write(&transcript, format!("{turn_three}\n")).unwrap();
+
+        let after = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            after.len(),
+            3,
+            "an in-place rewrite must not retire messages the cache already observed"
+        );
+        assert_eq!(
+            after.iter().map(|m| m.tokens.output).sum::<i64>(),
+            expected_output
+        );
+        assert_eq!(
+            after.iter().map(|m| m.tokens.cache_read).sum::<i64>(),
+            expected_cache_read
+        );
+        assert_eq!(
+            after.iter().map(|m| m.tokens.cache_write).sum::<i64>(),
+            expected_cache_write
+        );
+
+        // Retention has to survive its own round trip through the cache: the
+        // rewritten entry is what the NEXT scan reads back, so a union that is
+        // computed but not persisted drifts one run later.
+        let third = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            third.len(),
+            3,
+            "the retained turns must be written back to the cache, not just returned once"
+        );
+        assert_eq!(
+            third.iter().map(|m| m.tokens.output).sum::<i64>(),
+            expected_output
+        );
+    }
+
+    /// Retention is only sound because a retained message still collapses
+    /// against a live copy of itself somewhere else. Claude Code forks a
+    /// session into a new transcript that replays earlier turns, so the same
+    /// `messageId:requestId` legitimately appears in two files at once.
+    ///
+    /// The transcripts are named so the retaining file sorts first: the lane
+    /// walks paths in lexical order and keeps the first copy of a key, so this
+    /// is the ordering where a retained copy wins over the live one.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_retained_message_collapses_against_a_forked_transcript() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("aaa-original.jsonl");
+
+        let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let turn_two = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+        let turn_three = r#"{"type":"assistant","timestamp":"2024-12-01T10:10:00.000Z","requestId":"req_003","message":{"id":"msg_003","model":"claude-3-5-sonnet","usage":{"input_tokens":300,"output_tokens":70}}}"#;
+
+        std::fs::write(&original, format!("{turn_one}\n{turn_two}\n{turn_three}\n")).unwrap();
+        let before = parse_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 3);
+
+        // The compaction keeps turn one. Turn two is replayed into the fork,
+        // so it exists both retained and live. Turn three exists only as a
+        // retained copy.
+        std::fs::write(&original, format!("{turn_one}\n")).unwrap();
+        std::fs::write(claude_dir.join("zzz-fork.jsonl"), format!("{turn_two}\n")).unwrap();
+
+        let after = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            after.len(),
+            3,
+            "retention must keep turn three and must not double count turn two"
+        );
+        let keys: HashSet<String> = after
+            .iter()
+            .filter_map(|message| message.dedup_key.clone())
+            .collect();
+        assert_eq!(keys.len(), 3, "every surviving message must be distinct");
+        assert_eq!(
+            after.iter().map(|m| m.tokens.output).sum::<i64>(),
+            50 + 60 + 70,
+            "turn two contributes its 60 once, not twice"
+        );
+        assert_eq!(
+            after.iter().map(|m| m.tokens.input).sum::<i64>(),
+            100 + 200 + 300
+        );
+    }
+
+    /// A retained message is a partial the parser cached mid-stream (see
+    /// `merge_claude_duplicate`'s per-field max in `sessions/claudecode.rs`),
+    /// and compaction can drop that turn from the original file before the
+    /// stream ever completed. A forked/resumed transcript that replays the
+    /// same `messageId:requestId` after it finished must win: the live parse
+    /// of the fork carries the completed usage, and retention must not let
+    /// the earlier, lower partial from the original file's cache shadow it.
+    ///
+    /// The fork is named to sort after the original, i.e. the ordering where
+    /// naive first-write-wins dedup keeps the retained (wrong) copy.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_live_copy_outranks_retained_partial_when_fork_sorts_after() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("aaa-original.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":999}}}"#;
+
+        std::fs::write(&original, format!("{filler}\n{partial}\n")).unwrap();
+        let before = parse_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2, "cold scan sees the filler and the partial");
+        // Hand-derived from the fixture literals above.
+        assert_eq!(before.iter().map(|m| m.tokens.output).sum::<i64>(), 10 + 50);
+
+        // Compaction drops the shared turn from the original, leaving only the
+        // filler; a fork sorting after the original replays the shared turn
+        // to completion.
+        std::fs::write(&original, format!("{filler}\n")).unwrap();
+        std::fs::write(claude_dir.join("zzz-fork.jsonl"), format!("{completed}\n")).unwrap();
+
+        let after = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            after.len(),
+            2,
+            "the shared key must not double count across original and fork"
+        );
+        assert_eq!(
+            after.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 999,
+            "the live completed copy from the fork must win over the retained partial"
+        );
+    }
+
+    /// Same defect, opposite file order: the fork is named to sort *before*
+    /// the original, so a test that only exercised one ordering could pass by
+    /// accident of iteration order rather than because retained messages are
+    /// actually deferred behind every live message.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_live_copy_outranks_retained_partial_when_fork_sorts_before() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("zzz-original.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":999}}}"#;
+
+        std::fs::write(&original, format!("{filler}\n{partial}\n")).unwrap();
+        let before = parse_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2);
+        assert_eq!(before.iter().map(|m| m.tokens.output).sum::<i64>(), 10 + 50);
+
+        std::fs::write(&original, format!("{filler}\n")).unwrap();
+        std::fs::write(claude_dir.join("aaa-fork.jsonl"), format!("{completed}\n")).unwrap();
+
+        let after = parse_claude_fixture(source_home.path());
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            after.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 999,
+            "file iteration order must not change which copy wins"
+        );
+    }
+
+    /// A Claude tool-result key embeds the session id, which is the
+    /// transcript's file stem. A retained tool result therefore could never
+    /// collapse against the same tool result replayed under a fork's filename
+    /// — both would count — so retention has to leave those records behind
+    /// even though it means a compaction still retires their input tokens.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_path_scoped_tool_result_is_not_retained_across_a_rewrite() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("conversation.jsonl");
+
+        let assistant_turn = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let tool_result = r#"{"type":"user","timestamp":"2024-12-01T10:01:00.000Z","message":{"model":"claude-3-5-sonnet","content":[{"type":"tool_result","tool_use_id":"toolu_1","tool_output":{"input_tokens":40,"output":"result"}}]}}"#;
+
+        std::fs::write(&transcript, format!("{assistant_turn}\n{tool_result}\n")).unwrap();
+        let before = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            before.len(),
+            2,
+            "cold scan sees the turn and the tool result"
+        );
+        assert_eq!(before.iter().map(|m| m.tokens.input).sum::<i64>(), 100 + 40);
+
+        // The rewrite drops both records; only the assistant turn is
+        // re-added, so the tool result is a candidate for retention.
+        std::fs::write(&transcript, format!("{assistant_turn}\n")).unwrap();
+
+        let after = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            after.len(),
+            1,
+            "a path-scoped key must not be carried across the rewrite"
+        );
+        assert_eq!(after.iter().map(|m| m.tokens.input).sum::<i64>(), 100);
+    }
+
+    /// The retention above must not resurrect a session the user deleted:
+    /// missing-file pruning drops the entry when the file is gone.
+    ///
+    /// The transcript is compacted first, and retention is asserted, so the
+    /// deletion runs against an entry that really is holding a turn the live
+    /// file no longer has. Deleting straight after a cold scan would prove
+    /// nothing about retention.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_deleted_transcript_is_not_resurrected_by_retention() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("conversation.jsonl");
+
+        let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let turn_two = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+
+        std::fs::write(&transcript, format!("{turn_one}\n{turn_two}\n")).unwrap();
+        let before = parse_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2);
+
+        std::fs::write(&transcript, format!("{turn_two}\n")).unwrap();
+        let retained = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            retained.len(),
+            2,
+            "the entry must actually be holding a retained turn before the delete"
+        );
+
+        std::fs::remove_file(&transcript).unwrap();
+
+        let after = parse_claude_fixture(source_home.path());
+        assert!(
+            after.is_empty(),
+            "a deleted transcript stays deleted, retained turns and all; local disk remains the source of truth"
+        );
+    }
+
+    /// The streaming lane is a local integration seam absent from upstream:
+    /// our fork's `scan_messages_streaming` also has to honor retention, not
+    /// just the materialized path exercised above.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_lane_preserves_previously_seen_messages_across_a_rewrite() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("conversation.jsonl");
+
+        let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let turn_two = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+
+        std::fs::write(&transcript, format!("{turn_one}\n{turn_two}\n")).unwrap();
+        let before = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2, "cold streaming scan sees both turns");
+
+        std::fs::write(&transcript, format!("{turn_two}\n")).unwrap();
+        let after = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(
+            after.len(),
+            2,
+            "the streaming lane must retain turn one across the rewrite too"
+        );
+        assert_eq!(after.iter().map(|m| m.tokens.output).sum::<i64>(), 50 + 60);
+    }
+
+    /// Streaming-lane counterpart of
+    /// `test_claude_live_copy_outranks_retained_partial_when_fork_sorts_after`:
+    /// the streaming lane has its own dedup gate (`claude_seen` /
+    /// `dedup_gate_passes`) and its own file loop, so it needs its own
+    /// regression rather than inheriting the materialized lane's fix.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_live_copy_outranks_retained_partial_when_fork_sorts_after() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("aaa-original.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":999}}}"#;
+
+        std::fs::write(&original, format!("{filler}\n{partial}\n")).unwrap();
+        let before = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2);
+        assert_eq!(before.iter().map(|m| m.tokens.output).sum::<i64>(), 10 + 50);
+
+        std::fs::write(&original, format!("{filler}\n")).unwrap();
+        std::fs::write(claude_dir.join("zzz-fork.jsonl"), format!("{completed}\n")).unwrap();
+
+        let after = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            after.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 999,
+            "the streaming lane's live completed copy must win over its retained partial"
+        );
+    }
+
+    /// Same defect, opposite file order — see
+    /// `test_claude_live_copy_outranks_retained_partial_when_fork_sorts_before`
+    /// for why both orderings are asserted.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_live_copy_outranks_retained_partial_when_fork_sorts_before() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("zzz-original.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":999}}}"#;
+
+        std::fs::write(&original, format!("{filler}\n{partial}\n")).unwrap();
+        let before = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2);
+        assert_eq!(before.iter().map(|m| m.tokens.output).sum::<i64>(), 10 + 50);
+
+        std::fs::write(&original, format!("{filler}\n")).unwrap();
+        std::fs::write(claude_dir.join("aaa-fork.jsonl"), format!("{completed}\n")).unwrap();
+
+        let after = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            after.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 999,
+            "file iteration order must not change which copy wins"
+        );
+    }
+
+    /// The rewrite-and-fork scan above already resolves correctly, and writes
+    /// the resolved messages back to the cache — but a fresh parse's
+    /// `retained_keys` used to live only in `CachedParseOutcome`, never in the
+    /// persisted `CachedSourceEntry`. The very next scan then reads the
+    /// original file's entry back with no provenance at all, treats the
+    /// carried-forward partial as if it were live output of this scan, and it
+    /// reclaims the key ahead of the fork's completed copy — the undercount
+    /// this whole change exists to fix returns within one more scan even
+    /// though nothing on disk moved. This is the test that fails without
+    /// `CachedSourceEntry::retained_keys`.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_third_unchanged_scan_still_prefers_completed_over_retained_partial() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("aaa-original.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":999}}}"#;
+
+        std::fs::write(&original, format!("{filler}\n{partial}\n")).unwrap();
+        let before = parse_claude_fixture(source_home.path());
+        // Hand-derived from the fixture literals above.
+        assert_eq!(before.iter().map(|m| m.tokens.output).sum::<i64>(), 10 + 50);
+
+        // The rewrite-and-fork scan: compaction drops the shared turn from
+        // the original, and a fork sorting after it replays that turn to
+        // completion.
+        std::fs::write(&original, format!("{filler}\n")).unwrap();
+        std::fs::write(claude_dir.join("zzz-fork.jsonl"), format!("{completed}\n")).unwrap();
+        let after = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            after.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 999,
+            "the rewrite scan must already prefer the fork's completed replay"
+        );
+
+        // Nothing on disk changes between this scan and the last one: every
+        // file's fingerprint is unchanged, so this is a cache hit throughout.
+        let stable = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            stable.len(),
+            2,
+            "a cache-hit rescan must not resurrect the retained partial as a second message"
+        );
+        assert_eq!(
+            stable.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 999,
+            "a cache-hit rescan must not let the formerly-retained partial reclaim the key"
+        );
+    }
+
+    /// Streaming-lane counterpart of
+    /// `test_claude_third_unchanged_scan_still_prefers_completed_over_retained_partial`:
+    /// the streaming lane reconstructs retained status from the same
+    /// persisted `CachedSourceEntry::retained_keys` on its own cache-hit path,
+    /// and needs its own regression rather than inheriting the materialized
+    /// lane's fix.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_third_unchanged_scan_still_prefers_completed_over_retained_partial() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("aaa-original.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":999}}}"#;
+
+        std::fs::write(&original, format!("{filler}\n{partial}\n")).unwrap();
+        let before = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(before.iter().map(|m| m.tokens.output).sum::<i64>(), 10 + 50);
+
+        std::fs::write(&original, format!("{filler}\n")).unwrap();
+        std::fs::write(claude_dir.join("zzz-fork.jsonl"), format!("{completed}\n")).unwrap();
+        let after = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(after.iter().map(|m| m.tokens.output).sum::<i64>(), 10 + 999);
+
+        let stable = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(
+            stable.len(),
+            2,
+            "a cache-hit rescan must not resurrect the retained partial as a second message"
+        );
+        assert_eq!(
+            stable.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 999,
+            "a cache-hit rescan must not let the formerly-retained partial reclaim the key"
+        );
+    }
+
+    /// The materialized lane and the streaming lane use different mechanisms
+    /// for the live-outranks-retained invariant (two-pass admission driven by
+    /// an in-memory `CachedParseOutcome` vs. a deferred-message buffer driven
+    /// by `CachedSourceEntry::retained_keys` on a cache hit), so a fix to one
+    /// must not silently diverge from the other. This runs the materialized
+    /// lane first to populate the on-disk cache with `retained_keys`
+    /// provenance, then has the streaming lane read that same persisted
+    /// provenance back and checks it resolves to the same totals — not just
+    /// that each lane agrees with a parse it did itself.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_materialized_and_streaming_lanes_agree_on_one_cache_after_rewrite() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("aaa-original.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_shared","message":{"id":"msg_shared","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":999}}}"#;
+
+        std::fs::write(&original, format!("{filler}\n{partial}\n")).unwrap();
+        let _ = parse_claude_fixture(source_home.path());
+
+        std::fs::write(&original, format!("{filler}\n")).unwrap();
+        std::fs::write(claude_dir.join("zzz-fork.jsonl"), format!("{completed}\n")).unwrap();
+
+        let materialized_total: i64 = parse_claude_fixture(source_home.path())
+            .iter()
+            .map(|m| m.tokens.output)
+            .sum();
+        assert_eq!(
+            materialized_total,
+            10 + 999,
+            "materialized lane must resolve to the fork's completed replay"
+        );
+
+        let streaming_total: i64 = collect_streamed_claude_fixture(source_home.path())
+            .iter()
+            .map(|m| m.tokens.output)
+            .sum();
+        assert_eq!(
+            streaming_total, materialized_total,
+            "the streaming lane must agree with the materialized lane against the same persisted cache"
+        );
+    }
+
+    /// A deferred retained message's `date` is whatever was persisted the
+    /// last time it was cached — potentially under a different local
+    /// timezone or before a leap into the next day. The materialized lane
+    /// refreshes `date` from `timestamp` for every message it returns,
+    /// retained or not (see `apply_pricing_to_messages` /
+    /// `cached_messages`), but the streaming lane's deferred-retained sink
+    /// only used to reprice, not refresh. A stale `date` is invisible to a
+    /// raw count/sum comparison — it only surfaces once something filters on
+    /// `date`, exactly like `get_hourly_report`'s `since`/`until`/year
+    /// filtering does in production. This test tampers a persisted retained
+    /// message's `date` directly (standing in for "cached under a different
+    /// timezone") and asserts both lanes agree on the *filtered* output,
+    /// which requires the streaming lane to have recomputed `date` from the
+    /// message's unchanged `timestamp` before the filter ever sees it.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_materialized_and_streaming_lanes_agree_on_deferred_retained_date_after_filtering(
+    ) {
+        use chrono::TimeZone;
+
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("conversation.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let target = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_target","message":{"id":"msg_target","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let target_dedup_key = "msg_target:req_target";
+        let target_timestamp_ms = chrono::DateTime::parse_from_rfc3339("2024-12-01T10:00:00.000Z")
+            .unwrap()
+            .timestamp_millis();
+        // Same formula `UnifiedMessage::refresh_derived_fields` uses, computed
+        // independently here rather than read back from the parse under test.
+        let expected_date = chrono::Local
+            .timestamp_millis_opt(target_timestamp_ms)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        std::fs::write(&transcript, format!("{filler}\n{target}\n")).unwrap();
+        let cold = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            cold.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 50,
+            "cold scan must see both turns"
+        );
+
+        // Compaction: the target turn drops out of the live file, so the next
+        // scan retains it from the cache instead of a live parse.
+        std::fs::write(&transcript, format!("{filler}\n")).unwrap();
+        let rewritten = parse_claude_fixture(source_home.path());
+        assert_eq!(
+            rewritten.iter().map(|m| m.tokens.output).sum::<i64>(),
+            10 + 50,
+            "the rewrite scan must retain the dropped turn"
+        );
+
+        // Tamper the now-persisted retained entry's date directly, standing
+        // in for "this was cached while a different local timezone was
+        // active" without depending on the test process's real timezone.
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        let mut cache = message_cache::SourceMessageCache::load();
+        let mut entry = cache
+            .get(identity, &transcript)
+            .expect("the rewrite scan must have persisted a cache entry")
+            .clone();
+        assert!(
+            entry.retained_keys.contains(target_dedup_key),
+            "the target turn must be recorded as retained provenance"
+        );
+        let target_message = entry
+            .messages
+            .iter_mut()
+            .find(|m| m.dedup_key.as_deref() == Some(target_dedup_key))
+            .expect("the retained target turn must be in the persisted entry");
+        assert_ne!(
+            target_message.date, "1999-01-01",
+            "the fixture's real date must differ from the tampered sentinel, or this test proves nothing"
+        );
+        target_message.date = "1999-01-01".to_string();
+        cache.insert(entry);
+        cache.save_if_dirty();
+
+        // A since/until-style filter, exactly like `get_hourly_report`'s,
+        // that only a correctly-refreshed `date` can pass.
+        let date_filter = move |m: &UnifiedMessage| m.date == expected_date;
+
+        let materialized_filtered: Vec<UnifiedMessage> = parse_claude_fixture(source_home.path())
+            .into_iter()
+            .filter(|m| date_filter(m))
+            .collect();
+        assert_eq!(
+            materialized_filtered
+                .iter()
+                .map(|m| m.tokens.output)
+                .sum::<i64>(),
+            10 + 50,
+            "the materialized lane must refresh the retained turn's date before filtering, \
+             independent of what was persisted"
+        );
+
+        let mut streaming_filtered: Vec<UnifiedMessage> = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &date_filter,
+            &mut |message| streaming_filtered.push(message.clone()),
+        );
+        assert_eq!(
+            streaming_filtered
+                .iter()
+                .map(|m| m.tokens.output)
+                .sum::<i64>(),
+            materialized_filtered
+                .iter()
+                .map(|m| m.tokens.output)
+                .sum::<i64>(),
+            "the streaming lane must agree with the materialized lane once both are filtered \
+             on the retained turn's (refreshed) date"
+        );
+        assert!(
+            streaming_filtered
+                .iter()
+                .any(|m| m.dedup_key.as_deref() == Some(target_dedup_key)),
+            "the retained turn must survive the date filter in the streaming lane too, which \
+             requires its date to have been refreshed from its timestamp before filtering, not \
+             left at the stale persisted value"
+        );
     }
 
     fn copilot_desktop_test_db(home: &Path) -> (PathBuf, rusqlite::Connection) {
