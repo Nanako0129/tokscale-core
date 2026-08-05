@@ -718,6 +718,10 @@ pub(crate) struct CachedPath(Vec<u8>);
 
 #[cfg(unix)]
 impl CachedPath {
+    /// Stores the raw OS string with no normalisation, so two `Path`s that
+    /// name the same file but differ byte for byte are different cache keys.
+    /// On Windows that includes mixed separators: a `join("a/b")` literal and
+    /// the all-backslash path a directory walk produces will not match.
     pub(crate) fn from_path(path: &Path) -> Self {
         use std::os::unix::ffi::OsStrExt;
 

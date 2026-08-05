@@ -5503,7 +5503,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let transcript = claude_dir.join("conversation.jsonl");
 
@@ -5583,7 +5587,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let original = claude_dir.join("aaa-original.jsonl");
 
@@ -5643,7 +5651,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let original = claude_dir.join("aaa-original.jsonl");
 
@@ -5690,7 +5702,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let original = claude_dir.join("zzz-original.jsonl");
 
@@ -5730,7 +5746,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let transcript = claude_dir.join("conversation.jsonl");
 
@@ -5776,7 +5796,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let transcript = claude_dir.join("conversation.jsonl");
 
@@ -5817,7 +5841,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let transcript = claude_dir.join("conversation.jsonl");
 
@@ -5853,7 +5881,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let original = claude_dir.join("aaa-original.jsonl");
 
@@ -5891,7 +5923,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let original = claude_dir.join("zzz-original.jsonl");
 
@@ -5936,7 +5972,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let original = claude_dir.join("aaa-original.jsonl");
 
@@ -5992,7 +6032,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let original = claude_dir.join("aaa-original.jsonl");
 
@@ -6041,7 +6085,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let original = claude_dir.join("aaa-original.jsonl");
 
@@ -6102,7 +6150,11 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
 
-        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let transcript = claude_dir.join("conversation.jsonl");
 
@@ -9016,7 +9068,11 @@ mod tests {
 
         {
             // Plain claude session (client "claude"): 100 in / 50 out.
-            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            let claude_dir = source_home
+                .path()
+                .join(".claude")
+                .join("projects")
+                .join("myproject");
             std::fs::create_dir_all(&claude_dir).unwrap();
             std::fs::write(
                 claude_dir.join("conversation.jsonl"),
