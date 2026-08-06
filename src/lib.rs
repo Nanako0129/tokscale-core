@@ -30,7 +30,7 @@ pub use sessionize::{
 pub use sessions::{CostSource, UnifiedMessage};
 
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -401,6 +401,22 @@ pub struct DailyContribution {
     pub clients: Vec<ClientContribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_time_ms: Option<i64>,
+    /// User interaction turns for this day, keyed by exact client id.
+    ///
+    /// The turn markers already ride the deduped, priced message stream this
+    /// fold consumes, so counting them here costs one increment per message and
+    /// saves a consumer from running a second full report just to show per-day
+    /// turns. The hourly report stays the source for hour-resolution turns;
+    /// this serves day and month views.
+    ///
+    /// Keyed by client rather than folded into `totals` because a consumer that
+    /// hides a client has to be able to subtract it, and a single daily total
+    /// cannot be un-mixed. Kept out of `ClientContribution` because that is
+    /// keyed by client *and* model, while a turn belongs to the client alone —
+    /// splitting one turn across a day's models would invent data. `BTreeMap`
+    /// keeps serialization deterministic.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub turns_by_client: BTreeMap<String, i64>,
 }
 
 /// Per-session aggregate of token usage, cost, and timing — keyed on
