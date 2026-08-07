@@ -1007,6 +1007,7 @@ impl CachedSourceEntry {
         // rewrite straddled by two writers from losing a turn neither
         // writer's own parse of its own generation could reproduce.
         let same_fingerprint = stored.fingerprint == self.fingerprint;
+        let path = self.path.to_path_buf();
 
         let mut self_keys: HashMap<String, usize> = self
             .messages
@@ -1035,7 +1036,24 @@ impl CachedSourceEntry {
                     } else {
                         true
                     };
-                    self.messages.push(message.clone());
+                    let mut absorbed = message.clone();
+                    // `stored` may have been cached before a related-metadata
+                    // edit (a `cc-mirror/variant.json` change, say) that this
+                    // entry's own parse already reflects. Rebuild the
+                    // parser-derived context against the current on-disk
+                    // state so the absorbed copy does not carry `stored`'s
+                    // stale client/provider/workspace — see RET-CLAUDE-001.
+                    // No live sibling agent is available at merge time, so
+                    // `agent` is left as the last resolution, same as the
+                    // parse-time refresh does when a file's whole history is
+                    // retained.
+                    crate::sessions::claudecode::refresh_retained_message_context(
+                        &mut absorbed,
+                        &path,
+                        None,
+                        None,
+                    );
+                    self.messages.push(absorbed);
                     if is_retained {
                         self.retained_keys.insert(key.clone());
                     }
@@ -1045,7 +1063,14 @@ impl CachedSourceEntry {
                     // Both entries describe the same generation and `stored`
                     // saw this key live: prefer its message content, not
                     // just clear the label.
-                    self.messages[index] = message.clone();
+                    let mut absorbed = message.clone();
+                    crate::sessions::claudecode::refresh_retained_message_context(
+                        &mut absorbed,
+                        &path,
+                        None,
+                        None,
+                    );
+                    self.messages[index] = absorbed;
                     self.retained_keys.remove(key);
                 }
                 Some(_) => {
@@ -3697,6 +3722,110 @@ mod tests {
                 "a key an earlier writer saw live must not be left labeled retained just because \
                  the last writer's own entry retained it"
             );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Two writers can straddle both an in-place transcript rewrite and an
+    /// unrelated `cc-mirror/variant.json` edit (a provider switch, say)
+    /// landing in between. The absorbed message's client/provider/workspace
+    /// must reflect the *current* on-disk variant, not whatever `stored` was
+    /// first cached with — otherwise nothing ever refreshes it, since
+    /// `refresh_retained_message_context` only runs at parse time and the
+    /// save-merge path is the only place that ever sees `stored`'s content
+    /// again.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_refreshes_absorbed_message_metadata_against_current_variant() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let variant_dir = temp_home.path().join(".cc-mirror").join("work-variant");
+            let config_dir = variant_dir.join("config");
+            let path = config_dir
+                .join("projects")
+                .join("-Users-example-work")
+                .join("session.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"{\"id\":\"pre-rewrite\"}\n").unwrap();
+            std::fs::write(
+                variant_dir.join("variant.json"),
+                serde_json::json!({
+                    "name": "work-variant",
+                    "provider": "openai",
+                    "configDir": config_dir,
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let absorbed_key = "msg_absorbed:req_absorbed";
+            let stale_message = UnifiedMessage::new_with_dedup(
+                "cc-mirror/work-variant",
+                "claude-3-5-sonnet",
+                "openai",
+                "session-1",
+                1,
+                TokenBreakdown {
+                    input: 1,
+                    output: 2,
+                    ..Default::default()
+                },
+                0.0,
+                Some(absorbed_key.to_string()),
+            );
+
+            // Writer one caches the pre-rewrite generation, retaining the
+            // turn the in-place rewrite is about to drop.
+            let mut first = SourceMessageCache::load();
+            first.insert(
+                entry_with_messages(identity, &path, vec![stale_message])
+                    .with_retained_keys(HashSet::from([absorbed_key.to_string()])),
+            );
+            first.save_if_dirty();
+
+            // The rewrite lands (dropping the turn from the live file), and a
+            // related-metadata edit — a variant provider switch — lands
+            // alongside it.
+            std::fs::write(&path, b"{\"id\":\"post-rewrite\"}\n").unwrap();
+            std::fs::write(
+                variant_dir.join("variant.json"),
+                serde_json::json!({
+                    "name": "work-variant",
+                    "provider": "zai",
+                    "configDir": config_dir,
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            // Writer two's own parse of the new generation found nothing (the
+            // fixture never runs the real parser); its cache entry gets
+            // saved and absorbs the retained turn from `first` on merge.
+            let mut second = SourceMessageCache::load();
+            second.insert(entry_with_messages(identity, &path, Vec::new()));
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1, "the retained turn must survive");
+            assert_eq!(
+                entry.messages[0].provider_id, "zai",
+                "an absorbed message must carry the current variant's provider, not the stale \
+                 one it was first cached with"
+            );
+
+            // A following cache-hit scan serves the persisted entry as-is —
+            // the refreshed metadata must already be what got saved, not
+            // something a live re-parse would still need to fix up.
+            let rehit = SourceMessageCache::load();
+            let rehit_entry = rehit
+                .get(identity, &path)
+                .expect("cache hit should still see the entry");
+            assert_eq!(rehit_entry.messages[0].provider_id, "zai");
         }
 
         restore_cache_env(prev_env);

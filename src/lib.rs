@@ -670,6 +670,7 @@ fn parse_all_messages_with_pricing(
         pricing,
         true,
         &scanner::ScannerSettings::default(),
+        None,
     )
 }
 
@@ -832,6 +833,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     pricing: Option<&pricing::PricingService>,
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
+    modified_after: Option<u64>,
 ) -> Vec<UnifiedMessage> {
     #[derive(Debug)]
     struct CachedParseOutcome {
@@ -1121,12 +1123,15 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    let scan_result = scanner::scan_all_clients_with_scanner_settings(
+    let mut scan_result = scanner::scan_all_clients_with_scanner_settings(
         home_dir,
         clients,
         use_env_roots,
         scanner_settings,
     );
+    if let Some(threshold_ms) = modified_after {
+        prune_scan_result_by_mtime(&mut scan_result, threshold_ms);
+    }
     let headless_roots = scanner::headless_roots_with_env_strategy(home_dir, use_env_roots);
     let mut source_cache = message_cache::SourceMessageCache::load();
     source_cache.prune_missing_files();
@@ -4258,6 +4263,7 @@ fn parse_local_unified_messages_resolved(
         pricing,
         options.use_env_roots,
         &options.scanner_settings,
+        None,
     );
     Ok(filter_unified_messages(messages, &options))
 }
@@ -4789,6 +4795,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                 None,
                 options.use_env_roots,
                 &options.scanner_settings,
+                options.modified_after,
             )
             .iter()
             .map(unified_to_parsed)
@@ -5514,6 +5521,7 @@ mod tests {
             pricing,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         )
     }
 
@@ -5524,6 +5532,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         )
     }
 
@@ -6588,6 +6597,68 @@ mod tests {
             model_report.total_output,
             "parse_local_clients and get_model_report must agree on the same source tree"
         );
+    }
+
+    /// `parse_local_clients` used to route Claude through
+    /// `parse_all_messages_with_pricing_with_env_strategy`, which performed
+    /// its own scan and knew nothing about `modified_after` — the pruned
+    /// file list this function's own scan already computed was discarded, so
+    /// a Claude transcript the caller meant to exclude by mtime was parsed
+    /// and counted anyway, while every other file-backed client still
+    /// honored the option. This asserts a future `modified_after` threshold
+    /// excludes a Claude transcript exactly like it does for a client that
+    /// never went through the retention-aware lane.
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_honors_modified_after_for_claude() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("session.jsonl");
+        let content = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_excluded","message":{"id":"msg_excluded","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        std::fs::write(&transcript, content).unwrap();
+
+        let local_options = |modified_after| LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after,
+        };
+
+        let included = parse_local_clients(local_options(None)).unwrap();
+        assert_eq!(
+            included.messages.len(),
+            1,
+            "sanity: the transcript parses without a threshold"
+        );
+
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        let pruned = parse_local_clients(local_options(Some(future_ms))).unwrap();
+        assert_eq!(
+            pruned.messages.len(),
+            0,
+            "modified_after must exclude a Claude transcript older than the threshold, matching \
+             how other file-backed clients behave under the same option"
+        );
+        assert_eq!(pruned.counts.get(ClientId::Claude), 0);
     }
 
     /// A deferred retained message's `date` is whatever was persisted the
@@ -10070,6 +10141,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         );
         assert_eq!(materialized.len(), 3);
         let mut materialized_inputs: Vec<_> = materialized
@@ -10092,6 +10164,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         );
         assert_eq!(warm, materialized, "cache hits must retain OpenCode aliases");
 
@@ -10272,6 +10345,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                None,
             )
         };
         let mut cold = parse_materialized();
@@ -10527,6 +10601,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                None,
             )
         };
         let cold = parse_materialized();
@@ -11341,6 +11416,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                None,
             )
         };
 
@@ -11487,6 +11563,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                None,
             )
         });
 
@@ -12716,6 +12793,7 @@ mod tests {
             Some(&pricing),
             false,
             &scanner::ScannerSettings::default(),
+            None,
         );
         let mut streamed = Vec::new();
         scan_messages_streaming(
@@ -13744,6 +13822,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                None,
             )
         });
         assert_eq!(materialized.len(), 1);
@@ -14112,6 +14191,7 @@ mod tests {
                     None,
                     false,
                     &scanner::ScannerSettings::default(),
+                    None,
                 );
                 messages.sort_by(|left, right| {
                     (&left.client, &left.session_id, &left.dedup_key).cmp(&(
@@ -14467,6 +14547,7 @@ mod tests {
                     Some(&pricing),
                     false,
                     &scanner::ScannerSettings::default(),
+                    None,
                 )
             })
         };
@@ -14831,6 +14912,7 @@ mod tests {
                     Some(&pricing),
                     false,
                     &scanner::ScannerSettings::default(),
+                    None,
                 )
             })
         };
@@ -15568,6 +15650,7 @@ mod tests {
                 Some(&pricing),
                 false,
                 &scanner_settings,
+                None,
             )
         };
         let streamed = || {
@@ -15697,6 +15780,7 @@ mod tests {
                     Some(&pricing),
                     false,
                     &scanner_settings,
+                    None,
                 ))
             })
         };
@@ -15873,6 +15957,7 @@ mod tests {
                 None,
                 false,
                 &scanner_settings,
+                None,
             ))
         };
         let streamed = || {
@@ -17198,6 +17283,7 @@ mod tests {
                 None,
                 false,
                 &scanner_settings,
+                None,
             );
             parsed.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
             parsed
@@ -17419,6 +17505,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         )
         .into_iter()
         .map(|message| message.session_id)
@@ -17470,6 +17557,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         );
         assert_eq!(materialized.len(), 1);
 
@@ -17523,6 +17611,7 @@ mod tests {
             Some(&pricing_service),
             false,
             &scanner::ScannerSettings::default(),
+            None,
         );
         assert_eq!(materialized.len(), 1);
         assert_eq!(
@@ -17731,6 +17820,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         );
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].dedup_key.as_deref(), Some("execution:exec-1"));
@@ -17767,6 +17857,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         );
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].dedup_key.as_deref(), Some("execution:exec-1"));
@@ -17801,6 +17892,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            None,
         );
         assert_eq!(restored_execution.len(), 1);
         assert_eq!(
