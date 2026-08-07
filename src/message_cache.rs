@@ -1059,43 +1059,30 @@ impl CachedSourceEntry {
                     }
                     self_keys.insert(key.clone(), self.messages.len() - 1);
                 }
-                Some(&index) if same_fingerprint && !stored_is_retained => {
-                    // Both entries describe the same generation and `stored`
-                    // saw this key live: prefer its message content, not
-                    // just clear the label.
-                    let mut absorbed = message.clone();
-                    crate::sessions::claudecode::refresh_retained_message_context(
-                        &mut absorbed,
-                        &path,
-                        None,
-                        None,
-                    );
-                    self.messages[index] = absorbed;
-                    self.retained_keys.remove(key);
-                }
                 Some(&index) => {
-                    // Everything left: both entries hold their own copy of the
-                    // key and neither is a live parse of this generation that
-                    // outranks the other. That is a fingerprint mismatch, and
-                    // equally two copies under the *same* fingerprint that are
-                    // both labeled retained — writers spanning more than one
-                    // rewrite can retain a partial and a completed form of the
-                    // same turn into one fingerprint, so matching labels do
-                    // not imply matching content.
+                    // Both entries hold their own copy of this key. No copy is
+                    // ever authoritative over the other on content, whatever
+                    // their fingerprints or labels say, because every way the
+                    // two can differ is the same disagreement: one observed the
+                    // turn before its usage was final, the other after.
                     //
-                    // Both are the same disagreement: a record observed before
-                    // its usage was final against the completed one. Once
-                    // compaction drops the turn, neither writer's own parse can
-                    // reconstruct the other's usage, so reconcile field by
-                    // field rather than discarding a side — the per-field max
-                    // convention `merge_claude_duplicate` already uses to fold
-                    // same-file streaming duplicates in
-                    // `sessions/claudecode.rs`.
+                    // Two scanners can fingerprint the same partial file and
+                    // have the response complete between their parses, so even
+                    // two *live* copies under one fingerprint can disagree.
+                    // Writers spanning more than one rewrite can retain a
+                    // partial and a completed form into one fingerprint, so
+                    // matching retained labels do not imply matching content
+                    // either. And across a fingerprint mismatch neither side
+                    // can reparse what the other saw once compaction drops the
+                    // turn. Each of those was once handled by preferring a
+                    // side, and each preference turned out to discard real
+                    // usage.
                     //
-                    // Labels are left untouched in both cases. Across a
-                    // mismatch `stored`'s label is untrusted (see above); under
-                    // a match both are already retained, so there is nothing to
-                    // change.
+                    // So content is always reconciled field by field -- the
+                    // per-field max convention `merge_claude_duplicate` uses
+                    // to fold same-file streaming duplicates in
+                    // `sessions/claudecode.rs`. Only the *label* still depends
+                    // on the case, below.
                     let existing = &mut self.messages[index];
                     let stored_tokens = &message.tokens;
                     existing.tokens.input = existing.tokens.input.max(stored_tokens.input);
@@ -1122,6 +1109,16 @@ impl CachedSourceEntry {
                     crate::sessions::claudecode::refresh_retained_message_context(
                         existing, &path, None, None,
                     );
+                    // The one case where a label changes: `stored` parsed this
+                    // key live from the same generation, so the merged copy is
+                    // no longer a carry-forward and must not be deferred behind
+                    // live messages on a later scan. Across a fingerprint
+                    // mismatch `stored`'s label describes another generation
+                    // and is untrusted; when both are retained there is
+                    // nothing to change.
+                    if same_fingerprint && !stored_is_retained {
+                        self.retained_keys.remove(key);
+                    }
                 }
             }
         }
@@ -4244,6 +4241,73 @@ mod tests {
             assert!(
                 entry.retained_keys.contains(key),
                 "both copies were retained, so the merged one stays retained"
+            );
+        }
+        restore_cache_env(prev_env);
+    }
+
+    /// Two scanners can fingerprint the same partial file and have the
+    /// response complete between their parses, so two *live* copies can
+    /// disagree under one fingerprint too. Preferring the stored one because
+    /// it is live discards the completed usage whenever the completed writer
+    /// saved last.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_reconciles_two_live_copies_under_one_fingerprint() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("transcript.jsonl");
+            std::fs::write(&path, b"{\"id\":\"one-generation\"}\n").unwrap();
+
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+
+            // Neither writer labels the key retained: both parsed it live.
+            let mut partial = keyed_message(namespace, "session", key);
+            partial.tokens.input = 100;
+            partial.tokens.output = 50;
+            partial.duration_ms = Some(900);
+
+            let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.output = 999;
+            completed.tokens.cache_read = 10;
+            completed.duration_ms = Some(4_200);
+
+            // The partial writer saves first; the completed writer saves last
+            // and must not have its content replaced by the stored partial.
+            let mut writer_partial = SourceMessageCache::load();
+            writer_partial.insert(entry_with_messages(identity, &path, vec![partial]));
+            writer_partial.save_if_dirty();
+
+            let mut writer_completed = SourceMessageCache::load();
+            writer_completed.insert(entry_with_messages(identity, &path, vec![completed]));
+            writer_completed.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            let merged = &entry.messages[0];
+            assert_eq!(merged.tokens.input, 100, "input: partial held the max");
+            assert_eq!(merged.tokens.output, 999, "output: completed held the max");
+            assert_eq!(
+                merged.tokens.cache_read, 10,
+                "cache_read: completed held the max"
+            );
+            assert_eq!(
+                merged.duration_ms,
+                Some(4_200),
+                "duration: the completed timing must survive"
+            );
+            assert!(
+                !entry.retained_keys.contains(key),
+                "neither copy was retained, so the merged one is not either"
             );
         }
         restore_cache_env(prev_env);
