@@ -16724,12 +16724,7 @@ mod tests {
     fn test_batched_claude_hit_miss_interleave_within_batch() {
         let source_home = tempfile::TempDir::new().unwrap();
         let cache_home = tempfile::TempDir::new().unwrap();
-        // Cache keys keep the scanner's path spelling, and the production
-        // scanner builds this root with `format!("{home}/.claude/projects")`.
-        // `TempDir::join` would spell it with `\` on Windows, so seeding from
-        // that path stores an entry the scanner's lookup can never find — the
-        // hits would silently degrade into misses.
-        let project_dir = scanner_fixture_path(source_home.path(), ".claude/projects/proj");
+        let project_dir = source_home.path().join(".claude/projects/proj");
 
         let mut paths = Vec::new();
         for i in 0..10 {
@@ -16738,12 +16733,30 @@ mod tests {
         }
 
         let clients = vec!["claude".to_string()];
+        // Cache keys preserve the scanner's own path spelling, and no fixture
+        // can reliably predict it: `TempDir::join` produces `\` on Windows
+        // while the resolver builds `.claude/projects` with `/`, and WalkDir
+        // then appends `\` again for the project subdirectory. Ask the scanner
+        // what it calls each file instead of guessing — a wrong key stores an
+        // entry the lookup can never find, and every intended hit silently
+        // degrades into a fresh parse.
+        let scan_result = scan_test_sources(
+            source_home.path(),
+            &clients,
+            &scanner::ScannerSettings::default(),
+        );
+        let scanned = scan_result.get(ClientId::Claude);
+        let cache_sources: Vec<PathBuf> = paths
+            .iter()
+            .map(|path| scanner_spelling(scanned, path))
+            .collect();
+
         // Pre-warm the cache for even-indexed files only, with a sentinel body
         // that differs from what a fresh parse of the on-disk file would
         // produce, so a hit is distinguishable from a miss.
         with_isolated_tokscale_cache(cache_home.path(), || {
             let mut cache = message_cache::SourceMessageCache::default();
-            for (i, path) in paths.iter().enumerate() {
+            for (i, path) in cache_sources.iter().enumerate() {
                 if i % 2 != 0 {
                     continue;
                 }
@@ -16772,6 +16785,31 @@ mod tests {
                 ));
             }
             cache.save_if_dirty();
+        });
+
+        // Separate the two ways a seeded hit can fail to replay, so a red run
+        // names its own cause instead of leaving it to be guessed: a key the
+        // lookup never finds, or an entry found but judged stale.
+        with_isolated_tokscale_cache(cache_home.path(), || {
+            let cache = message_cache::SourceMessageCache::load();
+            let entry = cache.get(
+                message_cache::CacheIdentity::for_client(ClientId::Claude),
+                &cache_sources[0],
+            );
+            assert!(
+                entry.is_some(),
+                "seeded entry must be reachable under the scanner's key spelling"
+            );
+            let fresh = message_cache::SourceFingerprint::from_claude_code_path_with_home(
+                &cache_sources[0],
+                Some(source_home.path()),
+            )
+            .unwrap();
+            assert_eq!(
+                entry.unwrap().fingerprint,
+                fresh,
+                "seeded fingerprint must still match a freshly computed one"
+            );
         });
 
         let mut streamed = Vec::new();
