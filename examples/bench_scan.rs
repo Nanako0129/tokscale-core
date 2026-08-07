@@ -35,12 +35,54 @@ fn newest_mtime_ms(root: &std::path::Path) -> u128 {
     newest
 }
 
-fn hash_tokens(t: &tokscale_core::TokenBreakdown, hasher: &mut DefaultHasher) {
-    t.input.hash(hasher);
-    t.output.hash(hasher);
-    t.cache_read.hash(hasher);
-    t.cache_write.hash(hasher);
-    t.reasoning.hash(hasher);
+/// Volatile keys, by name, at any depth: they differ between two runs of the
+/// same binary, so leaving them in makes the no-op proof fail for the wrong
+/// reason. Nothing else is removed — an exclusion list is safe to hand-write in
+/// a way an inclusion list is not, because forgetting an entry here produces a
+/// loud false mismatch rather than silent blindness.
+const VOLATILE_KEYS: &[&str] = &["generated_at", "processing_time_ms"];
+
+fn strip_volatile(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|k, _| !VOLATILE_KEYS.contains(&k.as_str()));
+            for v in map.values_mut() {
+                strip_volatile(v);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_volatile),
+        _ => {}
+    }
+}
+
+/// Render to a canonical string: object keys sorted, and array elements sorted
+/// by their own canonical form. Arrays need it because per-day client rows come
+/// from `HashMap::into_values()` and their order varies between two runs of the
+/// same binary — the very first version of this digest hashed them as-is and
+/// the no-op proof caught it immediately. Sorting is safe for the arrays that
+/// do carry meaningful order (`contributions` is keyed by a unique date), and
+/// the digest is about which values survive dedup, not about array position.
+///
+/// Numbers keep serde_json's shortest round-trip form, so an `f64` difference
+/// below a micro-dollar still changes the digest; the earlier `{:.6}` string
+/// formatting silently discarded that.
+fn canonicalize(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{}:{}", k, canonicalize(v)))
+                .collect();
+            parts.sort();
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(items) => {
+            let mut parts: Vec<String> = items.iter().map(canonicalize).collect();
+            parts.sort();
+            format!("[{}]", parts.join(","))
+        }
+        other => other.to_string(),
+    }
 }
 
 fn main() {
@@ -70,52 +112,27 @@ fn main() {
         .expect("graph report must succeed");
     let elapsed = start.elapsed().as_millis();
 
-    // Order-sensitive digest of the report's per-day, per-client rows. The
-    // ordering inside a day comes from the fold, so a reordering of the
-    // emitted-message stream changes this value. Volatile metadata
-    // (`generated_at`, `processing_time_ms`) is deliberately excluded — it
-    // differs between two runs of the SAME binary, which is why a naive
-    // byte comparison cannot be the oracle.
+    // Digest of the ENTIRE serialized report, not a hand-picked field list.
+    //
+    // The previous two versions enumerated fields by hand and were each found
+    // incomplete by review: the first omitted `provider_id` and the token
+    // breakdown, the second still hashed only `contributions` — one of
+    // `GraphResult`'s five fields — leaving `summary`, `years`, the stable half
+    // of `meta`, and `time_metrics` entirely unchecked. `time_metrics` is not
+    // derived from `contributions`; it comes from a separate sessionize fold,
+    // so it can move on its own.
+    //
+    // Hand-enumeration is the defect, not any particular omission: it silently
+    // stops covering a field the moment one is added. Serializing the whole
+    // result and canonicalizing the JSON is exhaustive by construction, and a
+    // new field joins the digest without anyone remembering to add it.
+    let mut value = serde_json::to_value(&result).expect("GraphResult must serialize");
+    // Volatile keys differ between two runs of the SAME binary, which is why a
+    // naive byte comparison cannot be the oracle. Everything else stays.
+    strip_volatile(&mut value);
+    let canonical = canonicalize(&value);
     let mut hasher = DefaultHasher::new();
-    // Canonicalize every unordered container before hashing. Per-day client
-    // rows come from `HashMap::into_values()`, so their order varies between
-    // two runs of the SAME binary — the first version of this digest hashed
-    // them as-is and the no-op proof caught it immediately.
-    // Every stable field participates. A digest that hashes only a summary
-    // (message count, combined token total, cost) is blind to exactly the
-    // regression this benchmark exists to catch: two duplicate candidates that
-    // agree on the summary but differ in provider or bucket composition, where
-    // reordering the stream changes which one wins.
-    let mut days: Vec<_> = result.contributions.iter().collect();
-    days.sort_by(|a, b| a.date.cmp(&b.date));
-    for c in days {
-        c.date.hash(&mut hasher);
-        c.intensity.hash(&mut hasher);
-        c.active_time_ms.hash(&mut hasher);
-        c.totals.messages.hash(&mut hasher);
-        c.totals.tokens.hash(&mut hasher);
-        format!("{:.6}", c.totals.cost).hash(&mut hasher);
-        hash_tokens(&c.token_breakdown, &mut hasher);
-        // BTreeMap — already deterministic.
-        for (client, turns) in &c.turns_by_client {
-            client.hash(&mut hasher);
-            turns.hash(&mut hasher);
-        }
-        let mut rows: Vec<_> = c.clients.iter().collect();
-        // Total key: client+model alone can repeat across providers, and an
-        // unstable sort of equal keys would make the digest vary run to run.
-        rows.sort_by(|a, b| {
-            (&a.client, &a.model_id, &a.provider_id).cmp(&(&b.client, &b.model_id, &b.provider_id))
-        });
-        for cl in rows {
-            cl.client.hash(&mut hasher);
-            cl.model_id.hash(&mut hasher);
-            cl.provider_id.hash(&mut hasher);
-            cl.messages.hash(&mut hasher);
-            format!("{:.6}", cl.cost).hash(&mut hasher);
-            hash_tokens(&cl.tokens, &mut hasher);
-        }
-    }
+    canonical.hash(&mut hasher);
     let trace_digest = hasher.finish();
 
     println!(
