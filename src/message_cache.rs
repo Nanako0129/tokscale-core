@@ -1106,6 +1106,20 @@ impl CachedSourceEntry {
                         existing.duration_ms =
                             Some(existing.duration_ms.unwrap_or(0).max(stored_duration));
                     }
+                    // `is_turn_start` marks the first assistant reply after
+                    // genuine human input, and `aggregator.rs` counts those
+                    // markers into `turns_by_client` without re-deriving them.
+                    // A rewrite that drops the preceding user row makes the
+                    // compacted parse record `false` where the full generation
+                    // recorded `true`; keeping only this side's marker would
+                    // retire a turn that did happen. The marker is a claim that
+                    // something was observed, so either side asserting it wins.
+                    existing.is_turn_start |= message.is_turn_start;
+                    // Cost tracks the token counts just reconciled above. Left
+                    // alone it would describe whichever copy this entry started
+                    // from while the tokens describe both, which is a worse
+                    // state than either copy on its own.
+                    existing.cost = existing.cost.max(message.cost);
                     crate::sessions::claudecode::refresh_retained_message_context(
                         existing, &path, None, None,
                     );
@@ -4275,16 +4289,22 @@ mod tests {
             completed.tokens.output = 999;
             completed.tokens.cache_read = 10;
             completed.duration_ms = Some(4_200);
+            completed.cost = 0.25;
+            // The full generation still had the preceding user row, so it saw
+            // this reply as a turn start; the compacted parse does not.
+            completed.is_turn_start = true;
 
-            // The partial writer saves first; the completed writer saves last
-            // and must not have its content replaced by the stored partial.
-            let mut writer_partial = SourceMessageCache::load();
-            writer_partial.insert(entry_with_messages(identity, &path, vec![partial]));
-            writer_partial.save_if_dirty();
-
+            // The completed writer saves first, so its copy is the one already
+            // on disk; the partial writer saves last and its entry is the one
+            // doing the merging. This is the losing direction: whatever the
+            // merge fails to pull across from the stored copy is gone.
             let mut writer_completed = SourceMessageCache::load();
             writer_completed.insert(entry_with_messages(identity, &path, vec![completed]));
             writer_completed.save_if_dirty();
+
+            let mut writer_partial = SourceMessageCache::load();
+            writer_partial.insert(entry_with_messages(identity, &path, vec![partial]));
+            writer_partial.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4304,6 +4324,14 @@ mod tests {
                 merged.duration_ms,
                 Some(4_200),
                 "duration: the completed timing must survive"
+            );
+            assert!(
+                merged.is_turn_start,
+                "turn start: a marker either side asserted must survive, or turn_count silently drops it"
+            );
+            assert_eq!(
+                merged.cost, 0.25,
+                "cost must track the reconciled tokens, not the copy this entry started from"
             );
             assert!(
                 !entry.retained_keys.contains(key),
