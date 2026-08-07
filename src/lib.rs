@@ -6432,6 +6432,57 @@ mod tests {
         );
     }
 
+    /// The sibling `.meta.json` is part of the transcript's fingerprint, so
+    /// editing it reparses the entry. With every live assistant row compacted
+    /// away there is no sibling to take an agent from, but that is not the same
+    /// as there being no current metadata -- the sidecar still names the agent,
+    /// and a retained-only turn must move with it rather than staying on the
+    /// name it was cached under.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_retained_sidechain_agent_follows_a_meta_json_rename() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let subagents_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject")
+            .join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        let transcript = subagents_dir.join("agent-xyz200.jsonl");
+        let meta = subagents_dir.join("agent-xyz200.meta.json");
+        std::fs::write(&meta, r#"{"agentType":"explore"}"#).unwrap();
+
+        let turn = r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-uuid-200","agentId":"xyz200","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        std::fs::write(&transcript, format!("{turn}\n")).unwrap();
+        let before = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 1, "cold scan sees the sidechain turn");
+        assert_eq!(
+            before[0].agent.as_deref(),
+            Some("Explore"),
+            "the cold parse takes the agent from the sidecar"
+        );
+
+        // Compaction empties the transcript of live assistant rows, and the
+        // sidecar is renamed. The rename alone changes the fingerprint.
+        std::fs::write(&transcript, b"").unwrap();
+        std::fs::write(&meta, r#"{"agentType":"plan"}"#).unwrap();
+
+        let after = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(after.len(), 1, "the retained turn must survive");
+        assert_eq!(
+            after[0].agent.as_deref(),
+            Some("Plan"),
+            "a retained-only turn must follow the sidecar it is fingerprinted against"
+        );
+    }
+
     /// Streaming-lane counterpart of
     /// `test_claude_live_copy_outranks_retained_partial_when_fork_sorts_after`:
     /// the streaming lane has its own dedup gate (`claude_seen` /

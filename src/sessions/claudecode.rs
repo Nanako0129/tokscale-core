@@ -81,6 +81,24 @@ pub struct ClaudeUsage {
     pub cache_creation_input_tokens: Option<i64>,
 }
 
+/// Tier 1 of subagent resolution on its own: the sibling `.meta.json` sidecar's
+/// `agentType`, which needs nothing but the transcript path.
+///
+/// Split out because the retained-message refresh can reach this tier and no
+/// other: tiers 2 and 3 need a parent session id and a parent-subagent cache
+/// that the refresh has no access to.
+fn subagent_name_from_meta_sidecar(path: &Path) -> Option<String> {
+    let stem = path.file_stem().and_then(|s| s.to_str())?;
+    let meta_path = path.with_file_name(format!("{}.meta.json", stem));
+    let text = std::fs::read_to_string(&meta_path).ok()?;
+    let meta = serde_json::from_str::<AgentMetaFile>(&text).ok()?;
+    let agent_type = meta.agent_type?;
+    if agent_type.trim().is_empty() {
+        return None;
+    }
+    Some(normalize_agent_name(&agent_type))
+}
+
 /// Resolve the subagent display name for a sidechain transcript file.
 ///
 /// Tier 1: Read the sibling `.meta.json` sidecar for the `agentType` field.
@@ -98,15 +116,8 @@ fn resolve_subagent_name(
     };
 
     // Tier 1: sibling meta.json (e.g. agent-abc123.meta.json next to agent-abc123.jsonl)
-    let meta_path = path.with_file_name(format!("{}.meta.json", stem));
-    if let Ok(text) = std::fs::read_to_string(&meta_path) {
-        if let Ok(meta) = serde_json::from_str::<AgentMetaFile>(&text) {
-            if let Some(ref agent_type) = meta.agent_type {
-                if !agent_type.trim().is_empty() {
-                    return normalize_agent_name(agent_type);
-                }
-            }
-        }
+    if let Some(from_meta) = subagent_name_from_meta_sidecar(path) {
+        return from_meta;
     }
 
     // Tier 2: parent session tool_use inference
@@ -1006,6 +1017,16 @@ pub(crate) fn refresh_retained_message_context(
 
     if let Some(agent) = live_agent {
         message.agent = Some(agent.to_string());
+    } else if let Some(from_meta) = subagent_name_from_meta_sidecar(path) {
+        // No live sibling is not the same as no current metadata. The sibling
+        // `.meta.json` is part of this file's fingerprint, so a change to it
+        // reparsed the entry in the first place; reading it here keeps a
+        // retained-only sidechain turn from staying on the agent name that was
+        // current when it was cached. Tiers 2 and 3 of `resolve_subagent_name`
+        // stay out of reach -- they need a parent session id and cache this
+        // call does not have -- so a transcript with no sidecar still keeps
+        // its cached agent rather than falling back to the generic label.
+        message.agent = Some(from_meta);
     }
 }
 
