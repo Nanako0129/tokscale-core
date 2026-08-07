@@ -1073,11 +1073,38 @@ impl CachedSourceEntry {
                     self.messages[index] = absorbed;
                     self.retained_keys.remove(key);
                 }
+                Some(&index) if !same_fingerprint => {
+                    // Both entries know this key but disagree about which
+                    // generation produced it: a rewrite straddled by two
+                    // writers, one saving a partial mid-turn snapshot and the
+                    // other the completed form. Once compaction drops the
+                    // partial's generation, neither writer's own parse can
+                    // reconstruct the other's usage on its own, so reconcile
+                    // the token counts field-by-field instead of discarding
+                    // one side outright — the same per-field max convention
+                    // `merge_claude_duplicate` already uses to fold same-file
+                    // streaming duplicates together, since this is exactly
+                    // that shape: a record observed before its usage was
+                    // final. Stored's label is still untrusted across the
+                    // mismatch (see the comment above), so self's existing
+                    // retained/live classification for this key stands.
+                    let existing = &mut self.messages[index];
+                    let stored_tokens = &message.tokens;
+                    existing.tokens.input = existing.tokens.input.max(stored_tokens.input);
+                    existing.tokens.output = existing.tokens.output.max(stored_tokens.output);
+                    existing.tokens.cache_read =
+                        existing.tokens.cache_read.max(stored_tokens.cache_read);
+                    existing.tokens.cache_write =
+                        existing.tokens.cache_write.max(stored_tokens.cache_write);
+                    existing.tokens.reasoning =
+                        existing.tokens.reasoning.max(stored_tokens.reasoning);
+                    crate::sessions::claudecode::refresh_retained_message_context(
+                        existing, &path, None, None,
+                    );
+                }
                 Some(_) => {
-                    // Either the fingerprint mismatches (stored's label is
-                    // untrusted, so self's existing classification for a key
-                    // it already knows stands), or it matches and stored is
-                    // also retained (nothing to prefer). Keep self's copy.
+                    // Fingerprint matches and stored is also retained:
+                    // nothing to prefer. Keep self's copy.
                 }
             }
         }
@@ -3992,6 +4019,120 @@ mod tests {
                 "a key absent from this generation's own parse must be labeled retained, \
                  whatever the other generation's entry called it"
             );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Straddle case the previous test doesn't cover: `self` does not just
+    /// lack the key, it already holds its *own* copy of it — a partial turn
+    /// parsed before the file was rewritten out from under it — while
+    /// `stored` (the earlier writer's save) holds a completed replay of the
+    /// same key under a different fingerprint. Discarding either side loses
+    /// data once compaction removes the turn from the live file entirely, so
+    /// the merge must reconcile the two copies' token counts field-by-field,
+    /// the same way the parser folds same-file streaming duplicates —
+    /// neither copy alone carries every field's true maximum.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_reconciles_token_counts_across_a_fingerprint_mismatch() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+
+            // `completed` leads on output and cache_read; `partial` leads on
+            // input. Neither field-set alone is the true maximum, so a fix
+            // that just picks one whole message over the other would still
+            // fail this.
+            let completed = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 80,
+                    output: 999,
+                    cache_read: 10,
+                    cache_write: 5,
+                    reasoning: 0,
+                },
+                0.0,
+                Some(key.to_string()),
+            );
+            let partial = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 100,
+                    output: 50,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+                Some(key.to_string()),
+            );
+
+            // Writer B parses the completed form and saves first, under this
+            // generation's fingerprint.
+            std::fs::write(&path, b"{\"id\":\"generation-b\"}\n").unwrap();
+            let mut writer_b = SourceMessageCache::load();
+            writer_b.insert(entry_with_messages(identity, &path, vec![completed]));
+            writer_b.save_if_dirty();
+
+            // The file changes generation again (a straddled rewrite), and
+            // writer A — which had already parsed a stalled partial of the
+            // same turn under its own earlier generation — saves last.
+            std::fs::write(&path, b"{\"id\":\"generation-a\"}\n").unwrap();
+            let mut writer_a = SourceMessageCache::load();
+            writer_a.insert(entry_with_messages(identity, &path, vec![partial]));
+            writer_a.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            let merged = &entry.messages[0];
+            assert_eq!(
+                merged.tokens.input, 100,
+                "input: partial's field was the max"
+            );
+            assert_eq!(
+                merged.tokens.output, 999,
+                "output: completed's field was the max"
+            );
+            assert_eq!(
+                merged.tokens.cache_read, 10,
+                "cache_read: completed's field was the max"
+            );
+            assert_eq!(
+                merged.tokens.cache_write, 5,
+                "cache_write: completed's field was the max"
+            );
+
+            // A following cache-hit scan (no further writes) must keep
+            // reporting the reconciled figures, not just hold them in memory.
+            let rescan = SourceMessageCache::load();
+            let entry = rescan.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1);
+            let merged = &entry.messages[0];
+            assert_eq!(merged.tokens.input, 100);
+            assert_eq!(merged.tokens.output, 999);
+            assert_eq!(merged.tokens.cache_read, 10);
+            assert_eq!(merged.tokens.cache_write, 5);
         }
 
         restore_cache_env(prev_env);
