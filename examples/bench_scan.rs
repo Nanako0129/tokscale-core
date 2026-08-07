@@ -35,6 +35,14 @@ fn newest_mtime_ms(root: &std::path::Path) -> u128 {
     newest
 }
 
+fn hash_tokens(t: &tokscale_core::TokenBreakdown, hasher: &mut DefaultHasher) {
+    t.input.hash(hasher);
+    t.output.hash(hasher);
+    t.cache_read.hash(hasher);
+    t.cache_write.hash(hasher);
+    t.reasoning.hash(hasher);
+}
+
 fn main() {
     let home = std::env::args()
         .nth(1)
@@ -73,20 +81,39 @@ fn main() {
     // rows come from `HashMap::into_values()`, so their order varies between
     // two runs of the SAME binary — the first version of this digest hashed
     // them as-is and the no-op proof caught it immediately.
+    // Every stable field participates. A digest that hashes only a summary
+    // (message count, combined token total, cost) is blind to exactly the
+    // regression this benchmark exists to catch: two duplicate candidates that
+    // agree on the summary but differ in provider or bucket composition, where
+    // reordering the stream changes which one wins.
     let mut days: Vec<_> = result.contributions.iter().collect();
     days.sort_by(|a, b| a.date.cmp(&b.date));
     for c in days {
         c.date.hash(&mut hasher);
+        c.intensity.hash(&mut hasher);
+        c.active_time_ms.hash(&mut hasher);
         c.totals.messages.hash(&mut hasher);
         c.totals.tokens.hash(&mut hasher);
         format!("{:.6}", c.totals.cost).hash(&mut hasher);
+        hash_tokens(&c.token_breakdown, &mut hasher);
+        // BTreeMap — already deterministic.
+        for (client, turns) in &c.turns_by_client {
+            client.hash(&mut hasher);
+            turns.hash(&mut hasher);
+        }
         let mut rows: Vec<_> = c.clients.iter().collect();
-        rows.sort_by(|a, b| (&a.client, &a.model_id).cmp(&(&b.client, &b.model_id)));
+        // Total key: client+model alone can repeat across providers, and an
+        // unstable sort of equal keys would make the digest vary run to run.
+        rows.sort_by(|a, b| {
+            (&a.client, &a.model_id, &a.provider_id).cmp(&(&b.client, &b.model_id, &b.provider_id))
+        });
         for cl in rows {
             cl.client.hash(&mut hasher);
             cl.model_id.hash(&mut hasher);
+            cl.provider_id.hash(&mut hasher);
             cl.messages.hash(&mut hasher);
             format!("{:.6}", cl.cost).hash(&mut hasher);
+            hash_tokens(&cl.tokens, &mut hasher);
         }
     }
     let trace_digest = hasher.finish();
