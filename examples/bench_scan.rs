@@ -55,30 +55,57 @@ fn strip_volatile(value: &mut serde_json::Value) {
     }
 }
 
-/// Render to a canonical string: object keys sorted, and array elements sorted
-/// by their own canonical form. Arrays need it because per-day client rows come
-/// from `HashMap::into_values()` and their order varies between two runs of the
-/// same binary — the very first version of this digest hashed them as-is and
-/// the no-op proof caught it immediately. Sorting is safe for the arrays that
-/// do carry meaningful order (`contributions` is keyed by a unique date), and
-/// the digest is about which values survive dedup, not about array position.
+/// Arrays whose element order is NOT part of the output, addressed by JSON
+/// path. Only these get sorted; every other array keeps the order the report
+/// produced it in.
+///
+/// Order is the default because most of these arrays have defined output
+/// semantics: `contributions` is sorted by date and `years` by year
+/// (`aggregator.rs:51`, `:193`), consumers index into them, and sorting them
+/// here would make the digest blind to a reordering — the exact regression a
+/// batching change can cause. `summary.clients` and `summary.models` are
+/// likewise sorted by the aggregator, so preserving their order also keeps the
+/// digest sensitive to that sort breaking.
+///
+/// A per-day `clients` list is the one genuine exception: it comes from
+/// `HashMap::into_values()` (`aggregator.rs:450`) and varies between two runs
+/// of the same binary. The very first version of this digest hashed it as-is
+/// and the no-op proof caught it immediately.
+///
+/// Getting this list wrong fails safe in one direction: a missed unordered
+/// array makes `OLD-a != OLD-b` and stops the run loudly, whereas sorting an
+/// ordered array is silent. That asymmetry is why the default is to preserve.
+const UNORDERED_ARRAY_PATHS: &[&str] = &["contributions[].clients"];
+
+/// Render to a canonical string: object keys sorted, array order preserved
+/// except at the paths above.
 ///
 /// Numbers keep serde_json's shortest round-trip form, so an `f64` difference
 /// below a micro-dollar still changes the digest; the earlier `{:.6}` string
 /// formatting silently discarded that.
-fn canonicalize(value: &serde_json::Value) -> String {
+fn canonicalize(value: &serde_json::Value, path: &str) -> String {
     match value {
         serde_json::Value::Object(map) => {
             let mut parts: Vec<String> = map
                 .iter()
-                .map(|(k, v)| format!("{}:{}", k, canonicalize(v)))
+                .map(|(k, v)| {
+                    let child = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    format!("{}:{}", k, canonicalize(v, &child))
+                })
                 .collect();
             parts.sort();
             format!("{{{}}}", parts.join(","))
         }
         serde_json::Value::Array(items) => {
-            let mut parts: Vec<String> = items.iter().map(canonicalize).collect();
-            parts.sort();
+            let child = format!("{path}[]");
+            let mut parts: Vec<String> = items.iter().map(|v| canonicalize(v, &child)).collect();
+            if UNORDERED_ARRAY_PATHS.contains(&path) {
+                parts.sort();
+            }
             format!("[{}]", parts.join(","))
         }
         other => other.to_string(),
@@ -130,7 +157,7 @@ fn main() {
     // Volatile keys differ between two runs of the SAME binary, which is why a
     // naive byte comparison cannot be the oracle. Everything else stays.
     strip_volatile(&mut value);
-    let canonical = canonicalize(&value);
+    let canonical = canonicalize(&value, "");
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
     let trace_digest = hasher.finish();
