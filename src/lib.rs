@@ -16724,7 +16724,12 @@ mod tests {
     fn test_batched_claude_hit_miss_interleave_within_batch() {
         let source_home = tempfile::TempDir::new().unwrap();
         let cache_home = tempfile::TempDir::new().unwrap();
-        let project_dir = source_home.path().join(".claude/projects/proj");
+        // Cache keys keep the scanner's path spelling, and the production
+        // scanner builds this root with `format!("{home}/.claude/projects")`.
+        // `TempDir::join` would spell it with `\` on Windows, so seeding from
+        // that path stores an entry the scanner's lookup can never find — the
+        // hits would silently degrade into misses.
+        let project_dir = scanner_fixture_path(source_home.path(), ".claude/projects/proj");
 
         let mut paths = Vec::new();
         for i in 0..10 {
@@ -16915,6 +16920,17 @@ mod tests {
         // idx 3's uncacheable file never persisted a cache entry.
         with_isolated_tokscale_cache(stream_cache.path(), || {
             let cache = message_cache::SourceMessageCache::load();
+            // Prove the lookup spelling first: a wrong path key would make the
+            // `is_none()` below pass for the wrong reason.
+            assert!(
+                cache
+                    .get(
+                        message_cache::CacheIdentity::for_client(ClientId::Codex),
+                        &stream_dir.join("f00.jsonl"),
+                    )
+                    .is_some(),
+                "a cacheable sibling must be found, or the key spelling is wrong"
+            );
             assert!(cache
                 .get(
                     message_cache::CacheIdentity::for_client(ClientId::Codex),
