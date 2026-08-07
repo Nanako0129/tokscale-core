@@ -957,10 +957,14 @@ pub(crate) fn dedup_key_is_globally_stable(key: &str) -> bool {
 /// `cc-mirror/variant.json` name or provider edit changes the Claude
 /// fingerprint without touching the transcript body, and a retained message
 /// must not keep the stale values from the parse that originally cached it.
-/// `provider_id` reuses the same confidence-based override
-/// (`stored_claude_provider_confidence` / `update_claude_provider_id`) a live
-/// parse uses to merge duplicate entries, so a higher-confidence hint still
-/// wins and a lower-confidence one does not clobber an explicit value.
+/// `provider_id` is rebuilt from zero confidence, not seeded from the
+/// retained message's own stale value: `stored_claude_provider_confidence`
+/// on that value would reflect the cached parse's provider, and
+/// `update_claude_provider_id` only overrides on strictly higher confidence,
+/// so a stale non-Anthropic hint could outrank the current parse's Anthropic
+/// or default candidate and survive the very refresh meant to reconcile it.
+/// Seeding at zero lets the current parse's candidate win unconditionally,
+/// matching what a fresh parse of `path` would produce.
 ///
 /// `agent` (sidechain resolution) is uniform across every message a single
 /// parse of one file produces, so the caller threads it through from a live
@@ -968,8 +972,10 @@ pub(crate) fn dedup_key_is_globally_stable(key: &str) -> bool {
 /// re-deriving it would need the file's first raw entry and a parent-session
 /// cache, neither of which is reachable at this point. When the live parse
 /// produced no sibling at all (the whole file's messages are now retained),
-/// `live_agent` is `None` and the message's agent is cleared to match — the
-/// same default a fresh non-sidechain parse would produce.
+/// `live_agent` is `None` and the message's agent is left as-is: the cached
+/// agent is the last successful resolution for that turn, and with no live
+/// evidence to replace it, it is better than clearing it to the main/unknown
+/// bucket.
 ///
 /// Token counts, timestamps and the dedup key are intrinsic to the message
 /// and are left untouched.
@@ -991,14 +997,16 @@ pub(crate) fn refresh_retained_message_context(
     let provider_hint = cc_mirror_metadata
         .as_ref()
         .and_then(|metadata| metadata.provider_id.as_deref());
-    let mut confidence = stored_claude_provider_confidence(&message.provider_id);
+    let mut confidence = 0;
     if let Some(choice) =
         claude_provider_choice_from_parts(Some(message.model_id.as_str()), provider_hint)
     {
         update_claude_provider_id(&mut message.provider_id, &mut confidence, choice);
     }
 
-    message.agent = live_agent.map(str::to_string);
+    if let Some(agent) = live_agent {
+        message.agent = Some(agent.to_string());
+    }
 }
 
 /// A tool_use id is only unique within the conversation that issued it, so the

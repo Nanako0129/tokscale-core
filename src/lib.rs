@@ -6086,6 +6086,167 @@ mod tests {
         assert_eq!(retained.tokens.output, 50, "token counts stay intrinsic");
     }
 
+    /// `refresh_retained_message_context` must rebuild `provider_id` from the
+    /// current parse's evidence, not merge with the retained message's own
+    /// stale value. The regression this guards: seeding the merge confidence
+    /// from `stored_claude_provider_confidence(&message.provider_id)` reads
+    /// the *cached* provider back, so a stale non-Anthropic provider
+    /// (`CLAUDE_PROVIDER_INFERRED_CONFIDENCE`) outranks the live parse's
+    /// Anthropic candidate (`CLAUDE_PROVIDER_DEFAULT_CONFIDENCE`, strictly
+    /// lower) and survives the refresh. The sibling test above only exercises
+    /// a non-Anthropic-to-non-Anthropic edit (zai -> moonshot), which already
+    /// worked under the old seeding because both candidates use
+    /// `CLAUDE_PROVIDER_INFERRED_CONFIDENCE`.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_retained_provider_id_matches_live_sibling_after_variant_turns_anthropic(
+    ) {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let variant_dir = source_home.path().join(".cc-mirror").join("zai-worker");
+        let config_dir = variant_dir.join("config");
+        let project_dir = config_dir.join("projects").join("-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let variant_path = variant_dir.join("variant.json");
+        std::fs::write(
+            &variant_path,
+            serde_json::json!({
+                "name": "zai-worker",
+                "provider": "zai",
+                "configDir": config_dir,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let transcript = project_dir.join("session.jsonl");
+
+        let turn_a = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let turn_b = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_b","message":{"id":"msg_b","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+
+        std::fs::write(&transcript, format!("{turn_a}\n{turn_b}\n")).unwrap();
+        let before = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2);
+        assert!(
+            before.iter().all(|m| m.provider_id == "zai"),
+            "cold scan must attribute both turns to the original variant's provider"
+        );
+
+        // Turn A drops out of the live file, so it becomes a retained
+        // message cached under the original variant's provider ("zai",
+        // CLAUDE_PROVIDER_INFERRED_CONFIDENCE).
+        std::fs::write(&transcript, format!("{turn_b}\n")).unwrap();
+        let after_drop = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(after_drop.len(), 2, "turn A must be retained");
+
+        // The variant is rehomed to Anthropic itself. The candidate this
+        // resolves to (CLAUDE_PROVIDER_DEFAULT_CONFIDENCE) is strictly LOWER
+        // than the stale "zai" reading, so a confidence seeded from the
+        // retained message's own value would reject it.
+        std::fs::write(
+            &variant_path,
+            serde_json::json!({
+                "name": "zai-worker",
+                "provider": "anthropic",
+                "configDir": config_dir,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let after_rename = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(
+            after_rename.len(),
+            2,
+            "turn A must still be retained after the variant edit"
+        );
+        let retained = after_rename
+            .iter()
+            .find(|m| m.dedup_key.as_deref() == Some("msg_a:req_a"))
+            .expect("turn A must survive as a retained message");
+        let live = after_rename
+            .iter()
+            .find(|m| m.dedup_key.as_deref() == Some("msg_b:req_b"))
+            .expect("turn B must be present as a live message");
+        assert_eq!(
+            live.provider_id, "anthropic",
+            "sanity check: the live message picks up the variant's new provider"
+        );
+        assert_eq!(
+            retained.provider_id, live.provider_id,
+            "the retained turn must adopt the live parse's provider even though it is a \
+             lower-confidence candidate than the stale cached value"
+        );
+    }
+
+    /// `refresh_retained_message_context` must not clear a retained message's
+    /// `agent` when the live parse produced no sibling to read it from. The
+    /// regression this guards: unconditionally assigning
+    /// `live_agent.map(str::to_string)` erases the cached subagent name once
+    /// a compacting rewrite removes every live assistant row from a
+    /// sidechain transcript, moving retained-only sidechain usage into the
+    /// main/unknown bucket until the cache is rebuilt from a transcript with
+    /// live rows again.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_streaming_retained_sidechain_agent_survives_a_rewrite_with_no_live_siblings() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let subagents_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject")
+            .join("parent-uuid-100")
+            .join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        let transcript = subagents_dir.join("agent-xyz100.jsonl");
+        std::fs::write(
+            subagents_dir.join("agent-xyz100.meta.json"),
+            r#"{"agentType":"explore"}"#,
+        )
+        .unwrap();
+
+        let turn_a = r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-uuid-100","agentId":"xyz100","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let turn_b = r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-uuid-100","agentId":"xyz100","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_b","message":{"id":"msg_b","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+
+        std::fs::write(&transcript, format!("{turn_a}\n{turn_b}\n")).unwrap();
+        let before = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(before.len(), 2);
+        assert!(
+            before.iter().all(|m| m.agent.as_deref() == Some("Explore")),
+            "cold scan must resolve both turns to the meta.json subagent name"
+        );
+
+        // A compacting rewrite drops every assistant usage row from the
+        // sidechain file, leaving only a sidechain user row. The live parse
+        // of this file now produces zero messages, so retention has no live
+        // sibling to read `agent` from for either retained turn.
+        let user_row = r#"{"type":"user","isSidechain":true,"sessionId":"parent-uuid-100","agentId":"xyz100","timestamp":"2024-12-01T10:10:00.000Z","message":{"content":"continuing"}}"#;
+        std::fs::write(&transcript, format!("{user_row}\n")).unwrap();
+
+        let after = collect_streamed_claude_fixture(source_home.path());
+        assert_eq!(
+            after.len(),
+            2,
+            "both turns must be retained even with no live sibling in the same scan"
+        );
+        assert!(
+            after.iter().all(|m| m.agent.as_deref() == Some("Explore")),
+            "the retained turns must keep their cached agent when there is no live \
+             evidence to replace it, not be cleared to the main/unknown bucket"
+        );
+    }
+
     /// Streaming-lane counterpart of
     /// `test_claude_live_copy_outranks_retained_partial_when_fork_sorts_after`:
     /// the streaming lane has its own dedup gate (`claude_seen` /
