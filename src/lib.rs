@@ -4759,32 +4759,27 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     };
     counts.set(ClientId::OpenCode, opencode_count);
 
-    let claude_home = PathBuf::from(&home_dir);
-    let claude_msgs_raw: Vec<(String, ParsedMessage)> = scan_result
-        .get(ClientId::Claude)
-        .par_iter()
-        .map_init(std::collections::HashMap::new, |parent_cache, path| {
-            sessions::claudecode::parse_claude_file_with_cache_and_home(
-                path,
-                parent_cache,
-                Some(&claude_home),
+    // Route Claude through the same `SourceMessageCache`-backed retention the
+    // report lanes use (`parse_all_messages_with_pricing_with_env_strategy`)
+    // rather than parsing the live file directly. A direct parse never sees
+    // a turn an in-place transcript rewrite dropped, so this API's counts
+    // would silently disagree with `get_hourly_report` et al. for the same
+    // source tree after a compacting rewrite — see RET-CLAUDE-001.
+    let claude_msgs: Vec<ParsedMessage> =
+        if include_all || clients.iter().any(|c| c == ClientId::Claude.as_str()) {
+            parse_all_messages_with_pricing_with_env_strategy(
+                &home_dir,
+                std::slice::from_ref(&ClientId::Claude.as_str().to_string()),
+                None,
+                options.use_env_roots,
+                &options.scanner_settings,
             )
-            .into_iter()
-            .map(|msg| {
-                let dedup_key = msg.dedup_key.clone().unwrap_or_default();
-                (dedup_key, unified_to_parsed(&msg))
-            })
-            .collect::<Vec<_>>()
-        })
-        .flatten()
-        .collect();
-
-    let mut seen_keys: HashSet<String> = HashSet::new();
-    let claude_msgs: Vec<ParsedMessage> = claude_msgs_raw
-        .into_iter()
-        .filter(|(key, _)| key.is_empty() || seen_keys.insert(key.clone()))
-        .map(|(_, msg)| msg)
-        .collect();
+            .iter()
+            .map(unified_to_parsed)
+            .collect()
+        } else {
+            Vec::new()
+        };
     let claude_count = claude_msgs.len() as i32;
     counts.set(ClientId::Claude, claude_count);
     messages.extend(claude_msgs);
@@ -6329,6 +6324,92 @@ mod tests {
         assert_eq!(
             streaming_total, materialized_total,
             "the streaming lane must agree with the materialized lane against the same persisted cache"
+        );
+    }
+
+    /// `parse_local_clients` used to parse Claude files directly
+    /// (`parse_claude_file_with_cache_and_home`), bypassing the
+    /// `SourceMessageCache`-backed retention the report lanes use. A pure
+    /// compaction — a turn dropped from the transcript with no fork
+    /// replaying it elsewhere — is only recoverable through that retention:
+    /// there is no live copy anywhere on disk for a direct parse to find.
+    /// This asserts `parse_local_clients`'s totals for the compacted tree
+    /// agree with `get_model_report`'s for the same tree, which requires
+    /// the dropped turn to survive in both.
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_agrees_with_model_report_after_a_compacting_rewrite() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = claude_dir.join("aaa-original.jsonl");
+
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let dropped = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_dropped","message":{"id":"msg_dropped","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+
+        let local_options = || LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        };
+        let report_options = || ReportOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            group_by: GroupBy::ClientModel,
+            scanner_settings: scanner::ScannerSettings::default(),
+        };
+
+        // Populate the persistent cache with the turn compaction is about to
+        // drop.
+        std::fs::write(&original, format!("{filler}\n{dropped}\n")).unwrap();
+        let before = parse_local_clients(local_options()).unwrap();
+        assert_eq!(
+            before.messages.iter().map(|m| m.output).sum::<i64>(),
+            10 + 50,
+            "hand-derived from the fixture literals above"
+        );
+
+        // Compaction drops the turn with no fork replaying it elsewhere —
+        // only retention can recover it.
+        std::fs::write(&original, format!("{filler}\n")).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let model_report = runtime
+            .block_on(get_model_report(report_options()))
+            .unwrap();
+        let local_after = parse_local_clients(local_options()).unwrap();
+
+        assert_eq!(
+            local_after.messages.iter().map(|m| m.output).sum::<i64>(),
+            10 + 50,
+            "parse_local_clients must retain the compacted turn like the report lanes do"
+        );
+        assert_eq!(
+            local_after.messages.iter().map(|m| m.output).sum::<i64>(),
+            model_report.total_output,
+            "parse_local_clients and get_model_report must agree on the same source tree"
         );
     }
 

@@ -964,11 +964,17 @@ impl CachedSourceEntry {
     /// Same filter as the parse-time merge: a key that is only unique within
     /// one file must not outlive the bytes that produced it.
     ///
-    /// A message this union pulls in from `stored` carries its retention
-    /// status with it, and for a key both entries already describe, the
-    /// merged status is live if either side saw it live — never merging the
-    /// messages themselves (no per-field merge, see RET-CLAUDE-001), only
-    /// which provenance label survives.
+    /// A message this union pulls in from `stored` for a key `self` does not
+    /// already describe carries `stored`'s content and provenance with it.
+    /// For a key both entries already describe, `stored`'s live copy always
+    /// wins over `self`'s retained one — both the label and the message
+    /// content, not just the label, or a stale retained partial could be
+    /// relabeled live and win a future cross-file dedup race it never
+    /// earned (see RET-CLAUDE-001). When the two entries describe different
+    /// generations of the file (different fingerprints), `stored`'s per-key
+    /// labels are not trusted at all — see the fingerprint handling below —
+    /// so a key it holds is only ever absorbed as retained-by-definition,
+    /// and only when `self` does not already know that key some other way.
     fn absorb_retained_history(&mut self, stored: &CachedSourceEntry) {
         let Some(key_is_globally_stable) = retained_history_key_filter(&self.parser_namespace)
         else {
@@ -981,24 +987,32 @@ impl CachedSourceEntry {
         {
             return;
         }
-        // A stored entry with a different fingerprint is not a concurrent
-        // writer of the same content — it is this same process's own earlier
-        // scan of an older generation of the file (e.g. the pre-rewrite
-        // bytes). Its retained/live classification described that older
-        // generation, not this one: a key this generation retains because
-        // compaction just dropped it can legitimately have been live in that
-        // older, pre-rewrite entry, and blending that stale classification in
+        // A stored entry with a different fingerprint can be this same
+        // process's own earlier scan of an older generation of the file
+        // (e.g. the pre-rewrite bytes), or a concurrent writer's scan of a
+        // *different* generation than this entry's — two writers can
+        // straddle a rewrite, one loading the full pre-rewrite file and the
+        // other the freshly compacted one. Either way, `stored`'s
+        // retained/live *labels* described a different generation and must
+        // not be inherited: a key this generation retains because
+        // compaction just dropped it can legitimately have been live in
+        // that older, pre-rewrite entry, and blending that stale label in
         // would incorrectly un-retain it (see RET-CLAUDE-001's "third scan"
-        // regression). Only union when both entries describe the exact same
-        // fingerprinted bytes.
-        if stored.fingerprint != self.fingerprint {
-            return;
-        }
+        // regression).
+        //
+        // What is still safe across a fingerprint mismatch is the message
+        // *content* for a key this entry has never observed at all: from
+        // this generation's point of view such a key is retained by
+        // definition, whatever `stored` called it — this is what keeps a
+        // rewrite straddled by two writers from losing a turn neither
+        // writer's own parse of its own generation could reproduce.
+        let same_fingerprint = stored.fingerprint == self.fingerprint;
 
-        let mut seen: HashSet<String> = self
+        let mut self_keys: HashMap<String, usize> = self
             .messages
             .iter()
-            .filter_map(|message| message.dedup_key.clone())
+            .enumerate()
+            .filter_map(|(index, message)| message.dedup_key.clone().map(|key| (key, index)))
             .collect();
         for message in &stored.messages {
             let Some(key) = message.dedup_key.as_ref() else {
@@ -1008,20 +1022,38 @@ impl CachedSourceEntry {
                 continue;
             }
             let stored_is_retained = stored.retained_keys.contains(key);
-            if seen.insert(key.clone()) {
-                // Not previously in self: absorb the message and inherit
-                // stored's provenance label for it.
-                self.messages.push(message.clone());
-                if stored_is_retained {
-                    self.retained_keys.insert(key.clone());
+
+            match self_keys.get(key) {
+                None => {
+                    // Not previously in self: absorb the message. Under a
+                    // matching fingerprint, inherit stored's label as-is;
+                    // under a mismatch, stored's label is untrusted, so
+                    // treat it as retained by definition — this generation
+                    // never produced it on its own.
+                    let is_retained = if same_fingerprint {
+                        stored_is_retained
+                    } else {
+                        true
+                    };
+                    self.messages.push(message.clone());
+                    if is_retained {
+                        self.retained_keys.insert(key.clone());
+                    }
+                    self_keys.insert(key.clone(), self.messages.len() - 1);
                 }
-            } else if !stored_is_retained {
-                // Both entries describe this key. `stored` saw it live, so
-                // the merged entry must record it live too — a retained
-                // label left on a key some writer actually reparsed live
-                // would wrongly let a future scan treat real live content as
-                // a carried-forward partial.
-                self.retained_keys.remove(key);
+                Some(&index) if same_fingerprint && !stored_is_retained => {
+                    // Both entries describe the same generation and `stored`
+                    // saw this key live: prefer its message content, not
+                    // just clear the label.
+                    self.messages[index] = message.clone();
+                    self.retained_keys.remove(key);
+                }
+                Some(_) => {
+                    // Either the fingerprint mismatches (stored's label is
+                    // untrusted, so self's existing classification for a key
+                    // it already knows stands), or it matches and stored is
+                    // also retained (nothing to prefer). Keep self's copy.
+                }
             }
         }
     }
@@ -3664,6 +3696,172 @@ mod tests {
                 !entry.retained_keys.contains("msg_shared:req_shared"),
                 "a key an earlier writer saw live must not be left labeled retained just because \
                  the last writer's own entry retained it"
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Regression for the finding that clearing `retained_keys`' label
+    /// without replacing `self.messages`' content left the completed
+    /// replay's token counts unabsorbed: the merged entry kept the
+    /// partial's own content under a live label, which a following
+    /// cache-hit scan would then treat as authoritative.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_prefers_live_message_content_not_just_the_cleared_label() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+            let retained_partial = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 1,
+                    output: 50,
+                    ..Default::default()
+                },
+                0.0,
+                Some(key.to_string()),
+            );
+            let completed_live = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 1,
+                    output: 999,
+                    ..Default::default()
+                },
+                0.0,
+                Some(key.to_string()),
+            );
+
+            // `first` — the earlier, on-disk writer — saw the completed
+            // replay live; `second`, the last writer being saved (`self` in
+            // the merge), only holds a carried-forward retained partial for
+            // the same key.
+            let mut first = SourceMessageCache::load();
+            first.insert(entry_with_messages(identity, &path, vec![completed_live]));
+            first.save_if_dirty();
+
+            let mut second = SourceMessageCache::load();
+            second.insert(
+                entry_with_messages(identity, &path, vec![retained_partial])
+                    .with_retained_keys(HashSet::from([key.to_string()])),
+            );
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            assert_eq!(
+                entry.messages[0].tokens.output, 999,
+                "the merged entry must carry the completed replay's token counts, not just a \
+                 cleared retained label over the partial's own content"
+            );
+            assert!(!entry.retained_keys.contains(key));
+
+            // A following cache-hit scan (a second load with no further
+            // writes) must keep preferring the completed copy.
+            let rescan = SourceMessageCache::load();
+            let entry = rescan.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1);
+            assert_eq!(entry.messages[0].tokens.output, 999);
+            assert!(!entry.retained_keys.contains(key));
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Two writers can straddle an in-place transcript rewrite: one loads
+    /// and saves the full pre-rewrite file, the other loads the freshly
+    /// compacted file (whose parse never observed the turn compaction
+    /// dropped, since its own cache load predated the first writer's save)
+    /// and saves last. The two entries' fingerprints therefore differ, and
+    /// the merge must not let that fingerprint mismatch discard the first
+    /// writer's history — the dropped turn must survive, labeled retained
+    /// relative to this (the second writer's) generation.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_rescues_history_across_a_straddled_rewrite_fingerprint_mismatch() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let dropped = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 1,
+                    output: 777,
+                    ..Default::default()
+                },
+                0.0,
+                Some("msg_dropped:req_dropped".to_string()),
+            );
+            let kept = keyed_message(namespace, "session", "msg_kept:req_kept");
+
+            // Writer FULL parses the whole pre-rewrite file and saves first.
+            std::fs::write(&path, b"{\"id\":\"pre-rewrite\"}\n").unwrap();
+            let mut full_writer = SourceMessageCache::load();
+            full_writer.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![dropped.clone(), kept.clone()],
+            ));
+            full_writer.save_if_dirty();
+
+            // Compaction changes the fingerprint and drops `dropped`'s turn.
+            // Writer COMPACTED's own parse never saw it and saves last.
+            std::fs::write(&path, b"{\"id\":\"compacted\"}\n").unwrap();
+            let mut compacted_writer = SourceMessageCache::load();
+            compacted_writer.insert(entry_with_messages(identity, &path, vec![kept]));
+            compacted_writer.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                2,
+                "the dropped turn must survive a rewrite straddled by two writers"
+            );
+            let rescued = entry
+                .messages
+                .iter()
+                .find(|message| message.dedup_key.as_deref() == Some("msg_dropped:req_dropped"))
+                .expect("the dropped turn's content must be absorbed, not just its key");
+            assert_eq!(
+                rescued.tokens.output, 777,
+                "the rescued message must carry the pre-rewrite writer's own content"
+            );
+            assert!(
+                entry.retained_keys.contains("msg_dropped:req_dropped"),
+                "a key absent from this generation's own parse must be labeled retained, \
+                 whatever the other generation's entry called it"
             );
         }
 
