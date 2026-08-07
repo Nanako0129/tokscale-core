@@ -1098,6 +1098,19 @@ impl CachedSourceEntry {
                         existing.tokens.cache_write.max(stored_tokens.cache_write);
                     existing.tokens.reasoning =
                         existing.tokens.reasoning.max(stored_tokens.reasoning);
+                    // `duration_ms` grows the same way in
+                    // `merge_claude_duplicate`, and for the same reason: a
+                    // completion record arriving after a mid-turn snapshot
+                    // lengthens the response, and an earlier timestamp must
+                    // never shrink one. Reconciling only the token fields
+                    // would leave a completed timing on the floor whenever
+                    // the partial writer saves last, understating the
+                    // response in model performance metrics on every later
+                    // cache hit.
+                    if let Some(stored_duration) = message.duration_ms {
+                        existing.duration_ms =
+                            Some(existing.duration_ms.unwrap_or(0).max(stored_duration));
+                    }
                     crate::sessions::claudecode::refresh_retained_message_context(
                         existing, &path, None, None,
                     );
@@ -4066,6 +4079,15 @@ mod tests {
                 0.0,
                 Some(key.to_string()),
             );
+            // The completed record carries the finished timing; the partial
+            // was snapshotted mid-response and has a shorter one. Neither is
+            // the maximum on every field, so picking one whole message loses
+            // something either way.
+            let completed = {
+                let mut m = completed;
+                m.duration_ms = Some(4_200);
+                m
+            };
             let partial = UnifiedMessage::new_with_dedup(
                 namespace,
                 "claude-3-5-sonnet",
@@ -4082,6 +4104,11 @@ mod tests {
                 0.0,
                 Some(key.to_string()),
             );
+            let partial = {
+                let mut m = partial;
+                m.duration_ms = Some(900);
+                m
+            };
 
             // Writer B parses the completed form and saves first, under this
             // generation's fingerprint.
@@ -4115,6 +4142,11 @@ mod tests {
                 "output: completed's field was the max"
             );
             assert_eq!(
+                merged.duration_ms,
+                Some(4_200),
+                "duration: the completed timing must not be lost to the partial's shorter one"
+            );
+            assert_eq!(
                 merged.tokens.cache_read, 10,
                 "cache_read: completed's field was the max"
             );
@@ -4132,6 +4164,7 @@ mod tests {
             assert_eq!(merged.tokens.input, 100);
             assert_eq!(merged.tokens.output, 999);
             assert_eq!(merged.tokens.cache_read, 10);
+            assert_eq!(merged.duration_ms, Some(4_200));
             assert_eq!(merged.tokens.cache_write, 5);
         }
 
