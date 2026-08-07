@@ -1073,21 +1073,29 @@ impl CachedSourceEntry {
                     self.messages[index] = absorbed;
                     self.retained_keys.remove(key);
                 }
-                Some(&index) if !same_fingerprint => {
-                    // Both entries know this key but disagree about which
-                    // generation produced it: a rewrite straddled by two
-                    // writers, one saving a partial mid-turn snapshot and the
-                    // other the completed form. Once compaction drops the
-                    // partial's generation, neither writer's own parse can
-                    // reconstruct the other's usage on its own, so reconcile
-                    // the token counts field-by-field instead of discarding
-                    // one side outright — the same per-field max convention
-                    // `merge_claude_duplicate` already uses to fold same-file
-                    // streaming duplicates together, since this is exactly
-                    // that shape: a record observed before its usage was
-                    // final. Stored's label is still untrusted across the
-                    // mismatch (see the comment above), so self's existing
-                    // retained/live classification for this key stands.
+                Some(&index) => {
+                    // Everything left: both entries hold their own copy of the
+                    // key and neither is a live parse of this generation that
+                    // outranks the other. That is a fingerprint mismatch, and
+                    // equally two copies under the *same* fingerprint that are
+                    // both labeled retained — writers spanning more than one
+                    // rewrite can retain a partial and a completed form of the
+                    // same turn into one fingerprint, so matching labels do
+                    // not imply matching content.
+                    //
+                    // Both are the same disagreement: a record observed before
+                    // its usage was final against the completed one. Once
+                    // compaction drops the turn, neither writer's own parse can
+                    // reconstruct the other's usage, so reconcile field by
+                    // field rather than discarding a side — the per-field max
+                    // convention `merge_claude_duplicate` already uses to fold
+                    // same-file streaming duplicates in
+                    // `sessions/claudecode.rs`.
+                    //
+                    // Labels are left untouched in both cases. Across a
+                    // mismatch `stored`'s label is untrusted (see above); under
+                    // a match both are already retained, so there is nothing to
+                    // change.
                     let existing = &mut self.messages[index];
                     let stored_tokens = &message.tokens;
                     existing.tokens.input = existing.tokens.input.max(stored_tokens.input);
@@ -1114,10 +1122,6 @@ impl CachedSourceEntry {
                     crate::sessions::claudecode::refresh_retained_message_context(
                         existing, &path, None, None,
                     );
-                }
-                Some(_) => {
-                    // Fingerprint matches and stored is also retained:
-                    // nothing to prefer. Keep self's copy.
                 }
             }
         }
@@ -4168,6 +4172,80 @@ mod tests {
             assert_eq!(merged.tokens.cache_write, 5);
         }
 
+        restore_cache_env(prev_env);
+    }
+
+    /// Matching retained labels do not imply matching content. Writers
+    /// spanning more than one rewrite can land a partial and a completed form
+    /// of the same turn into a single fingerprint, both labeled retained. This
+    /// used to fall through untouched on the reasoning that neither side
+    /// outranked the other, which discarded the completed usage exactly the
+    /// way the cross-fingerprint case did.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_reconciles_two_retained_copies_under_one_fingerprint() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("transcript.jsonl");
+            // Written once and never changed, so both writers save under the
+            // same fingerprint.
+            std::fs::write(&path, b"{\"id\":\"one-generation\"}\n").unwrap();
+
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+            let retained: HashSet<String> = [key.to_string()].into_iter().collect();
+
+            let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.output = 999;
+            completed.tokens.cache_read = 10;
+            completed.duration_ms = Some(4_200);
+
+            let mut partial = keyed_message(namespace, "session", key);
+            partial.tokens.input = 100;
+            partial.tokens.output = 50;
+            partial.duration_ms = Some(900);
+
+            let mut writer_b = SourceMessageCache::load();
+            writer_b.insert(
+                entry_with_messages(identity, &path, vec![completed])
+                    .with_retained_keys(retained.clone()),
+            );
+            writer_b.save_if_dirty();
+
+            let mut writer_a = SourceMessageCache::load();
+            writer_a.insert(
+                entry_with_messages(identity, &path, vec![partial])
+                    .with_retained_keys(retained.clone()),
+            );
+            writer_a.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            let merged = &entry.messages[0];
+            assert_eq!(merged.tokens.input, 100, "input: partial held the max");
+            assert_eq!(merged.tokens.output, 999, "output: completed held the max");
+            assert_eq!(
+                merged.tokens.cache_read, 10,
+                "cache_read: completed held the max"
+            );
+            assert_eq!(
+                merged.duration_ms,
+                Some(4_200),
+                "duration: the completed timing must survive"
+            );
+            assert!(
+                entry.retained_keys.contains(key),
+                "both copies were retained, so the merged one stays retained"
+            );
+        }
         restore_cache_env(prev_env);
     }
 
