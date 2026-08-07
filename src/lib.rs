@@ -2872,6 +2872,154 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
     })
 }
 
+/// Ordered-batch size for the claude/codex stage-A/stage-B split below.
+/// Stage A (parse-or-fingerprint) runs `par_iter` per batch; stage B (dedup,
+/// filter, sink, cache write) runs serially over that batch's results in
+/// original path order before the next batch starts. Bounds retained memory
+/// to O(one batch of newly-parsed files), not O(corpus).
+const PARSE_BATCH_SIZE: usize = 32;
+
+/// Stage-A outcome for one Claude source. A cache hit carries no messages —
+/// stage B re-reads `cached.messages` by reference, exactly like the
+/// pre-batching cache-hit loop, so a batch of hits does not retain more than
+/// today's one-at-a-time replay.
+enum ClaudeStageA {
+    Hit,
+    Miss {
+        messages: Vec<UnifiedMessage>,
+        fingerprint: Option<message_cache::SourceFingerprint>,
+    },
+}
+
+/// Immutable-cache read + parse-or-not decision for one Claude source.
+/// Mirrors the pre-batching cache_hit/fingerprint decision inline in
+/// `scan_messages_streaming` exactly; only reads `source_cache` (`&self`),
+/// so this is safe to call from `par_iter`.
+fn claude_stage_a(
+    path: &Path,
+    source_cache: &message_cache::SourceMessageCache,
+    claude_home: &Path,
+) -> ClaudeStageA {
+    let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+    let cached = source_cache.get(identity, path);
+    let fingerprint_status = message_cache::SourceFingerprint::check_claude_code_path_with_home_samples_only(
+        path,
+        cached.map(|entry| &entry.fingerprint),
+        Some(claude_home),
+    );
+    let (cache_hit, fingerprint) = match fingerprint_status {
+        Some(message_cache::FingerprintStatus::Unchanged) => {
+            let cached =
+                cached.expect("an uncached Claude source always builds a complete fingerprint");
+            if cached.messages.is_empty() {
+                (false, Some(cached.fingerprint.clone()))
+            } else {
+                (true, None)
+            }
+        }
+        Some(message_cache::FingerprintStatus::Changed(fingerprint)) => {
+            let cache_hit = cached
+                .is_some_and(|entry| entry.fingerprint == fingerprint && !entry.messages.is_empty());
+            (cache_hit, Some(fingerprint))
+        }
+        None => (false, None),
+    };
+    if cache_hit {
+        return ClaudeStageA::Hit;
+    }
+    let messages = sessions::claudecode::parse_claude_file_with_home(path, Some(claude_home));
+    ClaudeStageA::Miss { messages, fingerprint }
+}
+
+/// Stage-A outcome for one Codex source. A cache hit carries no messages —
+/// stage B re-reads `cached.messages` by reference in place. This differs
+/// from `load_or_parse_codex_raw_source` (which the untouched materialized
+/// compat path still uses and which clones the whole cached Vec on a hit);
+/// duplicated here rather than shared so that path's behavior stays exactly
+/// as-is.
+enum CodexStageA {
+    Hit,
+    Parsed(Box<CodexRawCacheOutcome>),
+}
+
+/// Immutable-cache read + parse-or-not decision for one Codex source.
+/// Mirrors `load_or_parse_codex_raw_source` exactly except the exact-hit arm
+/// returns a marker instead of `cached.messages.clone()`. The append-resume
+/// arm still clones the cached prefix (`cached.messages.clone()`) — accepted,
+/// bounded by `PARSE_BATCH_SIZE` and the RSS ceiling, same as upstream.
+fn codex_stage_a(
+    path: &Path,
+    source_cache: &message_cache::SourceMessageCache,
+) -> CodexStageA {
+    let identity = message_cache::CacheIdentity::for_client(ClientId::Codex);
+    let Some(cached) = source_cache.get(identity, path) else {
+        return CodexStageA::Parsed(Box::new(parse_full_codex_raw_source(path)));
+    };
+    let Some(fingerprint_status) =
+        message_cache::SourceFingerprint::check_path(path, Some(&cached.fingerprint))
+    else {
+        return CodexStageA::Parsed(Box::new(parse_full_codex_raw_source(path)));
+    };
+    let fingerprint = match fingerprint_status {
+        message_cache::FingerprintStatus::Unchanged => cached.fingerprint.clone(),
+        message_cache::FingerprintStatus::Changed(fingerprint) => fingerprint,
+    };
+    let reparse_from_start = |invalidate_cache: bool| {
+        let mut outcome = parse_full_codex_raw_source(path);
+        outcome.invalidate_cache = invalidate_cache && outcome.cache_entry.is_none();
+        CodexStageA::Parsed(Box::new(outcome))
+    };
+
+    if cached.fingerprint == fingerprint {
+        if message_cache::codex_cache_entry_matches_fingerprint(cached, &fingerprint) {
+            return CodexStageA::Hit;
+        }
+        return reparse_from_start(true);
+    }
+
+    if let Some(codex_incremental) = cached.codex_incremental.as_ref() {
+        if fingerprint.size > codex_incremental.consumed_offset
+            && message_cache::codex_prefix_matches(path, codex_incremental)
+        {
+            let parsed = sessions::codex::parse_codex_file_incremental(
+                path,
+                codex_incremental.consumed_offset,
+                codex_incremental.state.clone(),
+            );
+            if parsed.parse_succeeded && !parsed.unresolved_model_events {
+                let mut messages = cached.messages.clone();
+                let mut fallback_timestamp_indices = cached.fallback_timestamp_indices.clone();
+                let existing_len = messages.len();
+                fallback_timestamp_indices.extend(
+                    parsed
+                        .fallback_timestamp_indices
+                        .iter()
+                        .map(|index| existing_len + index),
+                );
+                messages.extend(parsed.messages);
+                let Some(cache_entry) = build_codex_cache_entry(
+                    path,
+                    fingerprint,
+                    messages.clone(),
+                    parsed.consumed_offset,
+                    parsed.state,
+                    fallback_timestamp_indices.clone(),
+                ) else {
+                    return reparse_from_start(true);
+                };
+                return CodexStageA::Parsed(Box::new(CodexRawCacheOutcome {
+                    messages,
+                    fallback_timestamp_indices,
+                    cache_entry: Some(cache_entry),
+                    invalidate_cache: false,
+                }));
+            }
+        }
+    }
+
+    reparse_from_start(true)
+}
+
 /// Streaming scan driver — mirrors `parse_all_messages_with_pricing_with_env_strategy`
 /// but never materialises a full-history `Vec<UnifiedMessage>`.
 ///
@@ -2887,6 +3035,13 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 /// `sink` receives each final message exactly once.  Trae winners are flushed
 /// at the very end (after all other lanes), matching `StreamingAggregator`
 /// semantics.
+///
+/// Claude and Codex lanes below process files in ordered batches of
+/// `PARSE_BATCH_SIZE`: stage A (fingerprint check + parse-on-miss) runs in
+/// parallel per batch; stage B (cache write, dedup, filter, sink) runs
+/// serially over that batch in original path order, so `claude_seen` /
+/// `codex_seen` see messages in exactly today's order and cache mutations
+/// apply in original path order — both required for identical output.
 fn scan_messages_streaming<F, S>(
     home_dir: &str,
     clients: &[String],
@@ -2971,95 +3126,111 @@ where
         if passes_client(&message) && filter(&message) { sink(&message); }
     }
 
-    // ---- Claude Code JSONL (cache-aware, reference-iterate on hit) ----
+    // ---- Claude Code JSONL (batched: parallel stage A, serial stage B) ----
     let claude_home = PathBuf::from(home_dir);
+    let claude_identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
     let mut claude_seen: HashSet<String> = HashSet::new();
-    for path in scan_result.get(ClientId::Claude) {
-        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
-        let cached = source_cache.get(identity, path);
-        let fingerprint_status =
-            message_cache::SourceFingerprint::check_claude_code_path_with_home_samples_only(
-                path,
-                cached.map(|entry| &entry.fingerprint),
-                Some(&claude_home),
-            );
-        let (cache_hit, fingerprint) = match fingerprint_status {
-            Some(message_cache::FingerprintStatus::Unchanged) => {
-                let cached =
-                    cached.expect("an uncached Claude source always builds a complete fingerprint");
-                if cached.messages.is_empty() {
-                    (None, Some(cached.fingerprint.clone()))
-                } else {
-                    (Some(cached), None)
+    for chunk in scan_result.get(ClientId::Claude).chunks(PARSE_BATCH_SIZE) {
+        let stage_a: Vec<ClaudeStageA> = chunk
+            .par_iter()
+            .map(|path| claude_stage_a(path, &source_cache, &claude_home))
+            .collect();
+        for (path, outcome) in chunk.iter().zip(stage_a) {
+            match outcome {
+                ClaudeStageA::Hit => {
+                    let cached = source_cache.get(claude_identity, path).expect(
+                        "stage A verified a cache hit for this path under the same cache snapshot",
+                    );
+                    for msg in cached.messages.iter() {
+                        let mut m = msg.clone();
+                        m.refresh_derived_fields();
+                        apply_pricing_if_available(&mut m, pricing);
+                        if !passes_client(&m) { continue; }
+                        let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut claude_seen));
+                        if keep && filter(&m) { sink(&m); }
+                    }
                 }
-            }
-            Some(message_cache::FingerprintStatus::Changed(fingerprint)) => {
-                let cache_hit = cached
-                    .filter(|entry| entry.fingerprint == fingerprint && !entry.messages.is_empty());
-                (cache_hit, Some(fingerprint))
-            }
-            None => (None, None),
-        };
-        if let Some(cached) = cache_hit {
-            for msg in cached.messages.iter() {
-                let mut m = msg.clone();
-                m.refresh_derived_fields();
-                apply_pricing_if_available(&mut m, pricing);
-                if !passes_client(&m) { continue; }
-                let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut claude_seen));
-                if keep && filter(&m) { sink(&m); }
-            }
-        } else {
-            let msgs = sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home));
-            if !msgs.is_empty() {
-                if let Some(fingerprint) = fingerprint {
-                    source_cache.insert(message_cache::CachedSourceEntry::new(
-                        identity,
-                        path,
-                        fingerprint,
-                        msgs.clone(),
-                        Vec::new(),
-                        None,
-                    ));
+                ClaudeStageA::Miss { messages: msgs, fingerprint } => {
+                    if !msgs.is_empty() {
+                        if let Some(fingerprint) = fingerprint {
+                            source_cache.insert(message_cache::CachedSourceEntry::new(
+                                claude_identity,
+                                path,
+                                fingerprint,
+                                msgs.clone(),
+                                Vec::new(),
+                                None,
+                            ));
+                        }
+                    }
+                    for mut m in msgs {
+                        apply_pricing_if_available(&mut m, pricing);
+                        if !passes_client(&m) { continue; }
+                        let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut claude_seen));
+                        if keep && filter(&m) { sink(&m); }
+                    }
                 }
-            }
-            for mut m in msgs {
-                apply_pricing_if_available(&mut m, pricing);
-                if !passes_client(&m) { continue; }
-                let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut claude_seen));
-                if keep && filter(&m) { sink(&m); }
             }
         }
     }
 
-    // ---- Codex JSONL (cache-aware, incremental, headless-aware) ----
+    // ---- Codex JSONL (batched: parallel stage A, serial stage B) ----
+    let codex_identity = message_cache::CacheIdentity::for_client(ClientId::Codex);
     let mut codex_seen: HashSet<String> = HashSet::new();
-    for path in scan_result.get(ClientId::Codex) {
-        let raw = load_or_parse_codex_raw_source(path, &source_cache);
-        if let Some(entry) = raw.cache_entry {
-            source_cache.insert(entry);
-        } else if raw.invalidate_cache {
-            source_cache.remove(
-                message_cache::CacheIdentity::for_client(ClientId::Codex),
-                path,
-            );
-        }
-
-        let is_headless = is_headless_path(path, &headless_roots);
-        let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
-        for (index, mut message) in raw.messages.into_iter().enumerate() {
-            if raw.fallback_timestamp_indices.contains(&index) {
-                message.set_timestamp(fallback_timestamp);
-            } else {
-                message.refresh_derived_fields();
+    for chunk in scan_result.get(ClientId::Codex).chunks(PARSE_BATCH_SIZE) {
+        let stage_a: Vec<CodexStageA> = chunk
+            .par_iter()
+            .map(|path| codex_stage_a(path, &source_cache))
+            .collect();
+        for (path, outcome) in chunk.iter().zip(stage_a) {
+            let raw = match outcome {
+                CodexStageA::Hit => {
+                    let cached = source_cache.get(codex_identity, path).expect(
+                        "stage A verified a cache hit for this path under the same cache snapshot",
+                    );
+                    let is_headless = is_headless_path(path, &headless_roots);
+                    let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
+                    for (index, msg) in cached.messages.iter().enumerate() {
+                        let mut m = msg.clone();
+                        if cached.fallback_timestamp_indices.contains(&index) {
+                            m.set_timestamp(fallback_timestamp);
+                        } else {
+                            m.refresh_derived_fields();
+                        }
+                        apply_pricing_if_available(&mut m, pricing);
+                        apply_headless_agent(&mut m, is_headless);
+                        if !passes_client(&m) { continue; }
+                        let keep = m.dedup_key.as_ref().is_none_or(|key| {
+                            key.is_empty() || dedup_gate_passes(key, &mut codex_seen)
+                        });
+                        if keep && filter(&m) { sink(&m); }
+                    }
+                    continue;
+                }
+                CodexStageA::Parsed(raw) => raw,
+            };
+            if let Some(entry) = raw.cache_entry {
+                source_cache.insert(entry);
+            } else if raw.invalidate_cache {
+                source_cache.remove(codex_identity, path);
             }
-            apply_pricing_if_available(&mut message, pricing);
-            apply_headless_agent(&mut message, is_headless);
-            if !passes_client(&message) { continue; }
-            let keep = message.dedup_key.as_ref().is_none_or(|key| {
-                key.is_empty() || dedup_gate_passes(key, &mut codex_seen)
-            });
-            if keep && filter(&message) { sink(&message); }
+
+            let is_headless = is_headless_path(path, &headless_roots);
+            let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
+            for (index, mut message) in raw.messages.into_iter().enumerate() {
+                if raw.fallback_timestamp_indices.contains(&index) {
+                    message.set_timestamp(fallback_timestamp);
+                } else {
+                    message.refresh_derived_fields();
+                }
+                apply_pricing_if_available(&mut message, pricing);
+                apply_headless_agent(&mut message, is_headless);
+                if !passes_client(&message) { continue; }
+                let keep = message.dedup_key.as_ref().is_none_or(|key| {
+                    key.is_empty() || dedup_gate_passes(key, &mut codex_seen)
+                });
+                if keep && filter(&message) { sink(&message); }
+            }
         }
     }
 
@@ -16463,5 +16634,385 @@ mod tests {
 
         // Keep the fixture path live for the cache/source identity assertion.
         assert!(message_cache::SourceFingerprint::from_kiro_path(&snapshot).is_some());
+    }
+
+    // ---- Batched parallel parse (PARSE_BATCH_SIZE) acceptance matrix ----
+    // These fixtures deliberately exceed PARSE_BATCH_SIZE (32) so the driver
+    // crosses at least one batch boundary, and compare the batched streaming
+    // driver's output against the untouched, unbatched materialized path
+    // (`parse_all_messages_with_pricing_with_env_strategy`), which shares the
+    // exact same per-file cache/dedup semantics with an effectively unbounded
+    // batch. Byte-identical output between the two is the direct test that
+    // PARSE_BATCH_SIZE does not change results.
+
+    fn write_claude_message(dir: &Path, file_name: &str, msg_id: &str, output_tokens: i64) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(file_name);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"message\":{{\"id\":\"{msg_id}\",\"model\":\"claude-sonnet-4\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":{output_tokens}}}}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_batched_claude_dedup_preserves_first_occurrence_across_batch_boundary() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let project_dir = source_home.path().join(".claude/projects/proj");
+
+        // 40 files > PARSE_BATCH_SIZE(32), forcing two batches. File 0 (batch 1)
+        // and file 39 (batch 2) share a dedup_key (same message id) with
+        // different bodies (different output_tokens) — the cross-file gate
+        // must keep file 0's occurrence regardless of batching.
+        for i in 0..40 {
+            let name = format!("f{i:02}.jsonl");
+            if i == 0 {
+                write_claude_message(&project_dir, &name, "dup-msg", 10);
+            } else if i == 39 {
+                write_claude_message(&project_dir, &name, "dup-msg", 999);
+            } else {
+                write_claude_message(&project_dir, &name, &format!("uniq-{i}"), i as i64);
+            }
+        }
+
+        let clients = vec!["claude".to_string()];
+        let mut streamed = Vec::new();
+        with_isolated_tokscale_cache(cache_home.path(), || {
+            scan_messages_streaming(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+            );
+        });
+
+        assert_eq!(streamed.len(), 39, "40 files, one duplicate dropped");
+        let winner = streamed
+            .iter()
+            .find(|m| m.tokens.output == 10 || m.tokens.output == 999)
+            .expect("the dup-msg occurrence must survive");
+        assert_eq!(winner.tokens.output, 10, "file 0 (first path-order occurrence) must win, not file 39");
+        assert!(
+            !streamed.iter().any(|m| m.tokens.output == 999),
+            "file 39's body must not appear at all"
+        );
+
+        // Cross-check against the untouched materialized (unbounded-batch)
+        // path over a fresh cache: same corpus, same dedup outcome.
+        let mat_cache_home = tempfile::TempDir::new().unwrap();
+        let materialized = with_isolated_tokscale_cache(mat_cache_home.path(), || {
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None)
+        });
+        assert_eq!(materialized.len(), streamed.len());
+        assert_eq!(
+            materialized.iter().map(|m| &m.dedup_key).collect::<Vec<_>>(),
+            streamed.iter().map(|m| &m.dedup_key).collect::<Vec<_>>(),
+            "batched streaming order must match the unbatched materialized order"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_batched_claude_hit_miss_interleave_within_batch() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let project_dir = source_home.path().join(".claude/projects/proj");
+
+        let mut paths = Vec::new();
+        for i in 0..10 {
+            let name = format!("f{i:02}.jsonl");
+            paths.push(write_claude_message(&project_dir, &name, &format!("msg-{i}"), i as i64));
+        }
+
+        let clients = vec!["claude".to_string()];
+        // Pre-warm the cache for even-indexed files only, with a sentinel body
+        // that differs from what a fresh parse of the on-disk file would
+        // produce, so a hit is distinguishable from a miss.
+        with_isolated_tokscale_cache(cache_home.path(), || {
+            let mut cache = message_cache::SourceMessageCache::default();
+            for (i, path) in paths.iter().enumerate() {
+                if i % 2 != 0 {
+                    continue;
+                }
+                let fingerprint = message_cache::SourceFingerprint::from_claude_code_path_with_home(
+                    path,
+                    Some(source_home.path()),
+                )
+                .unwrap();
+                let sentinel = UnifiedMessage::new_with_dedup(
+                    "claude",
+                    "cached-sentinel-model",
+                    "anthropic",
+                    "cached-session",
+                    1_767_225_600_000,
+                    TokenBreakdown { input: 4242, output: 1, ..Default::default() },
+                    0.0,
+                    Some(format!("sentinel-{i}")),
+                );
+                cache.insert(message_cache::CachedSourceEntry::new(
+                    message_cache::CacheIdentity::for_client(ClientId::Claude),
+                    path,
+                    fingerprint,
+                    vec![sentinel],
+                    Vec::new(),
+                    None,
+                ));
+            }
+            cache.save_if_dirty();
+        });
+
+        let mut streamed = Vec::new();
+        with_isolated_tokscale_cache(cache_home.path(), || {
+            scan_messages_streaming(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+            );
+        });
+
+        assert_eq!(streamed.len(), 10);
+        for (i, message) in streamed.iter().enumerate() {
+            if i % 2 == 0 {
+                assert_eq!(message.model_id, "cached-sentinel-model", "file {i} must replay the cache hit");
+                assert_eq!(message.tokens.input, 4242);
+            } else {
+                assert_eq!(message.model_id, "claude-sonnet-4", "file {i} must be freshly parsed (miss)");
+                assert_eq!(message.tokens.output, i as i64);
+            }
+        }
+    }
+
+    fn codex_session_meta_line(session_id: &str, timestamp: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"session_meta","payload":{{"id":"{session_id}","source":"interactive","model_provider":"openai"}}}}"#
+        )
+    }
+
+    fn codex_turn_context_line(model: &str) -> String {
+        format!(r#"{{"type":"turn_context","payload":{{"model":"{model}"}}}}"#)
+    }
+
+    fn codex_token_count_line(input: i64, cached: i64, output: i64) -> String {
+        format!(
+            r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{output}}},"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{output}}}}}}}}}"#
+        )
+    }
+
+    /// A well-formed codex session: session_meta + turn_context + one
+    /// token_count event carrying a cumulative total (drives the
+    /// total-usage dedup key).
+    fn codex_plain_fixture(session_id: &str, model: &str, timestamp: &str, input: i64, output: i64) -> String {
+        format!(
+            "{}\n{}\n{}\n",
+            codex_session_meta_line(session_id, timestamp),
+            codex_turn_context_line(model),
+            codex_token_count_line(input, 0, output)
+        )
+    }
+
+    /// Trailing malformed JSON after valid lines: consumed_offset ends up
+    /// short of the file size, so `build_codex_cache_entry` never persists
+    /// an entry (the "uncacheable" cache-matrix case).
+    fn codex_uncacheable_fixture(session_id: &str, model: &str, timestamp: &str) -> String {
+        format!(
+            "{}\n{}\n{}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":999",
+            codex_session_meta_line(session_id, timestamp),
+            codex_turn_context_line(model),
+            codex_token_count_line(1, 0, 1),
+        )
+    }
+
+    fn write_codex_session(dir: &Path, file_name: &str, content: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(file_name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Full cache/incremental matrix for the batched codex lane, spanning a
+    /// PARSE_BATCH_SIZE(32) boundary at file 32: exact hit, valid
+    /// append-resume, stale-prefix full reparse, uncacheable invalidation
+    /// (both never-cached and previously-cached-then-removed), and a
+    /// duplicate dedup key straddling the boundary. Compared against the
+    /// untouched materialized (unbounded-batch) path as the serial baseline.
+    #[test]
+    #[serial_test::serial]
+    fn test_batched_codex_cache_matrix_across_batch_boundary() {
+        let stream_home = tempfile::TempDir::new().unwrap();
+        let stream_cache = tempfile::TempDir::new().unwrap();
+        let mat_home = tempfile::TempDir::new().unwrap();
+        let mat_cache = tempfile::TempDir::new().unwrap();
+
+        let stream_dir = scanner_fixture_path(stream_home.path(), ".codex/sessions");
+        let mat_dir = scanner_fixture_path(mat_home.path(), ".codex/sessions");
+
+        // Build the identical 36-file corpus in both homes.
+        // idx 0: hit;            idx 1: append-resume;   idx 2: stale reparse
+        // idx 3: uncacheable;    idx 4: cached-then-invalidated
+        // idx 5..29: filler (25 plain unique files)
+        // idx 30: hit;           idx 31: dup partner A (last of batch 1)
+        // idx 32: dup partner B (first of batch 2, same key, diff body)
+        // idx 33: append-resume; idx 34: stale reparse; idx 35: cached-then-invalidated
+        let build = |dir: &Path| {
+            for i in 0..36 {
+                let name = format!("f{i:02}.jsonl");
+                let content = match i {
+                    0 | 30 => codex_plain_fixture(&format!("sess-{i}"), "gpt-5.4", "2026-01-01T00:00:00Z", 10, 5),
+                    1 | 33 => codex_plain_fixture(&format!("sess-{i}"), "gpt-5.4", "2026-01-01T00:00:00Z", 10, 5),
+                    2 | 34 => codex_plain_fixture(&format!("sess-{i}"), "gpt-5.4", "2026-01-01T00:00:00Z", 10, 5),
+                    3 => codex_uncacheable_fixture(&format!("sess-{i}"), "gpt-5.4", "2026-01-01T00:00:00Z"),
+                    4 | 35 => codex_plain_fixture(&format!("sess-{i}"), "gpt-5.4", "2026-01-01T00:00:00Z", 10, 5),
+                    31 => codex_plain_fixture("sess-dup", "gpt-5.4", "2026-01-01T00:00:00Z", 77, 33),
+                    32 => codex_plain_fixture("sess-dup", "gpt-5.4", "2026-01-01T09:00:00Z", 77, 33),
+                    _ => codex_plain_fixture(&format!("sess-filler-{i}"), "gpt-5.4", "2026-01-01T00:00:00Z", i as i64, 1),
+                };
+                write_codex_session(dir, &name, &content);
+            }
+        };
+        build(&stream_dir);
+        build(&mat_dir);
+
+        let clients = vec!["codex".to_string()];
+
+        // Cold pass on both.
+        let mut cold_streamed = Vec::new();
+        with_isolated_tokscale_cache(stream_cache.path(), || {
+            scan_messages_streaming(
+                stream_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |m: &UnifiedMessage| cold_streamed.push(m.clone()),
+            );
+        });
+        let cold_materialized = with_isolated_tokscale_cache(mat_cache.path(), || {
+            parse_all_messages_with_pricing(mat_home.path().to_str().unwrap(), &clients, None)
+        });
+
+        assert_eq!(cold_streamed.len(), cold_materialized.len());
+        assert_eq!(
+            cold_streamed.iter().map(|m| &m.dedup_key).collect::<Vec<_>>(),
+            cold_materialized.iter().map(|m| &m.dedup_key).collect::<Vec<_>>(),
+            "cold: batched streaming order must match the unbatched materialized order"
+        );
+        // Only one of the sess-dup pair (idx 31 vs 32) survived, and it is
+        // idx 31's body (earlier path order): input=77 must appear once.
+        assert_eq!(cold_streamed.iter().filter(|m| m.tokens.input == 77).count(), 1);
+        // idx 3's uncacheable file never persisted a cache entry.
+        with_isolated_tokscale_cache(stream_cache.path(), || {
+            let cache = message_cache::SourceMessageCache::load();
+            assert!(cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &stream_dir.join("f03.jsonl"),
+                )
+                .is_none());
+        });
+
+        // Mutate for the warm pass, identically in both homes:
+        // idx 1/33 — append a valid extra token_count event (append-resume).
+        // idx 2/34 — full rewrite with different leading bytes (stale prefix -> full reparse).
+        // idx 4/35 — rewrite to malformed trailing JSON (cached-then-invalidated).
+        let mutate = |dir: &Path| {
+            for i in [1usize, 33] {
+                let path = dir.join(format!("f{i:02}.jsonl"));
+                let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+                file.write_all(codex_token_count_line(20, 0, 8).as_bytes()).unwrap();
+                file.write_all(b"\n").unwrap();
+                file.flush().unwrap();
+            }
+            for i in [2usize, 34] {
+                let path = dir.join(format!("f{i:02}.jsonl"));
+                std::fs::write(
+                    &path,
+                    codex_plain_fixture(&format!("sess-{i}-rewritten"), "gpt-5.5", "2026-02-02T00:00:00Z", 44, 22),
+                )
+                .unwrap();
+            }
+            for i in [4usize, 35] {
+                let path = dir.join(format!("f{i:02}.jsonl"));
+                std::fs::write(&path, codex_uncacheable_fixture(&format!("sess-{i}-broken"), "gpt-5.4", "2026-02-02T00:00:00Z")).unwrap();
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        mutate(&stream_dir);
+        mutate(&mat_dir);
+
+        let mut warm_streamed = Vec::new();
+        with_isolated_tokscale_cache(stream_cache.path(), || {
+            scan_messages_streaming(
+                stream_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |m: &UnifiedMessage| warm_streamed.push(m.clone()),
+            );
+        });
+        let warm_materialized = with_isolated_tokscale_cache(mat_cache.path(), || {
+            parse_all_messages_with_pricing(mat_home.path().to_str().unwrap(), &clients, None)
+        });
+
+        assert_eq!(warm_streamed.len(), warm_materialized.len());
+        assert_eq!(
+            warm_streamed.iter().map(|m| &m.dedup_key).collect::<Vec<_>>(),
+            warm_materialized.iter().map(|m| &m.dedup_key).collect::<Vec<_>>(),
+            "warm: batched streaming order must match the unbatched materialized order"
+        );
+        assert_eq!(
+            warm_streamed.iter().map(|m| m.tokens.input).collect::<Vec<_>>(),
+            warm_materialized.iter().map(|m| m.tokens.input).collect::<Vec<_>>(),
+            "warm: per-message token totals must match exactly (hit/append-resume/reparse/invalidate all agree)"
+        );
+
+        // idx 4/35 previously cached, now invalidated: cache entry removed.
+        with_isolated_tokscale_cache(stream_cache.path(), || {
+            let cache = message_cache::SourceMessageCache::load();
+            for i in [4, 35] {
+                assert!(
+                    cache
+                        .get(
+                            message_cache::CacheIdentity::for_client(ClientId::Codex),
+                            &stream_dir.join(format!("f{i:02}.jsonl")),
+                        )
+                        .is_none(),
+                    "file {i} must have its stale cache entry removed, not just left stale"
+                );
+            }
+        });
+        // idx 1/33 append-resume: incremental offset now covers the appended bytes.
+        with_isolated_tokscale_cache(stream_cache.path(), || {
+            let cache = message_cache::SourceMessageCache::load();
+            for i in [1, 33] {
+                let path = stream_dir.join(format!("f{i:02}.jsonl"));
+                let entry = cache
+                    .get(message_cache::CacheIdentity::for_client(ClientId::Codex), &path)
+                    .expect("append-resumed file must still be cached");
+                let incremental = entry
+                    .codex_incremental
+                    .as_ref()
+                    .expect("append-resume must persist incremental state");
+                assert_eq!(
+                    incremental.consumed_offset,
+                    std::fs::metadata(&path).unwrap().len(),
+                    "file {i} incremental offset must cover the full appended file"
+                );
+            }
+        });
     }
 }
