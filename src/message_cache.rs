@@ -20,7 +20,15 @@ use std::time::UNIX_EPOCH;
 // absent when cached. Claude sidechain parent candidates can therefore be
 // revalidated without reparsing the sidechain on every warm scan, while a
 // later-created parent transcript still invalidates the entry.
-const CACHE_FORMAT_VERSION: u32 = 2;
+// 3: CachedSourceEntry gained `retained_keys`, a new positional field shared
+// by every namespace's serialized entries — Codex, Grok, Copilot and all
+// others, not just Claude. This is a storage-layout change, not a
+// parser-only one, so it belongs here rather than in a single client's
+// parser_version: the envelope's format_version gate must reject every
+// namespace's pre-bump shard by version before any of them are decoded
+// against the new 8-field layout. This invalidates every namespace's cached
+// shards once.
+const CACHE_FORMAT_VERSION: u32 = 3;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -710,6 +718,10 @@ pub(crate) struct CachedPath(Vec<u8>);
 
 #[cfg(unix)]
 impl CachedPath {
+    /// Stores the raw OS string with no normalisation, so two `Path`s that
+    /// name the same file but differ byte for byte are different cache keys.
+    /// On Windows that includes mixed separators: a `join("a/b")` literal and
+    /// the all-backslash path a directory walk produces will not match.
     pub(crate) fn from_path(path: &Path) -> Self {
         use std::os::unix::ffi::OsStrExt;
 
@@ -817,6 +829,22 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Jcode => 4,
         ClientId::Copilot => 4,
         ClientId::Grok => 3,
+        // 2: Claude gained retention of history-only turns dropped by a
+        // Claude Code transcript rewrite (see RET-CLAUDE-001 in
+        // UPSTREAM.md). This records the parse-semantics change, not a
+        // storage-layout change — the new `CachedSourceEntry::retained_keys`
+        // field that retention needed is a shared bincode layout change
+        // covered by `CACHE_FORMAT_VERSION` instead, since every namespace's
+        // serialized entries gained the field, not just Claude's.
+        //
+        // WARNING for any *future* bump — once retention has shipped, a bump
+        // here discards data that is not recoverable by re-parsing. Claude
+        // Code rewrites a transcript in place on resume/compact, and retained
+        // assistant turns can no longer appear in the compacted file (see
+        // `HistoryRetention::RetainObserved` in `lib.rs`). A bump then
+        // silently retires those turns instead of merely making the cache
+        // cold. Bump for a real parser change only with that loss understood.
+        ClientId::Claude => 2,
         _ => 1,
     }
 }
@@ -867,9 +895,25 @@ pub(crate) struct CachedSourceEntry {
     parser_version: u32,
     pub path: CachedPath,
     pub fingerprint: SourceFingerprint,
+    /// Not always a pure function of the source file. For a namespace that
+    /// `retained_history_key_filter` covers, this can hold messages the live
+    /// file no longer contains, and re-parsing will not reproduce them — the
+    /// cache is the only copy. That is what makes a parser_version bump for
+    /// those namespaces lossy rather than merely cold.
     pub messages: Vec<UnifiedMessage>,
     pub fallback_timestamp_indices: Vec<usize>,
     pub codex_incremental: Option<CodexIncrementalCache>,
+    /// Dedup keys within `messages` that were carried forward by
+    /// `retain_observed_messages` rather than produced by a live parse of
+    /// this entry's fingerprinted bytes. Always empty for a namespace
+    /// `retained_history_key_filter` does not cover. Persisted so the
+    /// live-outranks-retained guarantee in `lib.rs` holds on a cache hit, not
+    /// only on the scan that first computed it — see RET-CLAUDE-001 in
+    /// UPSTREAM.md. This is the field whose addition forced the
+    /// `CACHE_FORMAT_VERSION` bump to 3, since it changes bincode's
+    /// positional layout for every namespace's serialized entries, not just
+    /// Claude's.
+    pub retained_keys: HashSet<String>,
 }
 
 impl CachedSourceEntry {
@@ -889,13 +933,222 @@ impl CachedSourceEntry {
             messages,
             fallback_timestamp_indices,
             codex_incremental,
+            retained_keys: HashSet::new(),
         }
+    }
+
+    /// Tag which of `self.messages`' dedup keys are retained carry-overs
+    /// rather than the live parse's own output. Only the Claude retention
+    /// lanes in `lib.rs` call this.
+    pub(crate) fn with_retained_keys(mut self, retained_keys: HashSet<String>) -> Self {
+        self.retained_keys = retained_keys;
+        self
     }
 
     fn identity_is_current(&self) -> bool {
         CacheIdentity::current_for_namespace(&self.parser_namespace)
             .is_some_and(|identity| identity.parser_version == self.parser_version)
     }
+
+    /// Carry forward keyed messages an entry already on disk holds for this
+    /// same path and this one does not.
+    ///
+    /// Two processes can scan at once — a running TUI and a `tokscale submit`,
+    /// say. Each loads the entry, parses, and saves back, and the last writer
+    /// replaces the other's entry wholesale. For most namespaces that is
+    /// harmless: the loser's messages come from the same bytes and reappear on
+    /// the next scan. For a namespace that retains history it is not, because
+    /// the messages the loser observed are gone from the live file too, so
+    /// nothing will ever put them back.
+    ///
+    /// Same filter as the parse-time merge: a key that is only unique within
+    /// one file must not outlive the bytes that produced it.
+    ///
+    /// A message this union pulls in from `stored` for a key `self` does not
+    /// already describe carries `stored`'s content and provenance with it.
+    /// For a key both entries already describe, `stored`'s live copy always
+    /// wins over `self`'s retained one — both the label and the message
+    /// content, not just the label, or a stale retained partial could be
+    /// relabeled live and win a future cross-file dedup race it never
+    /// earned (see RET-CLAUDE-001). When the two entries describe different
+    /// generations of the file (different fingerprints), `stored`'s per-key
+    /// labels are not trusted at all — see the fingerprint handling below —
+    /// so a key it holds is only ever absorbed as retained-by-definition,
+    /// and only when `self` does not already know that key some other way.
+    fn absorb_retained_history(&mut self, stored: &CachedSourceEntry) {
+        let Some(key_is_globally_stable) = retained_history_key_filter(&self.parser_namespace)
+        else {
+            return;
+        };
+        // A stored entry from a different parser version describes a layout
+        // this one does not agree with; let the wholesale replace stand.
+        if stored.parser_namespace != self.parser_namespace
+            || stored.parser_version != self.parser_version
+        {
+            return;
+        }
+        // A stored entry with a different fingerprint can be this same
+        // process's own earlier scan of an older generation of the file
+        // (e.g. the pre-rewrite bytes), or a concurrent writer's scan of a
+        // *different* generation than this entry's — two writers can
+        // straddle a rewrite, one loading the full pre-rewrite file and the
+        // other the freshly compacted one. Either way, `stored`'s
+        // retained/live *labels* described a different generation and must
+        // not be inherited: a key this generation retains because
+        // compaction just dropped it can legitimately have been live in
+        // that older, pre-rewrite entry, and blending that stale label in
+        // would incorrectly un-retain it (see RET-CLAUDE-001's "third scan"
+        // regression).
+        //
+        // What is still safe across a fingerprint mismatch is the message
+        // *content* for a key this entry has never observed at all: from
+        // this generation's point of view such a key is retained by
+        // definition, whatever `stored` called it — this is what keeps a
+        // rewrite straddled by two writers from losing a turn neither
+        // writer's own parse of its own generation could reproduce.
+        let same_fingerprint = stored.fingerprint == self.fingerprint;
+        let path = self.path.to_path_buf();
+
+        let mut self_keys: HashMap<String, usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| message.dedup_key.clone().map(|key| (key, index)))
+            .collect();
+        for message in &stored.messages {
+            let Some(key) = message.dedup_key.as_ref() else {
+                continue;
+            };
+            if !key_is_globally_stable(key) {
+                continue;
+            }
+            let stored_is_retained = stored.retained_keys.contains(key);
+
+            match self_keys.get(key) {
+                None => {
+                    // Not previously in self: absorb the message. Under a
+                    // matching fingerprint, inherit stored's label as-is;
+                    // under a mismatch, stored's label is untrusted, so
+                    // treat it as retained by definition — this generation
+                    // never produced it on its own.
+                    let is_retained = if same_fingerprint {
+                        stored_is_retained
+                    } else {
+                        true
+                    };
+                    let mut absorbed = message.clone();
+                    // `stored` may have been cached before a related-metadata
+                    // edit (a `cc-mirror/variant.json` change, say) that this
+                    // entry's own parse already reflects. Rebuild the
+                    // parser-derived context against the current on-disk
+                    // state so the absorbed copy does not carry `stored`'s
+                    // stale client/provider/workspace — see RET-CLAUDE-001.
+                    // No live sibling agent is available at merge time, so
+                    // `agent` is left as the last resolution, same as the
+                    // parse-time refresh does when a file's whole history is
+                    // retained.
+                    crate::sessions::claudecode::refresh_retained_message_context(
+                        &mut absorbed,
+                        &path,
+                        None,
+                        None,
+                    );
+                    self.messages.push(absorbed);
+                    if is_retained {
+                        self.retained_keys.insert(key.clone());
+                    }
+                    self_keys.insert(key.clone(), self.messages.len() - 1);
+                }
+                Some(&index) => {
+                    // Both entries hold their own copy of this key. No copy is
+                    // ever authoritative over the other on content, whatever
+                    // their fingerprints or labels say, because every way the
+                    // two can differ is the same disagreement: one observed the
+                    // turn before its usage was final, the other after.
+                    //
+                    // Two scanners can fingerprint the same partial file and
+                    // have the response complete between their parses, so even
+                    // two *live* copies under one fingerprint can disagree.
+                    // Writers spanning more than one rewrite can retain a
+                    // partial and a completed form into one fingerprint, so
+                    // matching retained labels do not imply matching content
+                    // either. And across a fingerprint mismatch neither side
+                    // can reparse what the other saw once compaction drops the
+                    // turn. Each of those was once handled by preferring a
+                    // side, and each preference turned out to discard real
+                    // usage.
+                    //
+                    // So content is always reconciled field by field -- the
+                    // per-field max convention `merge_claude_duplicate` uses
+                    // to fold same-file streaming duplicates in
+                    // `sessions/claudecode.rs`. Only the *label* still depends
+                    // on the case, below.
+                    let existing = &mut self.messages[index];
+                    let stored_tokens = &message.tokens;
+                    existing.tokens.input = existing.tokens.input.max(stored_tokens.input);
+                    existing.tokens.output = existing.tokens.output.max(stored_tokens.output);
+                    existing.tokens.cache_read =
+                        existing.tokens.cache_read.max(stored_tokens.cache_read);
+                    existing.tokens.cache_write =
+                        existing.tokens.cache_write.max(stored_tokens.cache_write);
+                    existing.tokens.reasoning =
+                        existing.tokens.reasoning.max(stored_tokens.reasoning);
+                    // `duration_ms` grows the same way in
+                    // `merge_claude_duplicate`, and for the same reason: a
+                    // completion record arriving after a mid-turn snapshot
+                    // lengthens the response, and an earlier timestamp must
+                    // never shrink one. Reconciling only the token fields
+                    // would leave a completed timing on the floor whenever
+                    // the partial writer saves last, understating the
+                    // response in model performance metrics on every later
+                    // cache hit.
+                    if let Some(stored_duration) = message.duration_ms {
+                        existing.duration_ms =
+                            Some(existing.duration_ms.unwrap_or(0).max(stored_duration));
+                    }
+                    // `is_turn_start` marks the first assistant reply after
+                    // genuine human input, and `aggregator.rs` counts those
+                    // markers into `turns_by_client` without re-deriving them.
+                    // A rewrite that drops the preceding user row makes the
+                    // compacted parse record `false` where the full generation
+                    // recorded `true`; keeping only this side's marker would
+                    // retire a turn that did happen. The marker is a claim that
+                    // something was observed, so either side asserting it wins.
+                    existing.is_turn_start |= message.is_turn_start;
+                    // Cost tracks the token counts just reconciled above. Left
+                    // alone it would describe whichever copy this entry started
+                    // from while the tokens describe both, which is a worse
+                    // state than either copy on its own.
+                    existing.cost = existing.cost.max(message.cost);
+                    crate::sessions::claudecode::refresh_retained_message_context(
+                        existing, &path, None, None,
+                    );
+                    // The one case where a label changes: `stored` parsed this
+                    // key live from the same generation, so the merged copy is
+                    // no longer a carry-forward and must not be deferred behind
+                    // live messages on a later scan. Across a fingerprint
+                    // mismatch `stored`'s label describes another generation
+                    // and is untrusted; when both are retained there is
+                    // nothing to change.
+                    if same_fingerprint && !stored_is_retained {
+                        self.retained_keys.remove(key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The dedup-key filter for namespaces whose entries carry history the live
+/// file may no longer contain, or `None` for namespaces that do not retain
+/// history.
+///
+/// Mirrors the `HistoryRetention` choice each lane makes in `lib.rs`. It has
+/// to exist here as well because the save merge is the other place a retained
+/// message can be dropped, and it must honor the same contract.
+fn retained_history_key_filter(namespace: &str) -> Option<fn(&str) -> bool> {
+    (namespace == ClientId::Claude.as_str())
+        .then_some(crate::sessions::claudecode::dedup_key_is_globally_stable)
 }
 
 /// The envelope is deliberately independent from CachedSourceEntry's binary
@@ -1187,7 +1440,15 @@ impl SourceMessageCache {
             if let Some(dirty) = dirty_by_shard.get(&shard_key) {
                 for key in dirty {
                     if let Some(entry) = self.entries.get(key) {
-                        merged_entries.insert(key.clone(), entry.clone());
+                        let mut entry = entry.clone();
+                        // Another process holding the lock before us may have
+                        // stored history for this same path that our in-memory
+                        // entry never saw. Union it in rather than replacing
+                        // wholesale — see `absorb_retained_history`.
+                        if let Some(stored) = merged_entries.remove(key) {
+                            entry.absorb_retained_history(&stored);
+                        }
+                        merged_entries.insert(key.clone(), entry);
                     }
                 }
             }
@@ -1691,6 +1952,38 @@ mod tests {
                 },
                 0.0,
             )],
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn keyed_message(namespace: &str, session_id: &str, dedup_key: &str) -> UnifiedMessage {
+        UnifiedMessage::new_with_dedup(
+            namespace,
+            "claude-3-5-sonnet",
+            "anthropic",
+            session_id,
+            1,
+            TokenBreakdown {
+                input: 1,
+                output: 2,
+                ..Default::default()
+            },
+            0.0,
+            Some(dedup_key.to_string()),
+        )
+    }
+
+    fn entry_with_messages(
+        identity: CacheIdentity,
+        path: &Path,
+        messages: Vec<UnifiedMessage>,
+    ) -> CachedSourceEntry {
+        CachedSourceEntry::new(
+            identity,
+            path,
+            SourceFingerprint::from_path(path).unwrap(),
+            messages,
             Vec::new(),
             None,
         )
@@ -2834,6 +3127,164 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    /// A shard written before RET-CLAUDE-001 (`CachedSourceEntry` without
+    /// `retained_keys`) is tagged Claude `parser_version = 1`. Its payload's
+    /// binary layout no longer matches the current 8-field struct, so
+    /// decoding it directly would either error out on missing trailing bytes
+    /// or, in the worst case, misalign fields — the version gate in
+    /// `read_shard_with_limit` has to reject it by version before ever
+    /// attempting `bincode::deserialize` on the payload. This hand-rolls the
+    /// pre-bump 7-field layout rather than using the current
+    /// `CachedSourceEntry`, so the test actually exercises the layout change
+    /// the bump exists for, not just a version-number label.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_v1_shard_is_rejected_before_its_payload_is_decoded() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"legacy claude transcript\n");
+        let claude = CacheIdentity::for_client(ClientId::Claude);
+        let legacy = CacheIdentity {
+            namespace: claude.namespace,
+            parser_version: 1,
+        };
+        assert_ne!(
+            claude.parser_version, 1,
+            "this test requires Claude to be versioned past the pre-retention layout"
+        );
+
+        #[derive(Serialize)]
+        struct LegacyCachedSourceEntry {
+            parser_namespace: String,
+            parser_version: u32,
+            path: CachedPath,
+            fingerprint: SourceFingerprint,
+            messages: Vec<UnifiedMessage>,
+            fallback_timestamp_indices: Vec<usize>,
+            codex_incremental: Option<CodexIncrementalCache>,
+        }
+
+        let legacy_entry = LegacyCachedSourceEntry {
+            parser_namespace: legacy.namespace.to_string(),
+            parser_version: legacy.parser_version,
+            path: CachedPath::from_path(source.path()),
+            fingerprint: SourceFingerprint::from_path(source.path()).unwrap(),
+            messages: vec![keyed_message(
+                legacy.namespace,
+                "session",
+                "msg_legacy:req_legacy",
+            )],
+            fallback_timestamp_indices: Vec::new(),
+            codex_incremental: None,
+        };
+        let payload = bincode::options().serialize(&vec![legacy_entry]).unwrap();
+        let stale_key = CacheKey::new(claude, source.path()).shard();
+        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        let stale_envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: legacy.namespace.to_string(),
+            parser_version: legacy.parser_version,
+            payload,
+        };
+        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &stale_envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert!(
+            matches!(read_shard(&stale_path, claude), ShardReadStatus::Stale),
+            "a v1 shard must be rejected by the version gate before its payload — which no \
+             longer matches CachedSourceEntry's field layout — is ever decoded"
+        );
+
+        let loaded = SourceMessageCache::load();
+        assert!(
+            loaded.get(claude, source.path()).is_none(),
+            "a stale-version shard is a cache miss, not a misread entry"
+        );
+
+        restore_cache_env(prev_env);
+    }
+
+    /// RET-CLAUDE-001 bumped `CACHE_FORMAT_VERSION`, not just Claude's
+    /// `parser_version`, because `retained_keys` was added to
+    /// `CachedSourceEntry`, which every namespace's shard uses. A shard
+    /// written by a client this branch never touches (Codex, still on
+    /// `parser_version` 4) under the pre-bump format must therefore also be
+    /// rejected by the format gate before its 7-field payload is ever
+    /// decoded against the new 8-field struct — proving the invalidation is
+    /// format-wide, not scoped to Claude's own version bump. This hand-rolls
+    /// the pre-bump layout rather than reusing the current
+    /// `CachedSourceEntry`, so the test fails if `CACHE_FORMAT_VERSION` is
+    /// reverted to 2.
+    #[test]
+    #[serial_test::serial]
+    fn test_non_claude_legacy_shard_is_rejected_by_the_format_bump_before_its_payload_is_decoded() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"legacy codex transcript\n");
+        let codex = CacheIdentity::for_client(ClientId::Codex);
+
+        #[derive(Serialize)]
+        struct LegacyCachedSourceEntry {
+            parser_namespace: String,
+            parser_version: u32,
+            path: CachedPath,
+            fingerprint: SourceFingerprint,
+            messages: Vec<UnifiedMessage>,
+            fallback_timestamp_indices: Vec<usize>,
+            codex_incremental: Option<CodexIncrementalCache>,
+        }
+
+        let legacy_entry = LegacyCachedSourceEntry {
+            parser_namespace: codex.namespace.to_string(),
+            parser_version: codex.parser_version,
+            path: CachedPath::from_path(source.path()),
+            fingerprint: SourceFingerprint::from_path(source.path()).unwrap(),
+            messages: vec![keyed_message(
+                codex.namespace,
+                "session",
+                "msg_legacy_codex:req_legacy",
+            )],
+            fallback_timestamp_indices: Vec::new(),
+            codex_incremental: None,
+        };
+        let payload = bincode::options().serialize(&vec![legacy_entry]).unwrap();
+        let stale_key = CacheKey::new(codex, source.path()).shard();
+        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        let stale_envelope = CachedShardEnvelope {
+            format_version: 2,
+            parser_namespace: codex.namespace.to_string(),
+            parser_version: codex.parser_version,
+            payload,
+        };
+        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &stale_envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert!(
+            matches!(read_shard(&stale_path, codex), ShardReadStatus::Stale),
+            "a pre-bump-format Codex shard must be rejected by the format gate before its \
+             payload — which no longer matches CachedSourceEntry's field layout — is ever \
+             decoded, even though its namespace and parser_version still match current"
+        );
+
+        let loaded = SourceMessageCache::load();
+        assert!(
+            loaded.get(codex, source.path()).is_none(),
+            "a stale-format shard is a cache miss, not a misread entry"
+        );
+
+        restore_cache_env(prev_env);
+    }
+
     /// Shared body for the Grok same-fingerprint parser-invalidation tests:
     /// a shard written under an older parser version, with an unchanged
     /// source file, must be treated as stale and cold-rebuilt rather than
@@ -3181,6 +3632,813 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    /// A Claude entry can hold assistant turns the live transcript no longer
+    /// contains. Two writers therefore hold genuinely different histories for
+    /// one path, and the last writer must union the stored history rather than
+    /// retire it with a wholesale replace.
+    ///
+    /// The key this test rescues (`dropped`) is tagged retained in `first`, so
+    /// the assertion actually exercises `absorb_retained_history` carrying
+    /// provenance across — not just the message surviving under whichever
+    /// label the union happens to attach. Without this, the test would still
+    /// pass even if `absorb_retained_history` dropped `stored.retained_keys`
+    /// entirely and always labeled an absorbed key live.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_unions_retained_history_for_the_same_path() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let shared = keyed_message(namespace, "session", "msg_shared:req_shared");
+            let dropped = keyed_message(namespace, "session", "msg_dropped:req_dropped");
+
+            let mut first = SourceMessageCache::load();
+            first.insert(
+                entry_with_messages(identity, &path, vec![shared.clone(), dropped])
+                    .with_retained_keys(HashSet::from(["msg_dropped:req_dropped".to_string()])),
+            );
+            first.save_if_dirty();
+
+            let mut second = SourceMessageCache::load();
+            second.insert(entry_with_messages(identity, &path, vec![shared]));
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            let keys: HashSet<&str> = entry
+                .messages
+                .iter()
+                .filter_map(|message| message.dedup_key.as_deref())
+                .collect();
+            assert!(keys.contains("msg_dropped:req_dropped"));
+            assert_eq!(
+                entry.messages.len(),
+                2,
+                "the shared turn must not duplicate"
+            );
+            assert!(
+                entry.retained_keys.contains("msg_dropped:req_dropped"),
+                "the absorbed key's retained provenance must survive the union, not just the \
+                 message content"
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Inverse of the union case above: the same key is live in one writer's
+    /// entry and retained in the other's. Regardless of which side is
+    /// `self` and which is `stored`, the merged label must be live — a
+    /// concurrent writer that actually reparsed the key from live content is
+    /// authoritative over a carried-forward retained copy of the same key.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_prefers_live_over_retained_for_a_key_both_writers_describe() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let shared = keyed_message(namespace, "session", "msg_shared:req_shared");
+
+            // `first` retains the shared key (a carried-forward partial);
+            // `second` — the last writer — saw it live.
+            let mut first = SourceMessageCache::load();
+            first.insert(
+                entry_with_messages(identity, &path, vec![shared.clone()])
+                    .with_retained_keys(HashSet::from(["msg_shared:req_shared".to_string()])),
+            );
+            first.save_if_dirty();
+
+            let mut second = SourceMessageCache::load();
+            second.insert(entry_with_messages(identity, &path, vec![shared]));
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            assert!(
+                !entry.retained_keys.contains("msg_shared:req_shared"),
+                "a key the last writer saw live must not be left labeled retained, even though \
+                 an earlier writer's entry retained it"
+            );
+        }
+
+        restore_cache_env(prev_env);
+
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let shared = keyed_message(namespace, "session", "msg_shared:req_shared");
+
+            // Same conflict, opposite arrival order: the last writer is the
+            // one that retained the key, `stored` (the earlier, on-disk
+            // entry) saw it live.
+            let mut first = SourceMessageCache::load();
+            first.insert(entry_with_messages(identity, &path, vec![shared.clone()]));
+            first.save_if_dirty();
+
+            let mut second = SourceMessageCache::load();
+            second.insert(
+                entry_with_messages(identity, &path, vec![shared])
+                    .with_retained_keys(HashSet::from(["msg_shared:req_shared".to_string()])),
+            );
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            assert!(
+                !entry.retained_keys.contains("msg_shared:req_shared"),
+                "a key an earlier writer saw live must not be left labeled retained just because \
+                 the last writer's own entry retained it"
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Two writers can straddle both an in-place transcript rewrite and an
+    /// unrelated `cc-mirror/variant.json` edit (a provider switch, say)
+    /// landing in between. The absorbed message's client/provider/workspace
+    /// must reflect the *current* on-disk variant, not whatever `stored` was
+    /// first cached with — otherwise nothing ever refreshes it, since
+    /// `refresh_retained_message_context` only runs at parse time and the
+    /// save-merge path is the only place that ever sees `stored`'s content
+    /// again.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_refreshes_absorbed_message_metadata_against_current_variant() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let variant_dir = temp_home.path().join(".cc-mirror").join("work-variant");
+            let config_dir = variant_dir.join("config");
+            let path = config_dir
+                .join("projects")
+                .join("-Users-example-work")
+                .join("session.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"{\"id\":\"pre-rewrite\"}\n").unwrap();
+            std::fs::write(
+                variant_dir.join("variant.json"),
+                serde_json::json!({
+                    "name": "work-variant",
+                    "provider": "openai",
+                    "configDir": config_dir,
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let absorbed_key = "msg_absorbed:req_absorbed";
+            let stale_message = UnifiedMessage::new_with_dedup(
+                "cc-mirror/work-variant",
+                "claude-3-5-sonnet",
+                "openai",
+                "session-1",
+                1,
+                TokenBreakdown {
+                    input: 1,
+                    output: 2,
+                    ..Default::default()
+                },
+                0.0,
+                Some(absorbed_key.to_string()),
+            );
+
+            // Writer one caches the pre-rewrite generation, retaining the
+            // turn the in-place rewrite is about to drop.
+            let mut first = SourceMessageCache::load();
+            first.insert(
+                entry_with_messages(identity, &path, vec![stale_message])
+                    .with_retained_keys(HashSet::from([absorbed_key.to_string()])),
+            );
+            first.save_if_dirty();
+
+            // The rewrite lands (dropping the turn from the live file), and a
+            // related-metadata edit — a variant provider switch — lands
+            // alongside it.
+            std::fs::write(&path, b"{\"id\":\"post-rewrite\"}\n").unwrap();
+            std::fs::write(
+                variant_dir.join("variant.json"),
+                serde_json::json!({
+                    "name": "work-variant",
+                    "provider": "zai",
+                    "configDir": config_dir,
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            // Writer two's own parse of the new generation found nothing (the
+            // fixture never runs the real parser); its cache entry gets
+            // saved and absorbs the retained turn from `first` on merge.
+            let mut second = SourceMessageCache::load();
+            second.insert(entry_with_messages(identity, &path, Vec::new()));
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1, "the retained turn must survive");
+            assert_eq!(
+                entry.messages[0].provider_id, "zai",
+                "an absorbed message must carry the current variant's provider, not the stale \
+                 one it was first cached with"
+            );
+
+            // A following cache-hit scan serves the persisted entry as-is —
+            // the refreshed metadata must already be what got saved, not
+            // something a live re-parse would still need to fix up.
+            let rehit = SourceMessageCache::load();
+            let rehit_entry = rehit
+                .get(identity, &path)
+                .expect("cache hit should still see the entry");
+            assert_eq!(rehit_entry.messages[0].provider_id, "zai");
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Regression for the finding that clearing `retained_keys`' label
+    /// without replacing `self.messages`' content left the completed
+    /// replay's token counts unabsorbed: the merged entry kept the
+    /// partial's own content under a live label, which a following
+    /// cache-hit scan would then treat as authoritative.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_prefers_live_message_content_not_just_the_cleared_label() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+            let retained_partial = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 1,
+                    output: 50,
+                    ..Default::default()
+                },
+                0.0,
+                Some(key.to_string()),
+            );
+            let completed_live = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 1,
+                    output: 999,
+                    ..Default::default()
+                },
+                0.0,
+                Some(key.to_string()),
+            );
+
+            // `first` — the earlier, on-disk writer — saw the completed
+            // replay live; `second`, the last writer being saved (`self` in
+            // the merge), only holds a carried-forward retained partial for
+            // the same key.
+            let mut first = SourceMessageCache::load();
+            first.insert(entry_with_messages(identity, &path, vec![completed_live]));
+            first.save_if_dirty();
+
+            let mut second = SourceMessageCache::load();
+            second.insert(
+                entry_with_messages(identity, &path, vec![retained_partial])
+                    .with_retained_keys(HashSet::from([key.to_string()])),
+            );
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            assert_eq!(
+                entry.messages[0].tokens.output, 999,
+                "the merged entry must carry the completed replay's token counts, not just a \
+                 cleared retained label over the partial's own content"
+            );
+            assert!(!entry.retained_keys.contains(key));
+
+            // A following cache-hit scan (a second load with no further
+            // writes) must keep preferring the completed copy.
+            let rescan = SourceMessageCache::load();
+            let entry = rescan.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1);
+            assert_eq!(entry.messages[0].tokens.output, 999);
+            assert!(!entry.retained_keys.contains(key));
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Two writers can straddle an in-place transcript rewrite: one loads
+    /// and saves the full pre-rewrite file, the other loads the freshly
+    /// compacted file (whose parse never observed the turn compaction
+    /// dropped, since its own cache load predated the first writer's save)
+    /// and saves last. The two entries' fingerprints therefore differ, and
+    /// the merge must not let that fingerprint mismatch discard the first
+    /// writer's history — the dropped turn must survive, labeled retained
+    /// relative to this (the second writer's) generation.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_rescues_history_across_a_straddled_rewrite_fingerprint_mismatch() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let dropped = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 1,
+                    output: 777,
+                    ..Default::default()
+                },
+                0.0,
+                Some("msg_dropped:req_dropped".to_string()),
+            );
+            let kept = keyed_message(namespace, "session", "msg_kept:req_kept");
+
+            // Writer FULL parses the whole pre-rewrite file and saves first.
+            std::fs::write(&path, b"{\"id\":\"pre-rewrite\"}\n").unwrap();
+            let mut full_writer = SourceMessageCache::load();
+            full_writer.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![dropped.clone(), kept.clone()],
+            ));
+            full_writer.save_if_dirty();
+
+            // Compaction changes the fingerprint and drops `dropped`'s turn.
+            // Writer COMPACTED's own parse never saw it and saves last.
+            std::fs::write(&path, b"{\"id\":\"compacted\"}\n").unwrap();
+            let mut compacted_writer = SourceMessageCache::load();
+            compacted_writer.insert(entry_with_messages(identity, &path, vec![kept]));
+            compacted_writer.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                2,
+                "the dropped turn must survive a rewrite straddled by two writers"
+            );
+            let rescued = entry
+                .messages
+                .iter()
+                .find(|message| message.dedup_key.as_deref() == Some("msg_dropped:req_dropped"))
+                .expect("the dropped turn's content must be absorbed, not just its key");
+            assert_eq!(
+                rescued.tokens.output, 777,
+                "the rescued message must carry the pre-rewrite writer's own content"
+            );
+            assert!(
+                entry.retained_keys.contains("msg_dropped:req_dropped"),
+                "a key absent from this generation's own parse must be labeled retained, \
+                 whatever the other generation's entry called it"
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Straddle case the previous test doesn't cover: `self` does not just
+    /// lack the key, it already holds its *own* copy of it — a partial turn
+    /// parsed before the file was rewritten out from under it — while
+    /// `stored` (the earlier writer's save) holds a completed replay of the
+    /// same key under a different fingerprint. Discarding either side loses
+    /// data once compaction removes the turn from the live file entirely, so
+    /// the merge must reconcile the two copies' token counts field-by-field,
+    /// the same way the parser folds same-file streaming duplicates —
+    /// neither copy alone carries every field's true maximum.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_reconciles_token_counts_across_a_fingerprint_mismatch() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+
+            // `completed` leads on output and cache_read; `partial` leads on
+            // input. Neither field-set alone is the true maximum, so a fix
+            // that just picks one whole message over the other would still
+            // fail this.
+            let completed = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 80,
+                    output: 999,
+                    cache_read: 10,
+                    cache_write: 5,
+                    reasoning: 0,
+                },
+                0.0,
+                Some(key.to_string()),
+            );
+            // The completed record carries the finished timing; the partial
+            // was snapshotted mid-response and has a shorter one. Neither is
+            // the maximum on every field, so picking one whole message loses
+            // something either way.
+            let completed = {
+                let mut m = completed;
+                m.duration_ms = Some(4_200);
+                m
+            };
+            let partial = UnifiedMessage::new_with_dedup(
+                namespace,
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1,
+                TokenBreakdown {
+                    input: 100,
+                    output: 50,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+                Some(key.to_string()),
+            );
+            let partial = {
+                let mut m = partial;
+                m.duration_ms = Some(900);
+                m
+            };
+
+            // Writer B parses the completed form and saves first, under this
+            // generation's fingerprint.
+            std::fs::write(&path, b"{\"id\":\"generation-b\"}\n").unwrap();
+            let mut writer_b = SourceMessageCache::load();
+            writer_b.insert(entry_with_messages(identity, &path, vec![completed]));
+            writer_b.save_if_dirty();
+
+            // The file changes generation again (a straddled rewrite), and
+            // writer A — which had already parsed a stalled partial of the
+            // same turn under its own earlier generation — saves last.
+            std::fs::write(&path, b"{\"id\":\"generation-a\"}\n").unwrap();
+            let mut writer_a = SourceMessageCache::load();
+            writer_a.insert(entry_with_messages(identity, &path, vec![partial]));
+            writer_a.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            let merged = &entry.messages[0];
+            assert_eq!(
+                merged.tokens.input, 100,
+                "input: partial's field was the max"
+            );
+            assert_eq!(
+                merged.tokens.output, 999,
+                "output: completed's field was the max"
+            );
+            assert_eq!(
+                merged.duration_ms,
+                Some(4_200),
+                "duration: the completed timing must not be lost to the partial's shorter one"
+            );
+            assert_eq!(
+                merged.tokens.cache_read, 10,
+                "cache_read: completed's field was the max"
+            );
+            assert_eq!(
+                merged.tokens.cache_write, 5,
+                "cache_write: completed's field was the max"
+            );
+
+            // A following cache-hit scan (no further writes) must keep
+            // reporting the reconciled figures, not just hold them in memory.
+            let rescan = SourceMessageCache::load();
+            let entry = rescan.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1);
+            let merged = &entry.messages[0];
+            assert_eq!(merged.tokens.input, 100);
+            assert_eq!(merged.tokens.output, 999);
+            assert_eq!(merged.tokens.cache_read, 10);
+            assert_eq!(merged.duration_ms, Some(4_200));
+            assert_eq!(merged.tokens.cache_write, 5);
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Matching retained labels do not imply matching content. Writers
+    /// spanning more than one rewrite can land a partial and a completed form
+    /// of the same turn into a single fingerprint, both labeled retained. This
+    /// used to fall through untouched on the reasoning that neither side
+    /// outranked the other, which discarded the completed usage exactly the
+    /// way the cross-fingerprint case did.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_reconciles_two_retained_copies_under_one_fingerprint() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("transcript.jsonl");
+            // Written once and never changed, so both writers save under the
+            // same fingerprint.
+            std::fs::write(&path, b"{\"id\":\"one-generation\"}\n").unwrap();
+
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+            let retained: HashSet<String> = [key.to_string()].into_iter().collect();
+
+            let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.output = 999;
+            completed.tokens.cache_read = 10;
+            completed.duration_ms = Some(4_200);
+
+            let mut partial = keyed_message(namespace, "session", key);
+            partial.tokens.input = 100;
+            partial.tokens.output = 50;
+            partial.duration_ms = Some(900);
+
+            let mut writer_b = SourceMessageCache::load();
+            writer_b.insert(
+                entry_with_messages(identity, &path, vec![completed])
+                    .with_retained_keys(retained.clone()),
+            );
+            writer_b.save_if_dirty();
+
+            let mut writer_a = SourceMessageCache::load();
+            writer_a.insert(
+                entry_with_messages(identity, &path, vec![partial])
+                    .with_retained_keys(retained.clone()),
+            );
+            writer_a.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            let merged = &entry.messages[0];
+            assert_eq!(merged.tokens.input, 100, "input: partial held the max");
+            assert_eq!(merged.tokens.output, 999, "output: completed held the max");
+            assert_eq!(
+                merged.tokens.cache_read, 10,
+                "cache_read: completed held the max"
+            );
+            assert_eq!(
+                merged.duration_ms,
+                Some(4_200),
+                "duration: the completed timing must survive"
+            );
+            assert!(
+                entry.retained_keys.contains(key),
+                "both copies were retained, so the merged one stays retained"
+            );
+        }
+        restore_cache_env(prev_env);
+    }
+
+    /// Two scanners can fingerprint the same partial file and have the
+    /// response complete between their parses, so two *live* copies can
+    /// disagree under one fingerprint too. Preferring the stored one because
+    /// it is live discards the completed usage whenever the completed writer
+    /// saved last.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_reconciles_two_live_copies_under_one_fingerprint() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("transcript.jsonl");
+            std::fs::write(&path, b"{\"id\":\"one-generation\"}\n").unwrap();
+
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+
+            // Neither writer labels the key retained: both parsed it live.
+            let mut partial = keyed_message(namespace, "session", key);
+            partial.tokens.input = 100;
+            partial.tokens.output = 50;
+            partial.duration_ms = Some(900);
+
+            let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.output = 999;
+            completed.tokens.cache_read = 10;
+            completed.duration_ms = Some(4_200);
+            completed.cost = 0.25;
+            // The full generation still had the preceding user row, so it saw
+            // this reply as a turn start; the compacted parse does not.
+            completed.is_turn_start = true;
+
+            // The completed writer saves first, so its copy is the one already
+            // on disk; the partial writer saves last and its entry is the one
+            // doing the merging. This is the losing direction: whatever the
+            // merge fails to pull across from the stored copy is gone.
+            let mut writer_completed = SourceMessageCache::load();
+            writer_completed.insert(entry_with_messages(identity, &path, vec![completed]));
+            writer_completed.save_if_dirty();
+
+            let mut writer_partial = SourceMessageCache::load();
+            writer_partial.insert(entry_with_messages(identity, &path, vec![partial]));
+            writer_partial.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "the shared turn must not duplicate"
+            );
+            let merged = &entry.messages[0];
+            assert_eq!(merged.tokens.input, 100, "input: partial held the max");
+            assert_eq!(merged.tokens.output, 999, "output: completed held the max");
+            assert_eq!(
+                merged.tokens.cache_read, 10,
+                "cache_read: completed held the max"
+            );
+            assert_eq!(
+                merged.duration_ms,
+                Some(4_200),
+                "duration: the completed timing must survive"
+            );
+            assert!(
+                merged.is_turn_start,
+                "turn start: a marker either side asserted must survive, or turn_count silently drops it"
+            );
+            assert_eq!(
+                merged.cost, 0.25,
+                "cost must track the reconciled tokens, not the copy this entry started from"
+            );
+            assert!(
+                !entry.retained_keys.contains(key),
+                "neither copy was retained, so the merged one is not either"
+            );
+        }
+        restore_cache_env(prev_env);
+    }
+
+    /// A Claude tool-result key embeds the transcript stem. It cannot collapse
+    /// against a replay under a forked filename, so save-time retention must
+    /// leave it behind even though assistant history is unioned.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_does_not_union_path_scoped_keys() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let shared = keyed_message(namespace, "session", "msg_shared:req_shared");
+            let tool_result = keyed_message(
+                namespace,
+                "session",
+                "claude:tool_result:conversation:tool_result:toolu_1",
+            );
+
+            let mut first = SourceMessageCache::load();
+            first.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![shared.clone(), tool_result],
+            ));
+            first.save_if_dirty();
+
+            let mut second = SourceMessageCache::load();
+            second.insert(entry_with_messages(identity, &path, vec![shared]));
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1);
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// Non-retaining clients still replace a changed entry wholesale. The
+    /// direct cross-namespace assertion also pins the guard: even a retaining
+    /// Claude receiver must not absorb a stored entry owned by another client.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_still_replaces_entries_for_non_retaining_clients() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("rollout.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Codex);
+            let namespace = ClientId::Codex.as_str();
+
+            let mut first = SourceMessageCache::load();
+            first.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![
+                    keyed_message(namespace, "session", "codex-key-a"),
+                    keyed_message(namespace, "session", "codex-key-b"),
+                ],
+            ));
+            first.save_if_dirty();
+
+            let mut second = SourceMessageCache::load();
+            second.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![keyed_message(namespace, "session", "codex-key-a")],
+            ));
+            second.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            assert_eq!(loaded.get(identity, &path).unwrap().messages.len(), 1);
+
+            let claude = CacheIdentity::for_client(ClientId::Claude);
+            let mut current = entry_with_messages(
+                claude,
+                &path,
+                vec![keyed_message(claude.namespace, "session", "claude-current")],
+            );
+            let foreign = entry_with_messages(
+                identity,
+                &path,
+                vec![keyed_message(namespace, "session", "codex-foreign")],
+            );
+            current.absorb_retained_history(&foreign);
+            assert_eq!(current.messages.len(), 1);
+        }
+
+        restore_cache_env(prev_env);
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_parser_versions_are_identity_scoped() {
@@ -3188,11 +4446,21 @@ mod tests {
         assert_eq!(parser_version(ClientId::Jcode), 4);
         assert_eq!(parser_version(ClientId::Copilot), 4);
         assert_eq!(parser_version(ClientId::Grok), 3);
+        // RET-CLAUDE-001: bumped for retention of history-only turns dropped
+        // by a Claude Code transcript rewrite. The shared `retained_keys`
+        // field this needed is a layout change covered by
+        // `CACHE_FORMAT_VERSION` instead, since it affects every namespace's
+        // serialized entries, not just Claude's.
+        assert_eq!(parser_version(ClientId::Claude), 2);
         assert_eq!(CacheIdentity::synthetic().parser_version, 1);
         for client in ClientId::iter() {
             if !matches!(
                 client,
-                ClientId::Codex | ClientId::Jcode | ClientId::Copilot | ClientId::Grok
+                ClientId::Codex
+                    | ClientId::Jcode
+                    | ClientId::Copilot
+                    | ClientId::Grok
+                    | ClientId::Claude
             ) {
                 assert_eq!(
                     parser_version(client),

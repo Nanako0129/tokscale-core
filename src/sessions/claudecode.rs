@@ -81,6 +81,24 @@ pub struct ClaudeUsage {
     pub cache_creation_input_tokens: Option<i64>,
 }
 
+/// Tier 1 of subagent resolution on its own: the sibling `.meta.json` sidecar's
+/// `agentType`, which needs nothing but the transcript path.
+///
+/// Split out because the retained-message refresh can reach this tier and no
+/// other: tiers 2 and 3 need a parent session id and a parent-subagent cache
+/// that the refresh has no access to.
+fn subagent_name_from_meta_sidecar(path: &Path) -> Option<String> {
+    let stem = path.file_stem().and_then(|s| s.to_str())?;
+    let meta_path = path.with_file_name(format!("{}.meta.json", stem));
+    let text = std::fs::read_to_string(&meta_path).ok()?;
+    let meta = serde_json::from_str::<AgentMetaFile>(&text).ok()?;
+    let agent_type = meta.agent_type?;
+    if agent_type.trim().is_empty() {
+        return None;
+    }
+    Some(normalize_agent_name(&agent_type))
+}
+
 /// Resolve the subagent display name for a sidechain transcript file.
 ///
 /// Tier 1: Read the sibling `.meta.json` sidecar for the `agentType` field.
@@ -98,15 +116,8 @@ fn resolve_subagent_name(
     };
 
     // Tier 1: sibling meta.json (e.g. agent-abc123.meta.json next to agent-abc123.jsonl)
-    let meta_path = path.with_file_name(format!("{}.meta.json", stem));
-    if let Ok(text) = std::fs::read_to_string(&meta_path) {
-        if let Ok(meta) = serde_json::from_str::<AgentMetaFile>(&text) {
-            if let Some(ref agent_type) = meta.agent_type {
-                if !agent_type.trim().is_empty() {
-                    return normalize_agent_name(agent_type);
-                }
-            }
-        }
+    if let Some(from_meta) = subagent_name_from_meta_sidecar(path) {
+        return from_meta;
     }
 
     // Tier 2: parent session tool_use inference
@@ -926,6 +937,106 @@ struct ClaudeToolResultUsage {
     dedup_key: Option<String>,
 }
 
+/// The segment that marks a dedup key as scoped to one transcript file.
+/// `tool_result_dedup_key` puts the session id — which is the transcript's
+/// file stem — behind it.
+const PATH_SCOPED_KEY_MARKER: &str = ":tool_result:";
+
+/// Whether a dedup key this parser mints identifies its message by content
+/// wherever that message happens to be written.
+///
+/// Assistant keys are `messageId:requestId` (or `message:{id}` when the
+/// transcript recorded no request id). Both come straight out of the API
+/// response, so the same turn replayed into a forked transcript keys
+/// identically and the two copies collapse at the cross-file dedup.
+/// Tool-result keys do not: they embed the session id, so the same tool result
+/// under a new filename is a different key and both copies count.
+///
+/// Only globally stable keys may be carried across an in-place rewrite. A
+/// retained path-scoped copy could never collapse against a live replay of
+/// itself, so retaining one would double count its input tokens.
+pub(crate) fn dedup_key_is_globally_stable(key: &str) -> bool {
+    !key.contains(PATH_SCOPED_KEY_MARKER)
+}
+
+/// Rebuild the parser-derived context on a message retained across an
+/// in-place transcript rewrite (see RET-CLAUDE-001), so it reflects the
+/// *current* parse of `path` rather than the parse that first cached it.
+///
+/// `client`, `provider_id` and the workspace fields are recomputed from
+/// `path`/`home_dir` exactly as a fresh parse would derive them — a
+/// `cc-mirror/variant.json` name or provider edit changes the Claude
+/// fingerprint without touching the transcript body, and a retained message
+/// must not keep the stale values from the parse that originally cached it.
+/// `provider_id` is rebuilt from zero confidence, not seeded from the
+/// retained message's own stale value: `stored_claude_provider_confidence`
+/// on that value would reflect the cached parse's provider, and
+/// `update_claude_provider_id` only overrides on strictly higher confidence,
+/// so a stale non-Anthropic hint could outrank the current parse's Anthropic
+/// or default candidate and survive the very refresh meant to reconcile it.
+/// Seeding at zero lets the current parse's candidate win unconditionally,
+/// matching what a fresh parse of `path` would produce.
+///
+/// `agent` (sidechain resolution) is uniform across every message a single
+/// parse of one file produces, so the caller threads it through from a live
+/// sibling in this same scan (`live_agent`) instead of re-deriving it here;
+/// re-deriving it would need the file's first raw entry and a parent-session
+/// cache, neither of which is reachable at this point. When the live parse
+/// produced no sibling at all (the whole file's messages are now retained),
+/// `live_agent` is `None` and the message's agent is left as-is: the cached
+/// agent is the last successful resolution for that turn, and with no live
+/// evidence to replace it, it is better than clearing it to the main/unknown
+/// bucket.
+///
+/// Token counts, timestamps and the dedup key are intrinsic to the message
+/// and are left untouched.
+pub(crate) fn refresh_retained_message_context(
+    message: &mut UnifiedMessage,
+    path: &Path,
+    home_dir: Option<&Path>,
+    live_agent: Option<&str>,
+) {
+    let (workspace_key, workspace_label) = claude_workspace_from_path(path);
+    message.set_workspace(workspace_key, workspace_label);
+
+    let cc_mirror_metadata = cc_mirror_variant_metadata_from_path(path, home_dir);
+    message.client = cc_mirror_metadata
+        .as_ref()
+        .map(CcMirrorVariantMetadata::client_id)
+        .unwrap_or_else(|| "claude".to_string());
+
+    let provider_hint = cc_mirror_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.provider_id.as_deref());
+    let mut confidence = 0;
+    if let Some(choice) =
+        claude_provider_choice_from_parts(Some(message.model_id.as_str()), provider_hint)
+    {
+        update_claude_provider_id(&mut message.provider_id, &mut confidence, choice);
+    }
+
+    if let Some(agent) = live_agent {
+        message.agent = Some(agent.to_string());
+    } else if let Some(from_meta) = subagent_name_from_meta_sidecar(path) {
+        // No live sibling is not the same as no current metadata. The sibling
+        // `.meta.json` is part of this file's fingerprint, so a change to it
+        // reparsed the entry in the first place; reading it here keeps a
+        // retained-only sidechain turn from staying on the agent name that was
+        // current when it was cached. Tiers 2 and 3 of `resolve_subagent_name`
+        // stay out of reach -- they need a parent session id and cache this
+        // call does not have -- so a transcript with no sidecar still keeps
+        // its cached agent rather than falling back to the generic label.
+        message.agent = Some(from_meta);
+    }
+}
+
+/// A tool_use id is only unique within the conversation that issued it, so the
+/// key is deliberately scoped to the session. See `dedup_key_is_globally_stable`
+/// for what that costs.
+fn tool_result_dedup_key(client_id: &str, session_id: &str, usage_key: &str) -> String {
+    format!("{client_id}{PATH_SCOPED_KEY_MARKER}{session_id}:{usage_key}")
+}
+
 struct ClaudeToolResultContext<'a> {
     entry: &'a ClaudeEntry,
     last_model: Option<&'a str>,
@@ -997,12 +1108,9 @@ fn extract_claude_tool_result_message(
             reasoning: 0,
         },
         0.0,
-        usage.dedup_key.map(|key| {
-            format!(
-                "{}:tool_result:{}:{key}",
-                context.client_id, context.session_id
-            )
-        }),
+        usage
+            .dedup_key
+            .map(|key| tool_result_dedup_key(context.client_id, context.session_id, &key)),
     );
     message.message_count = 0;
     message.agent = context.sidechain_agent;
@@ -1933,6 +2041,64 @@ mod tests {
         assert_eq!(messages[0].timestamp, 1_733_047_200_000);
         assert_eq!(messages[0].duration_ms, Some(3500));
         assert_eq!(messages[0].dedup_key.as_deref(), Some("message:msg_stream"));
+    }
+
+    /// History retention across an in-place transcript rewrite is only sound
+    /// for keys that identify a message by content across files. This pins
+    /// which of the parser's own key shapes qualify, so a future key change
+    /// trips here rather than silently making a retained copy double count.
+    #[test]
+    fn test_only_content_derived_dedup_keys_are_globally_stable() {
+        // Classify keys the parser actually mints, not literals or keys this
+        // test builds with the same helper it is checking. Retention carries
+        // every key this classifier calls stable across an in-place rewrite,
+        // so a future parser change that introduces another file-scoped shape
+        // has to trip here rather than silently widening what is retained.
+        let content = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}
+{"type":"user","timestamp":"2024-12-01T10:00:01.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"tu_001","content":"file contents here"}]}}
+{"type":"assistant","timestamp":"2024-12-01T10:00:02.000Z","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":80}}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+        let keys: Vec<String> = messages
+            .iter()
+            .filter_map(|message| message.dedup_key.clone())
+            .collect();
+
+        let (file_scoped, content_derived): (Vec<&String>, Vec<&String>) =
+            keys.iter().partition(|key| key.contains(":tool_result:"));
+
+        assert_eq!(
+            file_scoped.len(),
+            1,
+            "fixture must produce exactly one tool-result key, got {keys:?}"
+        );
+        assert_eq!(
+            content_derived.len(),
+            2,
+            "fixture must produce both assistant key shapes, got {keys:?}"
+        );
+        // `messageId:requestId` and the `message:{id}` fallback when the
+        // transcript recorded no request id.
+        assert!(content_derived
+            .iter()
+            .any(|key| key.starts_with("msg_001:")));
+        assert!(content_derived
+            .iter()
+            .any(|key| key.as_str() == "message:msg_002"));
+
+        for key in &file_scoped {
+            assert!(
+                !dedup_key_is_globally_stable(key),
+                "a key scoped to one transcript must never be retained: {key}"
+            );
+        }
+        for key in &content_derived {
+            assert!(
+                dedup_key_is_globally_stable(key),
+                "content-derived assistant keys must survive a rewrite: {key}"
+            );
+        }
     }
 
     #[test]
