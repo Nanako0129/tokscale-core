@@ -76,7 +76,10 @@ fn parse_session(client: &str, session: &serde_json::Value) -> Option<UnifiedMes
     // `usage_time` near `i64::MAX` would panic in debug builds and silently
     // wrap to a negative timestamp in release builds.
     let timestamp_ms = usage_time.checked_mul(1000)?;
-    let cost = session["dollar_float"].as_f64().unwrap_or(0.0);
+    let provider_cost = session
+        .get("dollar_float")
+        .and_then(|value| value.as_f64())
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
 
     let extra = &session["extra_info"];
     let input = extra["input_token"].as_i64().unwrap_or(0);
@@ -90,7 +93,7 @@ fn parse_session(client: &str, session: &serde_json::Value) -> Option<UnifiedMes
 
     let dedup_key = Some(format!("trae:{}:{}", session_id, usage_time));
 
-    Some(UnifiedMessage::new_with_dedup(
+    let mut message = UnifiedMessage::new_with_dedup(
         client,
         model_id,
         provider,
@@ -103,9 +106,13 @@ fn parse_session(client: &str, session: &serde_json::Value) -> Option<UnifiedMes
             cache_write,
             reasoning: 0,
         },
-        cost,
+        provider_cost.unwrap_or(0.0),
         dedup_key,
-    ))
+    );
+    if provider_cost.is_some() {
+        message.mark_provider_reported_cost();
+    }
+    Some(message)
 }
 
 /// Parse a cache file containing an array of sessions as returned by the API.
@@ -173,8 +180,42 @@ mod tests {
         assert_eq!(m.tokens.cache_read, 200);
         assert_eq!(m.tokens.cache_write, 100);
         assert_eq!(m.cost, 0.5);
+        assert!(m.has_authoritative_cost());
         // timestamp: epoch seconds → ms
         assert_eq!(m.timestamp, 1_776_000_000_000);
+    }
+
+    #[test]
+    fn test_cost_provenance_requires_valid_dollar_float() {
+        let json = serde_json::json!([
+            {
+                "model_name": "GPT-5.4",
+                "session_id": "zero-cost",
+                "usage_time": 1776000000,
+                "dollar_float": 0.0,
+                "extra_info": { "input_token": 10, "output_token": 1 }
+            },
+            {
+                "model_name": "GPT-5.4",
+                "session_id": "missing-cost",
+                "usage_time": 1776000001,
+                "extra_info": { "input_token": 10, "output_token": 1 }
+            },
+            {
+                "model_name": "GPT-5.4",
+                "session_id": "invalid-cost",
+                "usage_time": 1776000002,
+                "dollar_float": -0.1,
+                "extra_info": { "input_token": 10, "output_token": 1 }
+            }
+        ]);
+        let f = write_fixture(&json.to_string());
+
+        let messages = parse_trae_file("trae", f.path());
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].has_authoritative_cost());
+        assert!(!messages[1].has_authoritative_cost());
+        assert!(!messages[2].has_authoritative_cost());
     }
 
     #[test]

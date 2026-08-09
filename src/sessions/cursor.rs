@@ -175,7 +175,7 @@ pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
         // Input tokens = input_without_cache_write
         let input = input_without_cache_write;
 
-        messages.push(UnifiedMessage::new(
+        let mut message = UnifiedMessage::new(
             "cursor",
             model,
             infer_provider(model),
@@ -189,7 +189,11 @@ pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
                 reasoning: 0,
             },
             cost.max(0.0),
-        ));
+        );
+        if cost > 0.0 {
+            message.mark_provider_reported_cost();
+        }
+        messages.push(message);
     }
 
     messages
@@ -333,8 +337,10 @@ mod tests {
         assert_eq!(messages[0].tokens.output, 15);
         assert_eq!(messages[0].tokens.cache_write, 5); // 10 - 5
         assert!((messages[0].cost - 0.10).abs() < 0.001);
+        assert!(messages[0].has_authoritative_cost());
 
         assert_eq!(messages[1].model_id, "gpt-4o-mini");
+        assert!(messages[1].has_authoritative_cost());
     }
 
     #[test]
@@ -360,6 +366,7 @@ mod tests {
         assert_eq!(messages[0].tokens.cache_read, 105891);
         assert_eq!(messages[0].tokens.cache_write, 28342 - 775); // 27567
         assert!((messages[0].cost - 0.19).abs() < 0.001);
+        assert!(messages[0].has_authoritative_cost());
 
         // Second message: gpt-5-codex
         assert_eq!(messages[1].model_id, "gpt-5-codex");
@@ -388,13 +395,16 @@ mod tests {
         assert_eq!(messages[0].model_id, "composer-2");
         assert_eq!(messages[0].cost, 0.0);
         assert_eq!(messages[0].tokens.cache_read, 29045760);
+        assert!(!messages[0].has_authoritative_cost());
 
         // Second message: actual cost from "On-Demand"
         assert_eq!(messages[1].model_id, "composer-2");
         assert!((messages[1].cost - 0.11).abs() < 0.001);
+        assert!(messages[1].has_authoritative_cost());
 
         // Third message: "-" cost should be 0 (Errored, No Charge)
         assert_eq!(messages[2].model_id, "composer-2");
         assert_eq!(messages[2].cost, 0.0);
+        assert!(!messages[2].has_authoritative_cost());
     }
 }

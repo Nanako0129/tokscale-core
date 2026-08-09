@@ -75,6 +75,10 @@ fn get_provider_from_model(model: &str) -> &'static str {
     provider_identity::inferred_provider_from_model(model).unwrap_or("anthropic")
 }
 
+fn valid_amp_cost(cost: Option<f64>) -> Option<f64> {
+    cost.filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+
 #[derive(Debug, Clone)]
 struct AmpUsageRecord {
     model: String,
@@ -83,7 +87,7 @@ struct AmpUsageRecord {
     message_id: Option<i64>,
     ledger_to_message_id: Option<i64>,
     tokens: TokenBreakdown,
-    cost: f64,
+    cost: Option<f64>,
 }
 
 impl AmpUsageRecord {
@@ -92,15 +96,20 @@ impl AmpUsageRecord {
     }
 
     fn into_unified(self, thread_id: &str) -> UnifiedMessage {
-        UnifiedMessage::new(
+        let provider_cost = self.cost;
+        let mut message = UnifiedMessage::new(
             "amp",
             &self.model,
             get_provider_from_model(&self.model),
             thread_id.to_string(),
             self.timestamp,
             self.tokens,
-            self.cost,
-        )
+            provider_cost.unwrap_or(0.0),
+        );
+        if provider_cost.is_some() {
+            message.mark_provider_reported_cost();
+        }
+        message
     }
 }
 
@@ -161,7 +170,7 @@ fn parse_amp_ledger_records(
                     cache_write: tokens.cache_creation_input_tokens.unwrap_or(0).max(0),
                     reasoning: 0,
                 },
-                cost: event.credits.unwrap_or(0.0).max(0.0),
+                cost: valid_amp_cost(event.credits),
             })
         })
         .collect()
@@ -207,7 +216,7 @@ fn parse_amp_message_records(
                     cache_write: usage.cache_creation_input_tokens.unwrap_or(0).max(0),
                     reasoning: 0,
                 },
-                cost: usage.credits.unwrap_or(0.0).max(0.0),
+                cost: valid_amp_cost(usage.credits),
             })
         })
         .collect()
@@ -243,7 +252,7 @@ fn merge_amp_records(
     message_record: &AmpUsageRecord,
 ) -> AmpUsageRecord {
     if ledger_record.has_explicit_timestamp {
-        if ledger_record.cost > 0.0 || message_record.cost <= 0.0 {
+        if ledger_record.cost.is_some() {
             ledger_record
         } else {
             AmpUsageRecord {
@@ -260,11 +269,7 @@ fn merge_amp_records(
             message_id: message_record.message_id,
             ledger_to_message_id: ledger_record.ledger_to_message_id,
             tokens: ledger_record.tokens,
-            cost: if ledger_record.cost > 0.0 {
-                ledger_record.cost
-            } else {
-                message_record.cost
-            },
+            cost: ledger_record.cost.or(message_record.cost),
         }
     }
 }
@@ -416,6 +421,9 @@ mod tests {
         assert_eq!(messages[1].date, local_date(timestamp_ms(ledger_timestamp)));
         assert_eq!(messages[0].tokens.input, 50);
         assert_eq!(messages[1].tokens.input, 100);
+        assert!(messages
+            .iter()
+            .all(|message| message.has_authoritative_cost()));
     }
 
     #[test]
@@ -618,5 +626,63 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].timestamp >= file_mtime_ms);
         assert_ne!(messages[0].date, "1970-01-01");
+    }
+
+    #[test]
+    fn test_parse_amp_preserves_zero_and_missing_cost_provenance() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("T-cost-provenance.json");
+
+        write_amp_thread(
+            &path,
+            &serde_json::json!({
+                "id": "thread-cost-provenance",
+                "created": timestamp_ms("2026-04-04T12:00:00Z"),
+                "usageLedger": {
+                    "events": [
+                        {
+                            "timestamp": "2026-04-04T12:00:00Z",
+                            "model": "claude-sonnet-4-0",
+                            "credits": 0.0,
+                            "tokens": { "input": 10, "output": 1 }
+                        },
+                        {
+                            "timestamp": "2026-04-04T12:01:00Z",
+                            "model": "claude-sonnet-4-0",
+                            "tokens": { "input": 20, "output": 2 }
+                        }
+                    ]
+                },
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "messageId": 1,
+                        "usage": {
+                            "model": "claude-sonnet-4-0",
+                            "inputTokens": 10,
+                            "outputTokens": 1,
+                            "credits": 0.75
+                        }
+                    },
+                    {
+                        "role": "assistant",
+                        "messageId": 2,
+                        "usage": {
+                            "model": "claude-sonnet-4-0",
+                            "inputTokens": 20,
+                            "outputTokens": 2
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        );
+
+        let messages = parse_amp_file(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].cost, 0.0);
+        assert!(messages[0].has_authoritative_cost());
+        assert_eq!(messages[1].cost, 0.0);
+        assert!(!messages[1].has_authoritative_cost());
     }
 }

@@ -42,6 +42,12 @@ pub struct MuxLastRequest {
     pub timestamp: Option<i64>,
 }
 
+fn valid_mux_cost(bucket: Option<&MuxTokenBucket>) -> Option<f64> {
+    bucket
+        .and_then(|bucket| bucket.cost_usd)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+
 /// Parse a mux session-usage.json file.
 /// Returns one UnifiedMessage per model entry in byModel.
 pub fn parse_mux_file(path: &Path) -> Vec<UnifiedMessage> {
@@ -76,8 +82,10 @@ pub fn parse_mux_file(path: &Path) -> Vec<UnifiedMessage> {
         .filter_map(|(model_key, model_usage)| {
             let tokens =
                 |b: &Option<MuxTokenBucket>| b.as_ref().and_then(|b| b.tokens).unwrap_or(0).max(0);
-            let cost =
-                |b: &Option<MuxTokenBucket>| b.as_ref().and_then(|b| b.cost_usd).unwrap_or(0.0);
+            let cost = |b: &Option<MuxTokenBucket>| valid_mux_cost(b.as_ref()).unwrap_or(0.0);
+            let missing_cost = |b: &Option<MuxTokenBucket>, token_count: i64| {
+                token_count > 0 && valid_mux_cost(b.as_ref()).is_none()
+            };
             let input = tokens(&model_usage.input);
             let cached = tokens(&model_usage.cached);
             let cache_create = tokens(&model_usage.cache_create);
@@ -88,6 +96,11 @@ pub fn parse_mux_file(path: &Path) -> Vec<UnifiedMessage> {
                 + cost(&model_usage.cache_create)
                 + cost(&model_usage.output)
                 + cost(&model_usage.reasoning);
+            let has_unknown_cost = missing_cost(&model_usage.input, input)
+                || missing_cost(&model_usage.cached, cached)
+                || missing_cost(&model_usage.cache_create, cache_create)
+                || missing_cost(&model_usage.output, output)
+                || missing_cost(&model_usage.reasoning, reasoning);
 
             if input == 0 && cached == 0 && cache_create == 0 && output == 0 && reasoning == 0 {
                 return None;
@@ -113,7 +126,7 @@ pub fn parse_mux_file(path: &Path) -> Vec<UnifiedMessage> {
             };
             let provider = provider_identity::canonical_provider(&provider).unwrap_or(provider);
 
-            Some(UnifiedMessage::new_with_dedup(
+            let mut message = UnifiedMessage::new_with_dedup(
                 "mux",
                 model_id,
                 provider,
@@ -128,7 +141,11 @@ pub fn parse_mux_file(path: &Path) -> Vec<UnifiedMessage> {
                 },
                 source_cost,
                 dedup_key,
-            ))
+            );
+            if !has_unknown_cost {
+                message.mark_provider_reported_cost();
+            }
+            Some(message)
         })
         .collect()
 }
@@ -188,11 +205,13 @@ mod tests {
         assert_eq!(claude.tokens.output, 300);
         assert_eq!(claude.tokens.reasoning, 0);
         assert_eq!(claude.timestamp, 1700000000000);
+        assert!(claude.has_authoritative_cost());
 
         let gpt = msgs.iter().find(|m| m.model_id == "gpt-4o").unwrap();
         assert_eq!(gpt.provider_id, "openai");
         assert_eq!(gpt.tokens.input, 50);
         assert_eq!(gpt.tokens.output, 150);
+        assert!(gpt.has_authoritative_cost());
     }
 
     #[test]
@@ -232,6 +251,25 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_token_missing_cost_does_not_downgrade_coverage() {
+        let json = r#"{
+            "version": 1,
+            "byModel": {
+                "anthropic:claude-opus-4-6": {
+                    "input": { "tokens": 100, "cost_usd": 0 },
+                    "output": { "tokens": 0 }
+                }
+            },
+            "lastRequest": { "timestamp": 1700000000000 }
+        }"#;
+        let f = write_temp_json(json);
+        let msgs = parse_mux_file(f.path());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].cost, 0.0);
+        assert!(msgs[0].has_authoritative_cost());
+    }
+
+    #[test]
     fn test_model_without_provider_prefix() {
         let json = r#"{
             "version": 1,
@@ -248,6 +286,7 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].model_id, "claude-opus-4-6");
         assert_eq!(msgs[0].provider_id, "");
+        assert!(!msgs[0].has_authoritative_cost());
     }
 
     #[test]

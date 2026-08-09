@@ -29,6 +29,10 @@ fn resolved_provider(billing_provider: Option<String>, model_id: &str) -> String
         .unwrap_or_else(|| "hermes".to_string())
 }
 
+fn valid_cost(cost: Option<f64>) -> Option<f64> {
+    cost.filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+
 pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
     let conn = match Connection::open_with_flags(
         db_path,
@@ -68,7 +72,11 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             COALESCE(cache_read_tokens, 0) > 0 OR
             COALESCE(cache_write_tokens, 0) > 0 OR
             COALESCE(reasoning_tokens, 0) > 0 OR
-            COALESCE(actual_cost_usd, estimated_cost_usd, 0) > 0
+            COALESCE(
+              CASE WHEN actual_cost_usd >= 0 THEN actual_cost_usd END,
+              CASE WHEN estimated_cost_usd >= 0 THEN estimated_cost_usd END,
+              0
+            ) > 0
           )
     "#;
 
@@ -138,6 +146,14 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             actual_cost,
         )| {
             let provider = resolved_provider(billing_provider, &model_id);
+            let (cost, is_provider_reported, is_estimated) =
+                if let Some(cost) = valid_cost(actual_cost) {
+                    (cost, true, false)
+                } else if let Some(cost) = valid_cost(estimated_cost) {
+                    (cost, false, true)
+                } else {
+                    (0.0, false, false)
+                };
             let mut msg = UnifiedMessage::new_with_agent(
                 "hermes",
                 model_id,
@@ -151,13 +167,114 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                     cache_write: cache_write.max(0),
                     reasoning: reasoning.max(0),
                 },
-                actual_cost.or(estimated_cost).unwrap_or(0.0).max(0.0),
+                cost,
                 Some(HERMES_AGENT_NAME.to_string()),
             );
+            if is_provider_reported {
+                msg.mark_provider_reported_cost();
+            } else if is_estimated {
+                msg.mark_estimated_cost();
+            }
             msg.message_count = message_count.max(0);
             msg.dedup_key = Some(session_id);
             msg
         },
     )
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    fn create_test_db() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                model TEXT,
+                billing_provider TEXT,
+                started_at REAL,
+                message_count INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL
+            );",
+        )
+        .unwrap();
+        (dir, db_path)
+    }
+
+    #[test]
+    fn test_parse_hermes_cost_provenance_prefers_actual_zero() {
+        let (_dir, db_path) = create_test_db();
+        let conn = Connection::open(&db_path).unwrap();
+        for (id, input_tokens, estimated, actual) in [
+            ("actual-zero", 10_i64, Some(0.75), Some(0.0)),
+            ("estimated", 10_i64, Some(0.25), None),
+            ("invalid-actual", 0_i64, Some(0.4), Some(-0.1)),
+            ("unknown", 10_i64, Some(-0.1), Some(-0.2)),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (
+                    id, model, billing_provider, started_at, message_count,
+                    input_tokens, output_tokens, cache_read_tokens,
+                    cache_write_tokens, reasoning_tokens, estimated_cost_usd,
+                    actual_cost_usd
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    id,
+                    "gpt-5",
+                    "openai",
+                    1_700_000_000.0_f64,
+                    1_i32,
+                    input_tokens,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    estimated,
+                    actual,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let messages = parse_hermes_sqlite(&db_path);
+        assert_eq!(messages.len(), 4);
+
+        let message = |id: &str| {
+            messages
+                .iter()
+                .find(|message| message.session_id == id)
+                .unwrap()
+        };
+        assert_eq!(message("actual-zero").cost, 0.0);
+        assert_eq!(
+            message("actual-zero").cost_source,
+            crate::sessions::CostSource::ProviderReported
+        );
+        assert_eq!(
+            message("estimated").cost_source,
+            crate::sessions::CostSource::Estimated
+        );
+        assert_eq!(message("invalid-actual").cost, 0.4);
+        assert_eq!(
+            message("invalid-actual").cost_source,
+            crate::sessions::CostSource::Estimated
+        );
+        assert_eq!(
+            message("unknown").cost_source,
+            crate::sessions::CostSource::Unknown
+        );
+    }
 }

@@ -6043,7 +6043,7 @@ mod tests {
     fn graph_contract_is_bound_to_each_result_after_interleaving() {
         let message = graph_test_message(10, 0.75, CostSource::ProviderReported);
         let local = super::build_graph_result_with_contract_from_messages(
-            &[message.clone()],
+            std::slice::from_ref(&message),
             None,
             GraphPricingMode::LocalOnly,
         );
