@@ -458,6 +458,56 @@ pub struct DataSummary {
     pub models: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GraphPricingMode {
+    LocalOnly,
+    BestEffort,
+}
+
+impl GraphPricingMode {
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "localOnly",
+            Self::BestEffort => "bestEffort",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CostCoverage {
+    Complete,
+    Partial,
+    None,
+}
+
+impl CostCoverage {
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphMetaContract {
+    pub pricing_mode: GraphPricingMode,
+    pub cost_coverage: CostCoverage,
+}
+
+impl Default for GraphMetaContract {
+    fn default() -> Self {
+        Self {
+            pricing_mode: GraphPricingMode::BestEffort,
+            cost_coverage: CostCoverage::Complete,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GraphMeta {
     pub generated_at: String,
@@ -475,6 +525,33 @@ pub struct GraphResult {
     pub contributions: Vec<DailyContribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_metrics: Option<sessionize::TimeMetrics>,
+}
+
+/// A graph plus the immutable per-call metadata contract that describes it.
+/// The contract travels with the graph instead of through process or thread
+/// state, so interleaved reports cannot change an already-produced result.
+#[derive(Debug, Clone)]
+pub struct GraphResultWithContract {
+    graph: GraphResult,
+    contract: GraphMetaContract,
+}
+
+impl GraphResultWithContract {
+    pub fn graph(&self) -> &GraphResult {
+        &self.graph
+    }
+
+    pub fn contract(&self) -> GraphMetaContract {
+        self.contract
+    }
+
+    pub fn into_parts(self) -> (GraphResult, GraphMetaContract) {
+        (self.graph, self.contract)
+    }
+
+    pub fn into_graph(self) -> GraphResult {
+        self.graph
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4168,10 +4245,70 @@ where
     source_cache.save_if_dirty();
 }
 
+#[derive(Debug, Default)]
+struct CostCoverageFold {
+    known: bool,
+    unknown: bool,
+}
+
+impl CostCoverageFold {
+    fn observe(&mut self, message: &UnifiedMessage) {
+        // Structural rows (no tokens and no cost authority) do not affect
+        // coverage. ProviderReported remains relevant even at a legitimate
+        // zero cost; CostSource is the provenance source of truth.
+        let cost_relevant = message.tokens.total() > 0
+            || message.cost > 0.0
+            || message.cost_source == CostSource::ProviderReported;
+        if !cost_relevant {
+            return;
+        }
+
+        match message.cost_source {
+            CostSource::ProviderReported | CostSource::Estimated => self.known = true,
+            CostSource::Unknown => self.unknown = true,
+        }
+    }
+
+    fn finish(self) -> CostCoverage {
+        if !self.unknown {
+            CostCoverage::Complete
+        } else if self.known {
+            CostCoverage::Partial
+        } else {
+            CostCoverage::None
+        }
+    }
+}
+
+fn coverage_for_messages<'a>(messages: impl IntoIterator<Item = &'a UnifiedMessage>) -> CostCoverage {
+    let mut fold = CostCoverageFold::default();
+    for message in messages {
+        fold.observe(message);
+    }
+    fold.finish()
+}
+
+async fn resolve_graph_pricing<F, Fut>(
+    mode: GraphPricingMode,
+    loader: F,
+) -> Result<Option<Arc<pricing::PricingService>>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Arc<pricing::PricingService>>, String>>,
+{
+    match mode {
+        // The branch is deliberately before invoking the closure: local-first
+        // has no reachable pricing loader or outbound pricing seam.
+        GraphPricingMode::LocalOnly => Ok(None),
+        GraphPricingMode::BestEffort => loader().await,
+    }
+}
+
 async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
-) -> Result<GraphResult, String> {
+    pricing_mode: GraphPricingMode,
+) -> Result<GraphResultWithContract, String> {
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -4200,6 +4337,7 @@ async fn generate_graph_with_loaded_pricing(
     // since the driver already guarantees uniqueness.
     let mut day_agg = aggregator::StreamingAggregator::new();
     let mut sess_agg = sessionize::SessionizeAccumulator::new();
+    let mut coverage = CostCoverageFold::default();
 
     scan_messages_streaming(
         &home_dir,
@@ -4209,10 +4347,16 @@ async fn generate_graph_with_loaded_pricing(
         &options.scanner_settings,
         &msg_filter,
         &mut |m: &UnifiedMessage| {
+            coverage.observe(m);
             day_agg.feed_pre_deduped(m);
             sess_agg.feed(m);
         },
     );
+
+    let contract = GraphMetaContract {
+        pricing_mode,
+        cost_coverage: coverage.finish(),
+    };
 
     let contributions = day_agg.finalize();
     let intervals = sess_agg.finalize(sessionize::DEFAULT_IDLE_GAP_MS);
@@ -4230,7 +4374,10 @@ async fn generate_graph_with_loaded_pricing(
         }
     }
 
-    Ok(result)
+    Ok(GraphResultWithContract {
+        graph: result,
+        contract,
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4270,13 +4417,39 @@ pub async fn get_time_metrics_report(options: ReportOptions) -> Result<TimeMetri
 }
 
 pub async fn generate_graph(options: ReportOptions) -> Result<GraphResult, String> {
-    let pricing = pricing::PricingService::get_or_init().await?;
-    generate_graph_with_loaded_pricing(options, Some(&pricing)).await
+    let pricing = resolve_graph_pricing(GraphPricingMode::BestEffort, || async {
+        pricing::PricingService::get_or_init().await.map(Some)
+    })
+    .await?;
+    Ok(generate_graph_with_loaded_pricing(options, pricing.as_deref(), GraphPricingMode::BestEffort)
+        .await?
+        .into_graph())
 }
 
 pub async fn generate_local_graph_report(options: ReportOptions) -> Result<GraphResult, String> {
-    let pricing = load_pricing_for_local_parse().await;
-    generate_graph_with_loaded_pricing(options, pricing.as_deref()).await
+    Ok(generate_local_graph_report_with_contract(options)
+        .await?
+        .into_graph())
+}
+
+/// Best-effort local graph with its immutable per-call pricing contract.
+pub async fn generate_local_graph_report_with_contract(
+    options: ReportOptions,
+) -> Result<GraphResultWithContract, String> {
+    let pricing = resolve_graph_pricing(GraphPricingMode::BestEffort, || async {
+        Ok(load_pricing_for_local_parse().await)
+    })
+    .await?;
+    generate_graph_with_loaded_pricing(options, pricing.as_deref(), GraphPricingMode::BestEffort).await
+}
+
+/// Generate the local graph without resolving or loading any pricing dataset.
+/// Provider-reported message costs still flow through the existing scan and
+/// aggregation path unchanged.
+pub async fn generate_local_graph_report_local_only(
+    options: ReportOptions,
+) -> Result<GraphResultWithContract, String> {
+    generate_graph_with_loaded_pricing(options, None, GraphPricingMode::LocalOnly).await
 }
 
 /// Streaming graph entry-point.
@@ -4289,11 +4462,27 @@ pub fn build_graph_result_from_messages(
     messages: &[UnifiedMessage],
     since: Option<&str>,
 ) -> GraphResult {
-    let iter = messages
+    build_graph_result_with_contract_from_messages(messages, since, GraphPricingMode::BestEffort)
+        .into_graph()
+}
+
+fn build_graph_result_with_contract_from_messages(
+    messages: &[UnifiedMessage],
+    since: Option<&str>,
+    pricing_mode: GraphPricingMode,
+) -> GraphResultWithContract {
+    let filtered = messages
         .iter()
         .filter(|msg| since.is_none_or(|s| msg.date.as_str() >= s));
-    let contributions = aggregator::fold_messages_iter(iter);
-    aggregator::generate_graph_result(contributions, 0)
+    let cost_coverage = coverage_for_messages(filtered.clone());
+    let contributions = aggregator::fold_messages_iter(filtered);
+    GraphResultWithContract {
+        graph: aggregator::generate_graph_result(contributions, 0),
+        contract: GraphMetaContract {
+            pricing_mode,
+            cost_coverage,
+        },
+    }
 }
 
 fn is_headless_path(path: &Path, headless_roots: &[PathBuf]) -> bool {
@@ -5606,18 +5795,20 @@ mod tests {
     use super::copilot_desktop_source_mtime_ms;
     use super::{
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
-        canonical_model_id, clear_model_aliases, dedupe_latest_trae_messages,
+        canonical_model_id, clear_model_aliases, coverage_for_messages, dedupe_latest_trae_messages,
         fold_messages_streaming, get_agents_report, get_hourly_report, get_model_report,
         get_monthly_report, latest_source_mtime_ms, local_source_change_token, message_cache,
         model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
         opencode_authoritative_sources, opencode_identity_group,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
         parse_local_unified_messages, parsed_to_unified, pricing, prune_scan_result_by_mtime,
-        register_usage_data_invalidation_hook, reprice_lane_message, retain_for_requested_clients,
-        scan_messages_streaming, scanner, select_local_parse_pricing, sessions, set_model_aliases,
-        snapshot_grouping_aliases, unified_to_parsed, AgentAccumulator, ClientId, CostSource,
-        GroupBy, LocalParseOptions, ModelAliasMap, OpenCodeSelection, OpenCodeSourceIdentity,
-        ReportOptions, TokenBreakdown, UnifiedMessage, RETAIN_OBSERVED_MESSAGES_CALLS,
+        register_usage_data_invalidation_hook, reprice_lane_message, resolve_graph_pricing,
+        retain_for_requested_clients, scan_messages_streaming, scanner,
+        select_local_parse_pricing, sessions, set_model_aliases,
+        snapshot_grouping_aliases, unified_to_parsed, AgentAccumulator, ClientId, CostCoverage,
+        CostSource, GraphPricingMode, GroupBy, LocalParseOptions, ModelAliasMap,
+        OpenCodeSelection, OpenCodeSourceIdentity, ReportOptions, TokenBreakdown, UnifiedMessage,
+        RETAIN_OBSERVED_MESSAGES_CALLS,
         UNKNOWN_WORKSPACE_LABEL,
     };
     use bincode::Options;
@@ -5699,6 +5890,289 @@ mod tests {
             &scanner::ScannerSettings::default(),
             None,
         )
+    }
+
+    fn graph_test_message(tokens: i64, cost: f64, source: CostSource) -> UnifiedMessage {
+        let mut message = UnifiedMessage::new(
+            "claude",
+            "claude-sonnet-4-5",
+            "anthropic",
+            "session-1",
+            1_751_000_000_000,
+            TokenBreakdown {
+                input: tokens,
+                ..Default::default()
+            },
+            cost,
+        );
+        message.cost_source = source;
+        message
+    }
+
+    #[tokio::test]
+    async fn graph_pricing_resolver_skips_local_loader_and_calls_best_effort_once() {
+        let local_calls = Arc::new(AtomicUsize::new(0));
+        let local_calls_for_loader = Arc::clone(&local_calls);
+        let local = resolve_graph_pricing(GraphPricingMode::LocalOnly, move || async move {
+            local_calls_for_loader.fetch_add(1, Ordering::SeqCst);
+            panic!("local-only must not invoke pricing loader");
+        })
+        .await
+        .unwrap();
+        assert!(local.is_none());
+        assert_eq!(local_calls.load(Ordering::SeqCst), 0);
+
+        let best_effort_calls = Arc::new(AtomicUsize::new(0));
+        let best_effort_calls_for_loader = Arc::clone(&best_effort_calls);
+        let best_effort = resolve_graph_pricing(GraphPricingMode::BestEffort, move || async move {
+            best_effort_calls_for_loader.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        })
+        .await
+        .unwrap();
+        assert!(best_effort.is_none());
+        assert_eq!(best_effort_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn graph_cost_coverage_folds_cost_source_after_relevance_filter() {
+        let provider = graph_test_message(0, 0.0, CostSource::ProviderReported);
+        let estimated = graph_test_message(10, 0.0, CostSource::Estimated);
+        let unknown = graph_test_message(10, 0.0, CostSource::Unknown);
+        let structural = graph_test_message(0, 0.0, CostSource::Unknown);
+
+        assert_eq!(coverage_for_messages(std::iter::empty()), CostCoverage::Complete);
+        assert_eq!(coverage_for_messages([&provider]), CostCoverage::Complete);
+        assert_eq!(coverage_for_messages([&estimated]), CostCoverage::Complete);
+        assert_eq!(coverage_for_messages([&unknown]), CostCoverage::None);
+        assert_eq!(
+            coverage_for_messages([&estimated, &unknown]),
+            CostCoverage::Partial
+        );
+        assert_eq!(coverage_for_messages([&structural]), CostCoverage::Complete);
+    }
+
+    #[test]
+    fn local_only_keeps_provider_reported_cost_without_pricing() {
+        let mut message = graph_test_message(10, 0.75, CostSource::ProviderReported);
+        apply_pricing_if_available(&mut message, None);
+        assert_eq!(message.cost, 0.75);
+        assert_eq!(message.cost_source, CostSource::ProviderReported);
+    }
+
+    #[test]
+    fn local_and_priced_graphs_keep_the_same_topology() {
+        let provider = graph_test_message(10, 0.75, CostSource::ProviderReported);
+        let unknown = graph_test_message(20, 0.0, CostSource::Unknown);
+        let local_messages = vec![provider.clone(), unknown.clone()];
+
+        let mut priced_unknown = unknown;
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4-5".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        apply_pricing_if_available(&mut priced_unknown, Some(&pricing));
+        let priced_messages = vec![provider, priced_unknown];
+
+        let local = super::build_graph_result_with_contract_from_messages(
+            &local_messages,
+            None,
+            GraphPricingMode::LocalOnly,
+        );
+        let local_contract = local.contract();
+        let priced = super::build_graph_result_with_contract_from_messages(
+            &priced_messages,
+            None,
+            GraphPricingMode::BestEffort,
+        );
+        let priced_contract = priced.contract();
+
+        assert_eq!(local_contract.pricing_mode, GraphPricingMode::LocalOnly);
+        assert_eq!(local_contract.cost_coverage, CostCoverage::Partial);
+        assert_eq!(priced_contract.cost_coverage, CostCoverage::Complete);
+        assert_eq!(local.graph().contributions.len(), priced.graph().contributions.len());
+        for (local_day, priced_day) in local
+            .graph()
+            .contributions
+            .iter()
+            .zip(&priced.graph().contributions)
+        {
+            assert_eq!(local_day.date, priced_day.date);
+            assert_eq!(local_day.totals.tokens, priced_day.totals.tokens);
+            assert_eq!(local_day.totals.messages, priced_day.totals.messages);
+            assert_eq!(local_day.token_breakdown, priced_day.token_breakdown);
+            assert_eq!(local_day.turns_by_client, priced_day.turns_by_client);
+            let local_topology: Vec<_> = local_day
+                .clients
+                .iter()
+                .map(|client| {
+                    (
+                        client.client.as_str(),
+                        client.model_id.as_str(),
+                        client.provider_id.as_str(),
+                        client.tokens.clone(),
+                        client.messages,
+                    )
+                })
+                .collect();
+            let priced_topology: Vec<_> = priced_day
+                .clients
+                .iter()
+                .map(|client| {
+                    (
+                        client.client.as_str(),
+                        client.model_id.as_str(),
+                        client.provider_id.as_str(),
+                        client.tokens.clone(),
+                        client.messages,
+                    )
+                })
+                .collect();
+            assert_eq!(local_topology, priced_topology);
+        }
+        assert!(priced.graph().summary.total_cost > local.graph().summary.total_cost);
+        assert_eq!(local.graph().contributions[0].clients[0].cost, 0.75);
+    }
+
+    #[test]
+    fn graph_contract_is_bound_to_each_result_after_interleaving() {
+        let message = graph_test_message(10, 0.75, CostSource::ProviderReported);
+        let local = super::build_graph_result_with_contract_from_messages(
+            &[message.clone()],
+            None,
+            GraphPricingMode::LocalOnly,
+        );
+        let best_effort = super::build_graph_result_with_contract_from_messages(
+            &[message],
+            None,
+            GraphPricingMode::BestEffort,
+        );
+
+        let serialized_local = serde_json::to_value(local.graph()).unwrap();
+        assert!(serialized_local["meta"].get("pricingMode").is_none());
+        assert_eq!(local.contract().pricing_mode, GraphPricingMode::LocalOnly);
+        assert_eq!(local.contract().cost_coverage, CostCoverage::Complete);
+        assert_eq!(best_effort.contract().pricing_mode, GraphPricingMode::BestEffort);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn public_local_graph_contract_preserves_fixture_topology_and_provider_cost() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let gjc_dir = source_home.path().join(".gjc/agent/sessions");
+        std::fs::create_dir_all(&gjc_dir).unwrap();
+        std::fs::write(
+            gjc_dir.join("test.jsonl"),
+            concat!(
+                "{\"type\":\"session\",\"id\":\"gjc_ses_001\",\"cwd\":\"/work/pi\"}\n",
+                "{\"type\":\"message\",\"id\":\"provider\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-4\",\"provider\":\"anthropic\",\"timestamp\":1767225601000,\"usage\":{\"input\":100,\"output\":50,\"cost\":{\"total\":0.3}}}}\n",
+                "{\"type\":\"message\",\"id\":\"unknown\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-4\",\"provider\":\"anthropic\",\"timestamp\":1767225661000,\"usage\":{\"input\":200,\"output\":60}}}\n",
+            ),
+        )
+        .unwrap();
+
+        let options = ReportOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["gjc".to_string()]),
+            ..Default::default()
+        };
+        let local = super::generate_local_graph_report_local_only(options.clone())
+            .await
+            .unwrap();
+
+        let pricing = pricing::PricingService::new(
+            HashMap::from([(
+                "claude-sonnet-4".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.01),
+                    output_cost_per_token: Some(0.02),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::new(),
+        );
+        let priced = super::generate_graph_with_loaded_pricing(
+            options,
+            Some(&pricing),
+            GraphPricingMode::BestEffort,
+        )
+        .await
+        .unwrap();
+
+        let local_contract = local.contract();
+        assert_eq!(local_contract.pricing_mode, GraphPricingMode::LocalOnly);
+        assert_eq!(local_contract.cost_coverage, CostCoverage::Partial);
+        assert_eq!(priced.contract().pricing_mode, GraphPricingMode::BestEffort);
+        assert_eq!(priced.contract().cost_coverage, CostCoverage::Complete);
+
+        let local_wire = serde_json::to_value(local.graph()).unwrap();
+        assert!(local_wire["meta"].get("pricingMode").is_none());
+        assert_eq!(local.contract().pricing_mode, GraphPricingMode::LocalOnly);
+
+        let local_graph = local.graph();
+        let priced_graph = priced.graph();
+        assert_eq!(local_graph.summary.total_tokens, priced_graph.summary.total_tokens);
+        assert_eq!(local_graph.summary.total_days, priced_graph.summary.total_days);
+        assert_eq!(local_graph.summary.active_days, priced_graph.summary.active_days);
+        assert_eq!(local_graph.summary.clients, priced_graph.summary.clients);
+        assert_eq!(local_graph.summary.models, priced_graph.summary.models);
+        assert!(priced_graph.summary.total_cost > local_graph.summary.total_cost);
+        assert!(local_graph
+            .contributions
+            .iter()
+            .flat_map(|day| day.clients.iter())
+            .any(|client| (client.cost - 0.3).abs() < 1e-9));
+
+        assert_eq!(local_graph.contributions.len(), priced_graph.contributions.len());
+        for (local_day, priced_day) in local_graph
+            .contributions
+            .iter()
+            .zip(&priced_graph.contributions)
+        {
+            assert_eq!(local_day.date, priced_day.date);
+            assert_eq!(local_day.totals.tokens, priced_day.totals.tokens);
+            assert_eq!(local_day.totals.messages, priced_day.totals.messages);
+            assert_eq!(local_day.token_breakdown, priced_day.token_breakdown);
+            assert_eq!(local_day.turns_by_client, priced_day.turns_by_client);
+            let local_topology: Vec<_> = local_day
+                .clients
+                .iter()
+                .map(|client| {
+                    (
+                        client.client.as_str(),
+                        client.model_id.as_str(),
+                        client.provider_id.as_str(),
+                        client.tokens.clone(),
+                        client.messages,
+                    )
+                })
+                .collect();
+            let priced_topology: Vec<_> = priced_day
+                .clients
+                .iter()
+                .map(|client| {
+                    (
+                        client.client.as_str(),
+                        client.model_id.as_str(),
+                        client.provider_id.as_str(),
+                        client.tokens.clone(),
+                        client.messages,
+                    )
+                })
+                .collect();
+            assert_eq!(local_topology, priced_topology);
+        }
     }
 
     fn parse_claude_fixture(source_home: &Path) -> Vec<UnifiedMessage> {
@@ -7793,8 +8267,10 @@ mod tests {
             .block_on(super::generate_graph_with_loaded_pricing(
                 options.clone(),
                 None,
+                super::GraphPricingMode::BestEffort,
             ))
-            .unwrap();
+            .unwrap()
+            .into_graph();
         let model = runtime.block_on(get_model_report(options.clone())).unwrap();
         let monthly = runtime
             .block_on(get_monthly_report(options.clone()))
