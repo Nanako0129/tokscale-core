@@ -4265,6 +4265,10 @@ impl CostCoverageFold {
 
         match message.cost_source {
             CostSource::ProviderReported | CostSource::Estimated => self.known = true,
+            CostSource::PartiallyEstimated => {
+                self.known = true;
+                self.unknown = true;
+            }
             CostSource::Unknown => self.unknown = true,
         }
     }
@@ -4529,15 +4533,25 @@ fn apply_pricing_if_available(
         return;
     };
 
-    let calculated_cost = pricing.calculate_cost_with_provider(
+    let Some(estimate) = pricing.estimate_cost_with_provider(
         &message.model_id,
         Some(&message.provider_id),
         &message.tokens,
-    ) * pricing_multiplier(message);
+    ) else {
+        return;
+    };
+    let calculated_cost = estimate.cost * pricing_multiplier(message);
 
-    if calculated_cost > 0.0 {
-        message.cost = calculated_cost;
-        message.mark_estimated_cost();
+    match estimate.coverage {
+        pricing::lookup::EstimateCoverage::Complete => {
+            message.cost = calculated_cost;
+            message.mark_estimated_cost();
+        }
+        pricing::lookup::EstimateCoverage::Partial => {
+            message.cost = calculated_cost;
+            message.mark_partially_estimated_cost();
+        }
+        pricing::lookup::EstimateCoverage::None => {}
     }
 }
 
@@ -5938,12 +5952,18 @@ mod tests {
     fn graph_cost_coverage_folds_cost_source_after_relevance_filter() {
         let provider = graph_test_message(0, 0.0, CostSource::ProviderReported);
         let estimated = graph_test_message(10, 0.0, CostSource::Estimated);
+        let partially_estimated =
+            graph_test_message(10, 0.0, CostSource::PartiallyEstimated);
         let unknown = graph_test_message(10, 0.0, CostSource::Unknown);
         let structural = graph_test_message(0, 0.0, CostSource::Unknown);
 
         assert_eq!(coverage_for_messages(std::iter::empty()), CostCoverage::Complete);
         assert_eq!(coverage_for_messages([&provider]), CostCoverage::Complete);
         assert_eq!(coverage_for_messages([&estimated]), CostCoverage::Complete);
+        assert_eq!(
+            coverage_for_messages([&partially_estimated]),
+            CostCoverage::Partial
+        );
         assert_eq!(coverage_for_messages([&unknown]), CostCoverage::None);
         assert_eq!(
             coverage_for_messages([&estimated, &unknown]),
@@ -8526,6 +8546,7 @@ mod tests {
         match source {
             CostSource::ProviderReported => message.mark_provider_reported_cost(),
             CostSource::Estimated => message.mark_estimated_cost(),
+            CostSource::PartiallyEstimated => message.mark_partially_estimated_cost(),
             CostSource::Unknown => {}
         }
         message
@@ -13461,6 +13482,107 @@ mod tests {
 
         assert_eq!(msg.cost, 0.02);
         assert_eq!(msg.cost_source, CostSource::Estimated);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_marks_partial_subtotal() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "partial-model".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let mut msg = UnifiedMessage::new(
+            "codex",
+            "partial-model",
+            "provider",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_write: 7,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert!((msg.cost - 0.01).abs() < 1e-12);
+        assert_eq!(msg.cost_source, CostSource::PartiallyEstimated);
+        assert_eq!(coverage_for_messages([&msg]), CostCoverage::Partial);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_marks_successful_zero_cost_lookup_estimated() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "free-model".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                cache_read_input_token_cost: Some(0.0),
+                cache_creation_input_token_cost: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let mut msg = UnifiedMessage::new(
+            "codex",
+            "free-model",
+            "provider",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 3,
+                cache_write: 7,
+                reasoning: 2,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.0);
+        assert_eq!(msg.cost_source, CostSource::Estimated);
+        assert_eq!(coverage_for_messages([&msg]), CostCoverage::Complete);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_keeps_unknown_on_lookup_miss() {
+        let pricing = pricing::PricingService::new(
+            HashMap::from([(
+                "other-model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::new(),
+        );
+        let mut msg = UnifiedMessage::new(
+            "codex",
+            "missing-model",
+            "provider",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                ..Default::default()
+            },
+            0.25,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.25);
+        assert_eq!(msg.cost_source, CostSource::Unknown);
     }
 
     #[test]

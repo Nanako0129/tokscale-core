@@ -48,6 +48,7 @@ pub enum CostSource {
     Unknown,
     ProviderReported,
     Estimated,
+    PartiallyEstimated,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -385,6 +386,10 @@ impl UnifiedMessage {
         self.cost_source = CostSource::Estimated;
     }
 
+    pub(crate) fn mark_partially_estimated_cost(&mut self) {
+        self.cost_source = CostSource::PartiallyEstimated;
+    }
+
     pub(crate) fn has_authoritative_cost(&self) -> bool {
         self.cost_source == CostSource::ProviderReported
     }
@@ -599,6 +604,14 @@ mod tests {
         msg.mark_estimated_cost();
         assert_eq!(msg.cost_source, CostSource::Estimated);
         assert!(!msg.has_authoritative_cost());
+
+        msg.mark_partially_estimated_cost();
+        assert_eq!(msg.cost_source, CostSource::PartiallyEstimated);
+        assert!(!msg.has_authoritative_cost());
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap()["cost_source"],
+            "partiallyEstimated"
+        );
     }
 
     #[test]
