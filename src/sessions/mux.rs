@@ -49,7 +49,8 @@ fn valid_mux_cost(bucket: Option<&MuxTokenBucket>) -> Option<f64> {
 }
 
 /// Parse a mux session-usage.json file.
-/// Returns one UnifiedMessage per model entry in byModel.
+/// Returns one or two UnifiedMessage rows per model entry in byModel when
+/// positive-token buckets have mixed cost provenance.
 pub fn parse_mux_file(path: &Path) -> Vec<UnifiedMessage> {
     let Some(data) = read_file_or_none(path) else {
         return vec![];
@@ -79,41 +80,74 @@ pub fn parse_mux_file(path: &Path) -> Vec<UnifiedMessage> {
 
     by_model
         .into_iter()
-        .filter_map(|(model_key, model_usage)| {
+        .flat_map(|(model_key, model_usage)| {
             let tokens =
                 |b: &Option<MuxTokenBucket>| b.as_ref().and_then(|b| b.tokens).unwrap_or(0).max(0);
-            let cost = |b: &Option<MuxTokenBucket>| valid_mux_cost(b.as_ref()).unwrap_or(0.0);
-            let missing_cost = |b: &Option<MuxTokenBucket>, token_count: i64| {
-                token_count > 0 && valid_mux_cost(b.as_ref()).is_none()
-            };
-            let input = tokens(&model_usage.input);
-            let cached = tokens(&model_usage.cached);
-            let cache_create = tokens(&model_usage.cache_create);
-            let output = tokens(&model_usage.output);
-            let reasoning = tokens(&model_usage.reasoning);
-            let source_cost = cost(&model_usage.input)
-                + cost(&model_usage.cached)
-                + cost(&model_usage.cache_create)
-                + cost(&model_usage.output)
-                + cost(&model_usage.reasoning);
-            let has_unknown_cost = missing_cost(&model_usage.input, input)
-                || missing_cost(&model_usage.cached, cached)
-                || missing_cost(&model_usage.cache_create, cache_create)
-                || missing_cost(&model_usage.output, output)
-                || missing_cost(&model_usage.reasoning, reasoning);
+            let buckets = [
+                (
+                    "input",
+                    tokens(&model_usage.input),
+                    valid_mux_cost(model_usage.input.as_ref()),
+                ),
+                (
+                    "cached",
+                    tokens(&model_usage.cached),
+                    valid_mux_cost(model_usage.cached.as_ref()),
+                ),
+                (
+                    "cache_create",
+                    tokens(&model_usage.cache_create),
+                    valid_mux_cost(model_usage.cache_create.as_ref()),
+                ),
+                (
+                    "output",
+                    tokens(&model_usage.output),
+                    valid_mux_cost(model_usage.output.as_ref()),
+                ),
+                (
+                    "reasoning",
+                    tokens(&model_usage.reasoning),
+                    valid_mux_cost(model_usage.reasoning.as_ref()),
+                ),
+            ];
+            let mut known_tokens = TokenBreakdown::default();
+            let mut unknown_tokens = TokenBreakdown::default();
+            let mut known_cost = 0.0;
 
-            if input == 0 && cached == 0 && cache_create == 0 && output == 0 && reasoning == 0 {
-                return None;
+            for (bucket, token_count, cost) in buckets {
+                if let Some(cost) = cost {
+                    known_cost += cost;
+                }
+                if token_count == 0 {
+                    continue;
+                }
+                let target = if cost.is_some() {
+                    &mut known_tokens
+                } else {
+                    &mut unknown_tokens
+                };
+                match bucket {
+                    "input" => target.input = token_count,
+                    "cached" => target.cache_read = token_count,
+                    "cache_create" => target.cache_write = token_count,
+                    "output" => target.output = token_count,
+                    "reasoning" => target.reasoning = token_count,
+                    _ => unreachable!("all Mux token buckets are listed above"),
+                }
+            }
+
+            let known_total = known_tokens.total();
+            let unknown_total = unknown_tokens.total();
+            if known_total == 0 && unknown_total == 0 {
+                return Vec::new();
             }
 
             // Dedup key scoped to (workspace session, model): stable across
             // re-parses (no HashMap-iteration index) and unique per workspace,
             // so two workspaces reporting the same model are not collided into
-            // one — only a genuine re-parse of the same workspace+model
-            // collapses. Local fix: upstream #760 keyed on the HashMap
-            // iteration index, which is unstable across re-parses and collides
-            // cross-file (reported upstream).
-            let dedup_key = Some(format!("mux:{session_id}:{model_key}"));
+            // one. The provenance suffix keeps a mixed known/unknown split from
+            // dropping one row at the per-client dedup gate.
+            let dedup_base = format!("mux:{session_id}:{model_key}");
 
             // Strip "provider:" prefix for model ID (e.g., "anthropic:claude-opus-4-6" -> "claude-opus-4-6")
             let (provider, model_id) = if model_key.contains(':') {
@@ -126,26 +160,37 @@ pub fn parse_mux_file(path: &Path) -> Vec<UnifiedMessage> {
             };
             let provider = provider_identity::canonical_provider(&provider).unwrap_or(provider);
 
-            let mut message = UnifiedMessage::new_with_dedup(
-                "mux",
-                model_id,
-                provider,
-                session_id.clone(),
-                timestamp,
-                TokenBreakdown {
-                    input,
-                    output,
-                    cache_read: cached,
-                    cache_write: cache_create,
-                    reasoning,
-                },
-                source_cost,
-                dedup_key,
-            );
-            if !has_unknown_cost {
-                message.mark_provider_reported_cost();
+            let make_message = |tokens: TokenBreakdown,
+                                cost: f64,
+                                suffix: &str,
+                                message_count: i32,
+                                provider_reported: bool| {
+                let mut message = UnifiedMessage::new_with_dedup(
+                    "mux",
+                    model_id.clone(),
+                    provider.clone(),
+                    session_id.clone(),
+                    timestamp,
+                    tokens,
+                    cost,
+                    Some(format!("{dedup_base}:{suffix}")),
+                );
+                message.message_count = message_count;
+                if provider_reported {
+                    message.mark_provider_reported_cost();
+                }
+                message
+            };
+
+            match (known_total > 0 || known_cost > 0.0, unknown_total > 0) {
+                (true, true) => vec![
+                    make_message(known_tokens, known_cost, "known", 1, true),
+                    make_message(unknown_tokens, 0.0, "unknown", 0, false),
+                ],
+                (true, false) => vec![make_message(known_tokens, known_cost, "known", 1, true)],
+                (false, true) => vec![make_message(unknown_tokens, 0.0, "unknown", 1, false)],
+                (false, false) => Vec::new(),
             }
-            Some(message)
         })
         .collect()
 }
@@ -286,7 +331,94 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].model_id, "claude-opus-4-6");
         assert_eq!(msgs[0].provider_id, "");
+        assert_eq!(msgs[0].cost, 0.0);
+        assert_eq!(msgs[0].message_count, 1);
         assert!(!msgs[0].has_authoritative_cost());
+        assert!(msgs[0]
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.ends_with(":unknown")));
+    }
+
+    #[test]
+    fn test_mixed_bucket_costs_split_provenance_without_double_counting_messages() {
+        let json = r#"{
+            "version": 1,
+            "byModel": {
+                "anthropic:claude-opus-4-6": {
+                    "input": { "tokens": 100, "cost_usd": 0.01 },
+                    "cached": { "tokens": 200, "cost_usd": 0.02 },
+                    "cacheCreate": { "tokens": 50 },
+                    "output": { "tokens": 300, "cost_usd": 0.03 },
+                    "reasoning": { "tokens": 25 }
+                }
+            },
+            "lastRequest": { "timestamp": 1700000000000 }
+        }"#;
+        let f = write_temp_json(json);
+        let msgs = parse_mux_file(f.path());
+        assert_eq!(msgs.len(), 2);
+
+        let known = msgs
+            .iter()
+            .find(|message| message.dedup_key.as_deref().unwrap().ends_with(":known"))
+            .unwrap();
+        let unknown = msgs
+            .iter()
+            .find(|message| message.dedup_key.as_deref().unwrap().ends_with(":unknown"))
+            .unwrap();
+
+        assert_eq!(known.tokens.input, 100);
+        assert_eq!(known.tokens.cache_read, 200);
+        assert_eq!(known.tokens.output, 300);
+        assert_eq!(known.tokens.cache_write, 0);
+        assert_eq!(known.tokens.reasoning, 0);
+        assert!((known.cost - 0.06).abs() < 1e-12);
+        assert!(known.has_authoritative_cost());
+        assert_eq!(known.message_count, 1);
+
+        assert_eq!(unknown.tokens.cache_write, 50);
+        assert_eq!(unknown.tokens.reasoning, 25);
+        assert_eq!(unknown.tokens.input, 0);
+        assert_eq!(unknown.tokens.output, 0);
+        assert_eq!(unknown.cost, 0.0);
+        assert!(!unknown.has_authoritative_cost());
+        assert_eq!(unknown.message_count, 0);
+        assert_ne!(known.dedup_key, unknown.dedup_key);
+
+        assert_eq!(known.tokens.total() + unknown.tokens.total(), 675);
+        assert_eq!(known.message_count + unknown.message_count, 1);
+    }
+
+    #[test]
+    fn test_zero_token_bucket_cost_is_preserved_with_unknown_tokens() {
+        let json = r#"{
+            "version": 1,
+            "byModel": {
+                "anthropic:claude-opus-4-6": {
+                    "input": { "tokens": 0, "cost_usd": 0.25 },
+                    "output": { "tokens": 10 }
+                }
+            },
+            "lastRequest": { "timestamp": 1700000000000 }
+        }"#;
+        let f = write_temp_json(json);
+        let msgs = parse_mux_file(f.path());
+        assert_eq!(msgs.len(), 2);
+
+        let known = msgs
+            .iter()
+            .find(|message| message.has_authoritative_cost())
+            .unwrap();
+        let unknown = msgs
+            .iter()
+            .find(|message| !message.has_authoritative_cost())
+            .unwrap();
+        assert_eq!(known.tokens.total(), 0);
+        assert_eq!(known.cost, 0.25);
+        assert_eq!(known.message_count, 1);
+        assert_eq!(unknown.tokens.output, 10);
+        assert_eq!(unknown.message_count, 0);
     }
 
     #[test]
@@ -392,11 +524,11 @@ mod tests {
         // cross-file dedup gate instead of colliding on "mux:<model>:0").
         assert_eq!(
             a[0].dedup_key.as_deref(),
-            Some("mux:ws_alpha:anthropic:claude-opus-4-6")
+            Some("mux:ws_alpha:anthropic:claude-opus-4-6:known")
         );
         assert_eq!(
             b[0].dedup_key.as_deref(),
-            Some("mux:ws_beta:anthropic:claude-opus-4-6")
+            Some("mux:ws_beta:anthropic:claude-opus-4-6:known")
         );
         assert_ne!(a[0].dedup_key, b[0].dedup_key);
         // Re-parsing the same workspace reproduces the key (true duplicate).

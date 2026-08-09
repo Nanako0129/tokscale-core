@@ -436,10 +436,38 @@ these are upstream fixes a sync will *gain*.)
 
 > **All previously-reported upstream fixes are now vendored:** `#735` / `#741` / `#742` Part 1 / `#743` / `#737` in M5b, `#742` **Part 2** (micode authoritative-cost reprice guard) in M7, and issue `#739`'s remaining GJC cost-presence plus replay-stable id-less-key items through upstream `#791` in M8. The Micode guard remains a local cost-guarded `simple_lane!` adaptation because upstream's equivalent lives only in its materialized lane. Nothing remains pending in this direction.
 
+## Local graph pricing and provenance contract
+
+This vendor's graph contract is authoritative for local consumers. Public
+`GraphPricingMode::{LocalOnly,BestEffort}` selects whether the graph may load
+local pricing; `GraphResultWithContract` carries its instance-bound
+`GraphMetaContract`, including `CostCoverage::{Complete,Partial,None}`, so
+interleaved calls cannot rewrite a result's mode or coverage. Parser
+`CostSource` is the authority for raw message cost provenance: report-time
+pricing may fill unknown costs and mark them `Estimated`, but never overwrites
+`ProviderReported` values. `LocalOnly` therefore retains provider-reported
+costs without consulting pricing, while `BestEffort` estimates only unknown
+rows.
+
+Raw parser semantic or output-shape changes bump the affected per-client
+parser identity; serialized layout changes bump the global
+`CACHE_FORMAT_VERSION` instead. The active layout remains format 3. This
+round advances `Amp`, `Cursor`, `OpenClaw`, `MiMoCode`, and `Mux` parser
+identity `1→2`; `Crush`, `Hermes`, and `Trae` remain at 1. Mux is the parser
+source of truth for bucket-level `cost_usd`: valid finite non-negative costs
+stay in a `ProviderReported` known row, missing or invalid positive-token
+buckets become an `Unknown` row, and mixed output uses stable `:known` /
+`:unknown` dedup suffixes while only one split row carries the original
+message count. Re-vendor and sync work must reapply this contract, the
+per-client identities, and the Mux split at `src/lib.rs`,
+`src/message_cache.rs`, and `src/sessions/mux.rs`; do not move this decision
+into coverage or expand it to B2.
+
 ## Local patches (diverged from upstream)
 
 | Patch | Files | Status upstream |
 |---|---|---|
+| local-first graph pricing/provenance contract: `GraphPricingMode`, instance-bound `GraphResultWithContract` / `CostCoverage`, parser-owned `CostSource`, report-time fill-only pricing, and Mux known/unknown bucket splitting. Per-client parser identity advances `Amp`, `Cursor`, `OpenClaw`, `MiMoCode`, `Mux` `1→2`; `CACHE_FORMAT_VERSION` stays 3. **Re-apply on any re-vendor of these files.** | `src/lib.rs`, `src/message_cache.rs`, `src/sessions/mux.rs` | TokenBar-local contract; not upstream |
 | aggregation (feat): **per-day turn counts on `DailyContribution`.** `turns_by_client: BTreeMap<String, i64>` is folded in `DayAccumulator` from the `UnifiedMessage.is_turn_start` markers the parsers already set, merged in `DayAccumulator::merge` (parallel reduction otherwise loses the other half's counts silently), and finalized with non-positive counts dropped so a client with no turns is absent rather than present-with-zero. Turn counts previously existed only at hour resolution in `HourlyUsage.turn_count`, so a consumer wanting day/month turns had to run a second full report — measured at 25.7s cold for the two clients that dominate turn data, contending with the graph and model scans for the same bounded Rayon pool. Keyed by exact client id, not folded into `DailyTotals` (a consumer hiding a client must be able to subtract it) and not placed on `ClientContribution` (that map is keyed by client *and* model, while a turn belongs to the client alone — splitting one across a day's models would invent data); `cc-mirror/*` therefore keeps its own count. Serialization is additive with `#[serde(default)]`, and the cache schema is deliberately unchanged because `is_turn_start` is already part of the cached message — this is report-time aggregation only. **Re-apply on any re-vendor of `aggregator.rs`/`lib.rs`.** | `src/aggregator.rs`, `src/lib.rs` | not yet forwarded to junhoyeo/tokscale |
 | Grok usage-row accessor naming: `ParsedUsage::token_breakdown(&self)` avoids Rust 1.96.1's `clippy::wrong_self_convention` rejection of the former borrowed `into_*` name. This is a private-method rename only; parsed output, cache schema, and runtime behavior are unchanged. | `src/sessions/grok.rs` | TokenBar-local maintenance for the local `turn_completed.usage` path |
 | Cross-platform test cfg hygiene: the Copilot Desktop mtime helper import now follows its existing Unix-only test, while four Kiro globalStorage fixture helpers follow their existing macOS-only tests. This removes Windows Rust 1.96.1 strict-Clippy unused/dead-code failures without changing tests or runtime behavior. | `src/lib.rs` (tests) | Candidate for upstream test-only cleanup |

@@ -829,6 +829,13 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Jcode => 4,
         ClientId::Copilot => 4,
         ClientId::Grok => 3,
+        // 2: These parser output shapes now preserve source cost provenance;
+        // Mux additionally splits mixed known/unknown token buckets.
+        ClientId::Amp
+        | ClientId::Cursor
+        | ClientId::OpenClaw
+        | ClientId::MiMoCode
+        | ClientId::Mux => 2,
         // 2: Claude gained retention of history-only turns dropped by a
         // Claude Code transcript rewrite (see RET-CLAUDE-001 in
         // UPSTREAM.md). This records the parse-semantics change, not a
@@ -3040,6 +3047,45 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_mux_v1_shard_is_rejected_before_new_parser_identity_can_hit() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"mux\n");
+        let current = CacheIdentity::for_client(ClientId::Mux);
+        let stale = CacheIdentity {
+            namespace: current.namespace,
+            parser_version: 1,
+        };
+        assert_eq!(current.parser_version, 2);
+
+        let stale_key = CacheKey::new(current, source.path()).shard();
+        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        let stale_envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: stale.namespace.to_string(),
+            parser_version: stale.parser_version,
+            payload: b"deliberately invalid old Mux payload".to_vec(),
+        };
+        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &stale_envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert!(matches!(
+            read_shard(&stale_path, current),
+            ShardReadStatus::Stale
+        ));
+        let loaded = SourceMessageCache::load();
+        assert!(loaded.get(current, source.path()).is_none());
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_copilot_parser_v3_same_fingerprint_rebuilds_merged_duration() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
@@ -4446,6 +4492,23 @@ mod tests {
         assert_eq!(parser_version(ClientId::Jcode), 4);
         assert_eq!(parser_version(ClientId::Copilot), 4);
         assert_eq!(parser_version(ClientId::Grok), 3);
+        for client in [
+            ClientId::Amp,
+            ClientId::Cursor,
+            ClientId::OpenClaw,
+            ClientId::MiMoCode,
+            ClientId::Mux,
+        ] {
+            assert_eq!(
+                parser_version(client),
+                2,
+                "{} parser version",
+                client.as_str()
+            );
+        }
+        assert_eq!(parser_version(ClientId::Crush), 1);
+        assert_eq!(parser_version(ClientId::Hermes), 1);
+        assert_eq!(parser_version(ClientId::Trae), 1);
         // RET-CLAUDE-001: bumped for retention of history-only turns dropped
         // by a Claude Code transcript rewrite. The shared `retained_keys`
         // field this needed is a layout change covered by
@@ -4461,6 +4524,11 @@ mod tests {
                     | ClientId::Copilot
                     | ClientId::Grok
                     | ClientId::Claude
+                    | ClientId::Amp
+                    | ClientId::Cursor
+                    | ClientId::OpenClaw
+                    | ClientId::MiMoCode
+                    | ClientId::Mux
             ) {
                 assert_eq!(
                     parser_version(client),

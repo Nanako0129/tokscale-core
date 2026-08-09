@@ -6040,6 +6040,89 @@ mod tests {
     }
 
     #[test]
+    fn mux_mixed_cost_provenance_preserves_known_subtotal_and_message_count() {
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let source = source_dir.path().join("session-usage.json");
+        std::fs::write(
+            &source,
+            r#"{
+                "version": 1,
+                "byModel": {
+                    "anthropic:claude-opus-4-6": {
+                        "input": { "tokens": 100, "cost_usd": 0.1 },
+                        "output": { "tokens": 50 }
+                    }
+                },
+                "lastRequest": { "timestamp": 1700000000000 }
+            }"#,
+        )
+        .unwrap();
+
+        let raw = sessions::mux::parse_mux_file(&source);
+        assert_eq!(raw.len(), 2);
+        assert_eq!(
+            raw.iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            150
+        );
+        assert_eq!(
+            raw.iter()
+                .map(|message| message.message_count)
+                .sum::<i32>(),
+            1
+        );
+
+        let local = super::build_graph_result_with_contract_from_messages(
+            &raw,
+            None,
+            GraphPricingMode::LocalOnly,
+        );
+        assert_eq!(local.contract().cost_coverage, CostCoverage::Partial);
+        assert_eq!(local.graph().summary.total_tokens, 150);
+        assert_eq!(local.graph().summary.total_cost, 0.1);
+        assert_eq!(local.graph().contributions[0].totals.messages, 1);
+
+        let pricing = pricing::PricingService::new(
+            HashMap::from([(
+                "claude-opus-4-6".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.01),
+                    output_cost_per_token: Some(0.02),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::new(),
+        );
+        let mut priced = raw.clone();
+        for message in &mut priced {
+            apply_pricing_if_available(message, Some(&pricing));
+        }
+        let known = priced
+            .iter()
+            .find(|message| message.cost_source == CostSource::ProviderReported)
+            .unwrap();
+        let unknown = priced
+            .iter()
+            .find(|message| message.cost_source == CostSource::Estimated)
+            .unwrap();
+        assert_eq!(known.cost, 0.1);
+        assert_eq!(unknown.cost, 1.0);
+        assert_eq!(known.tokens.input, 100);
+        assert_eq!(unknown.tokens.output, 50);
+
+        let best_effort = super::build_graph_result_with_contract_from_messages(
+            &priced,
+            None,
+            GraphPricingMode::BestEffort,
+        );
+        assert_eq!(best_effort.contract().cost_coverage, CostCoverage::Complete);
+        assert_eq!(best_effort.graph().summary.total_tokens, 150);
+        assert_eq!(best_effort.graph().summary.total_cost, 1.1);
+        assert_eq!(best_effort.graph().contributions[0].totals.messages, 1);
+    }
+
+    #[test]
     fn graph_contract_is_bound_to_each_result_after_interleaving() {
         let message = graph_test_message(10, 0.75, CostSource::ProviderReported);
         let local = super::build_graph_result_with_contract_from_messages(
