@@ -4253,10 +4253,11 @@ struct CostCoverageFold {
 
 impl CostCoverageFold {
     fn observe(&mut self, message: &UnifiedMessage) {
-        // Structural rows (no tokens and no cost authority) do not affect
+        // Structural rows (no usage and no cost authority) do not affect
         // coverage. ProviderReported remains relevant even at a legitimate
         // zero cost; CostSource is the provenance source of truth.
         let cost_relevant = message.tokens.total() > 0
+            || message.message_count > 0
             || message.cost > 0.0
             || message.cost_source == CostSource::ProviderReported;
         if !cost_relevant {
@@ -5955,7 +5956,10 @@ mod tests {
         let partially_estimated =
             graph_test_message(10, 0.0, CostSource::PartiallyEstimated);
         let unknown = graph_test_message(10, 0.0, CostSource::Unknown);
-        let structural = graph_test_message(0, 0.0, CostSource::Unknown);
+        let mut message_only = graph_test_message(0, 0.0, CostSource::Unknown);
+        message_only.message_count = 1;
+        let mut structural = graph_test_message(0, 0.0, CostSource::Unknown);
+        structural.message_count = 0;
 
         assert_eq!(coverage_for_messages(std::iter::empty()), CostCoverage::Complete);
         assert_eq!(coverage_for_messages([&provider]), CostCoverage::Complete);
@@ -5965,6 +5969,7 @@ mod tests {
             CostCoverage::Partial
         );
         assert_eq!(coverage_for_messages([&unknown]), CostCoverage::None);
+        assert_eq!(coverage_for_messages([&message_only]), CostCoverage::None);
         assert_eq!(
             coverage_for_messages([&estimated, &unknown]),
             CostCoverage::Partial

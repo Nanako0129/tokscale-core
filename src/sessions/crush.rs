@@ -429,6 +429,16 @@ mod tests {
         assert!(!message("negative").has_authoritative_cost());
         assert!(!message("missing").has_authoritative_cost());
         assert!(message("zero").has_authoritative_cost());
+
+        let result = crate::build_graph_result_with_contract_from_messages(
+            &messages,
+            None,
+            crate::GraphPricingMode::LocalOnly,
+        );
+        assert_eq!(
+            result.contract().cost_coverage,
+            crate::CostCoverage::Partial
+        );
     }
 
     #[test]
