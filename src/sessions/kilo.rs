@@ -116,6 +116,7 @@ pub fn parse_kilo_sqlite_with_fallback(
             None => continue,
         };
 
+        let provider_cost = msg.cost.filter(|cost| cost.is_finite() && *cost > 0.0);
         let agent = msg.agent.or(msg.mode);
         let session_id = msg.session_id.unwrap_or(row_session_id);
         let timestamp = msg
@@ -144,9 +145,12 @@ pub fn parse_kilo_sqlite_with_fallback(
                 cache_write: tokens.cache.write.max(0),
                 reasoning: tokens.reasoning.unwrap_or(0).max(0),
             },
-            msg.cost.unwrap_or(0.0).max(0.0),
+            provider_cost.unwrap_or(0.0),
             agent,
         );
+        if provider_cost.is_some() {
+            unified.mark_provider_reported_cost();
+        }
         unified.dedup_key = dedup_key;
 
         messages.push(unified);
@@ -249,8 +253,19 @@ mod tests {
         assert_eq!(msg.tokens.cache_read, 75);
         assert_eq!(msg.tokens.cache_write, 25);
         assert_eq!(msg.cost, 0.42);
+        assert!(msg.has_authoritative_cost());
         assert_eq!(msg.agent.as_deref(), Some("architect"));
         assert_eq!(msg.dedup_key.as_deref(), Some("embedded-msg-1"));
+
+        let result = crate::build_graph_result_with_contract_from_messages(
+            &messages,
+            None,
+            crate::GraphPricingMode::LocalOnly,
+        );
+        assert_eq!(
+            result.contract().cost_coverage,
+            crate::CostCoverage::Complete
+        );
     }
 
     #[test]
@@ -324,6 +339,7 @@ mod tests {
         assert_eq!(msg.tokens.cache_read, 0);
         assert_eq!(msg.tokens.cache_write, 0);
         assert_eq!(msg.cost, 0.0);
+        assert!(!msg.has_authoritative_cost());
         assert_eq!(msg.agent.as_deref(), Some("debug"));
         assert_eq!(msg.dedup_key.as_deref(), Some("row-valid"));
     }

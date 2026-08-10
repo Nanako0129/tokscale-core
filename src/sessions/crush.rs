@@ -25,7 +25,7 @@ const CRUSH_PROVIDER_ID: &str = "crush";
 #[derive(Debug)]
 struct CrushSession {
     id: String,
-    cost: f64,
+    cost: Option<f64>,
     created_at: i64,
     updated_at: i64,
 }
@@ -60,11 +60,14 @@ pub fn parse_crush_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
 
     for session in root_sessions {
         let session_key = format!("{}:{}", db_namespace, session.id);
+        let provider_cost = session
+            .cost
+            .filter(|cost| cost.is_finite() && *cost >= 0.0);
 
         if let Some(day_buckets) = assistant_buckets.get(&session.id) {
             let total_assistant_messages: i32 =
                 day_buckets.iter().map(|bucket| bucket.message_count).sum();
-            let safe_cost = session.cost.max(0.0);
+            let safe_cost = provider_cost.unwrap_or(0.0);
             let mut allocated_cost = 0.0;
 
             for (index, bucket) in day_buckets.iter().enumerate() {
@@ -85,6 +88,9 @@ pub fn parse_crush_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                     TokenBreakdown::default(),
                     bucket_cost,
                 );
+                if provider_cost.is_some() {
+                    message.mark_provider_reported_cost();
+                }
                 message.message_count = bucket.message_count.max(0);
                 messages.push(message);
             }
@@ -92,9 +98,9 @@ pub fn parse_crush_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        if session.cost <= 0.0 {
+        let Some(provider_cost) = provider_cost.filter(|cost| *cost > 0.0) else {
             continue;
-        }
+        };
 
         let Some(timestamp_ms) =
             fallback_session_timestamp_ms(session.updated_at, session.created_at)
@@ -109,8 +115,9 @@ pub fn parse_crush_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             session_key,
             timestamp_ms,
             TokenBreakdown::default(),
-            session.cost.max(0.0),
+            provider_cost,
         );
+        message.mark_provider_reported_cost();
         message.message_count = 0;
         messages.push(message);
     }
@@ -140,7 +147,7 @@ fn load_root_sessions(conn: &Connection) -> Vec<CrushSession> {
     let rows = match stmt.query_map([], |row| {
         Ok(CrushSession {
             id: row.get(0)?,
-            cost: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            cost: row.get::<_, Option<f64>>(1)?,
             created_at: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
             updated_at: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
         })
@@ -253,7 +260,7 @@ mod tests {
                 message_count INTEGER NOT NULL DEFAULT 0,
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
-                cost REAL NOT NULL DEFAULT 0,
+                cost REAL DEFAULT 0,
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT 0
             );
@@ -355,6 +362,83 @@ mod tests {
             .iter()
             .all(|msg| msg.session_id.ends_with(":root-1")));
         assert!(messages.iter().all(|msg| msg.tokens.total() == 0));
+        assert!(messages.iter().all(|msg| msg.has_authoritative_cost()));
+    }
+
+    #[test]
+    fn test_parse_crush_sqlite_local_only_graph_contract_keeps_reported_cost() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+        let day_one = 1_742_300_000_i64;
+        let day_two = 1_742_386_400_i64;
+
+        insert_root_session(&conn, "root-1", 2, 30.0, day_two, day_one);
+        insert_message(&conn, "msg-1", "root-1", "assistant", day_one, 0);
+        insert_message(&conn, "msg-2", "root-1", "assistant", day_two, 0);
+
+        let messages = parse_crush_sqlite(&db_path);
+        let result = crate::build_graph_result_with_contract_from_messages(
+            &messages,
+            None,
+            crate::GraphPricingMode::LocalOnly,
+        );
+
+        assert_eq!(
+            result.contract().cost_coverage,
+            crate::CostCoverage::Complete
+        );
+        assert!((result.graph().summary.total_cost - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_crush_sqlite_keeps_invalid_and_missing_cost_unknown() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+        let timestamp = 1_742_300_000_i64;
+
+        for (id, cost) in [("negative", Some(-1.0)), ("missing", None)] {
+            conn.execute(
+                "INSERT INTO sessions (id, parent_session_id, title, message_count, cost, updated_at, created_at)
+                 VALUES (?1, NULL, 'Root', 1, ?2, ?3, ?3)",
+                params![id, cost, timestamp],
+            )
+            .unwrap();
+            insert_message(
+                &conn,
+                &format!("msg-{id}"),
+                id,
+                "assistant",
+                timestamp,
+                0,
+            );
+        }
+        insert_root_session(&conn, "zero", 1, 0.0, timestamp, timestamp);
+        insert_message(&conn, "msg-zero", "zero", "assistant", timestamp, 0);
+        drop(conn);
+
+        let messages = parse_crush_sqlite(&db_path);
+        assert_eq!(messages.len(), 3);
+        let message = |id: &str| {
+            messages
+                .iter()
+                .find(|message| message.session_id.ends_with(&format!(":{id}")))
+                .unwrap()
+        };
+        assert!(!message("negative").has_authoritative_cost());
+        assert!(!message("missing").has_authoritative_cost());
+        assert!(message("zero").has_authoritative_cost());
+
+        let result = crate::build_graph_result_with_contract_from_messages(
+            &messages,
+            None,
+            crate::GraphPricingMode::LocalOnly,
+        );
+        assert_eq!(
+            result.contract().cost_coverage,
+            crate::CostCoverage::Partial
+        );
     }
 
     #[test]
@@ -378,6 +462,7 @@ mod tests {
         assert_eq!(messages[0].timestamp, 1_742_342_000_000_i64);
         assert_eq!(messages[0].message_count, 0);
         assert_eq!(messages[0].cost, 4.5);
+        assert!(messages[0].has_authoritative_cost());
     }
 
     #[test]

@@ -226,9 +226,11 @@ fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedM
                     current_model = Some(model.clone());
                     current_provider = Some(provider.clone());
                     let timestamp = msg.timestamp.unwrap_or(file_mtime_ms);
-                    let cost = usage.cost.and_then(|c| c.total).unwrap_or(0.0);
-
-                    messages.push(UnifiedMessage::new(
+                    let provider_cost = usage
+                        .cost
+                        .and_then(|cost| cost.total)
+                        .filter(|cost| cost.is_finite() && *cost >= 0.0);
+                    let mut message = UnifiedMessage::new(
                         "openclaw",
                         model,
                         provider,
@@ -241,8 +243,12 @@ fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedM
                             cache_write: usage.cache_write.unwrap_or(0).max(0),
                             reasoning: 0,
                         },
-                        cost.max(0.0),
-                    ));
+                        provider_cost.unwrap_or(0.0),
+                    );
+                    if provider_cost.is_some() {
+                        message.mark_provider_reported_cost();
+                    }
+                    messages.push(message);
                 }
             }
             _ => {}
@@ -282,6 +288,7 @@ mod tests {
         assert_eq!(messages[0].tokens.output, 50);
         assert_eq!(messages[0].tokens.cache_read, 200);
         assert_eq!(messages[0].cost, 0.05);
+        assert!(messages[0].has_authoritative_cost());
     }
 
     #[test]
@@ -296,6 +303,21 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.input, 50);
+        assert!(!messages[0].has_authoritative_cost());
+    }
+
+    #[test]
+    fn test_parse_openclaw_session_zero_cost_is_provider_reported() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"type":"model_change","provider":"anthropic","modelId":"claude-3.5-sonnet"}
+{"type":"message","id":"msg1","message":{"role":"assistant","content":[],"usage":{"input":50,"output":25,"cost":{"total":0.0}},"timestamp":1700000000000}}"#;
+
+        let session_path = create_test_session(&dir, "session.jsonl", content);
+        let messages = parse_openclaw_session(Path::new(&session_path), "test-session");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cost, 0.0);
+        assert!(messages[0].has_authoritative_cost());
     }
 
     #[test]

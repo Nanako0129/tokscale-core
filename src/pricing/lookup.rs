@@ -139,6 +139,19 @@ pub struct LookupResult {
     pub matched_key: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EstimateCoverage {
+    Complete,
+    Partial,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CostEstimate {
+    pub(crate) cost: f64,
+    pub(crate) coverage: EstimateCoverage,
+}
+
 impl PricingLookup {
     pub fn new(
         litellm: HashMap<String, ModelPricing>,
@@ -1161,41 +1174,55 @@ impl PricingLookup {
         self.calculate_cost_with_provider(model_id, None, &usage)
     }
 
+    pub(crate) fn estimate_cost_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> Option<CostEstimate> {
+        let result = self.lookup_with_provider(model_id, provider_id)?;
+        Some(compute_cost_and_coverage_for_lookup_result(&result, usage))
+    }
+
     pub fn calculate_cost_with_provider(
         &self,
         model_id: &str,
         provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> f64 {
-        let result = match self.lookup_with_provider(model_id, provider_id) {
-            Some(r) => r,
-            None => return 0.0,
-        };
-
-        compute_cost_for_lookup_result(&result, usage)
+        self.estimate_cost_with_provider(model_id, provider_id, usage)
+            .map_or(0.0, |estimate| estimate.cost)
     }
 }
 
-pub(crate) fn compute_cost_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> f64 {
-    if uses_full_session_long_context_tier(result) {
-        return compute_full_session_long_context_cost(
+pub(crate) fn compute_cost_and_coverage_for_lookup_result(
+    result: &LookupResult,
+    usage: &TokenBreakdown,
+) -> CostEstimate {
+    let cost = if uses_full_session_long_context_tier(result) {
+        compute_full_session_long_context_cost(
             &result.pricing,
             usage.input,
             usage.output,
             usage.cache_read,
             usage.cache_write,
             usage.reasoning,
-        );
-    }
+        )
+    } else {
+        compute_cost(
+            &result.pricing,
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+            usage.reasoning,
+        )
+    };
 
-    compute_cost(
-        &result.pricing,
-        usage.input,
-        usage.output,
-        usage.cache_read,
-        usage.cache_write,
-        usage.reasoning,
-    )
+    CostEstimate {
+        cost,
+        coverage: coverage_for_lookup_result(result, usage),
+    }
 }
 
 fn uses_full_session_long_context_tier(result: &LookupResult) -> bool {
@@ -1212,6 +1239,202 @@ fn uses_full_session_long_context_tier(result: &LookupResult) -> bool {
         && FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS
             .iter()
             .any(|key| terminal_model_id.eq_ignore_ascii_case(key))
+}
+
+#[derive(Clone, Copy)]
+enum BucketCoverage {
+    Known,
+    Partial,
+    Unknown,
+}
+
+#[derive(Default)]
+struct CoverageFold {
+    known: bool,
+    unknown: bool,
+}
+
+impl CoverageFold {
+    fn observe(&mut self, coverage: Option<BucketCoverage>) {
+        match coverage {
+            Some(BucketCoverage::Known) => self.known = true,
+            Some(BucketCoverage::Partial) => {
+                self.known = true;
+                self.unknown = true;
+            }
+            Some(BucketCoverage::Unknown) => self.unknown = true,
+            None => {}
+        }
+    }
+
+    fn finish(self) -> EstimateCoverage {
+        if !self.known && !self.unknown {
+            EstimateCoverage::None
+        } else if !self.unknown {
+            EstimateCoverage::Complete
+        } else if self.known {
+            EstimateCoverage::Partial
+        } else {
+            EstimateCoverage::None
+        }
+    }
+}
+
+fn is_active_bucket(tokens: f64) -> bool {
+    tokens > 0.0
+}
+
+fn ordinary_bucket_coverage(
+    tokens: f64,
+    base: Option<f64>,
+    tiers: &[(f64, Option<f64>)],
+) -> Option<BucketCoverage> {
+    if !is_active_bucket(tokens) {
+        return None;
+    }
+    if base.is_some_and(is_valid_price_value) {
+        return Some(BucketCoverage::Known);
+    }
+
+    let first_valid_tier = tiers.iter().find(|(threshold, rate)| {
+        threshold.is_finite()
+            && *threshold > 0.0
+            && rate.is_some_and(is_valid_price_value)
+    });
+    if first_valid_tier.is_some_and(|(threshold, _)| tokens > *threshold) {
+        Some(BucketCoverage::Partial)
+    } else {
+        Some(BucketCoverage::Unknown)
+    }
+}
+
+fn selected_long_context_bucket_coverage(
+    tokens: f64,
+    base: Option<f64>,
+    long_context: Option<f64>,
+    use_long_context_rates: bool,
+) -> Option<BucketCoverage> {
+    if !is_active_bucket(tokens) {
+        return None;
+    }
+
+    let selected_rate = if use_long_context_rates {
+        long_context
+            .filter(|value| is_valid_price_value(*value))
+            .or(base.filter(|value| is_valid_price_value(*value)))
+    } else {
+        base.filter(|value| is_valid_price_value(*value))
+    };
+    Some(if selected_rate.is_some() {
+        BucketCoverage::Known
+    } else {
+        BucketCoverage::Unknown
+    })
+}
+
+fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> EstimateCoverage {
+    let input_clamped = usage.input.max(0) as f64;
+    let output_clamped = usage.output.max(0).saturating_add(usage.reasoning.max(0)) as f64;
+    let cache_read_clamped = usage.cache_read.max(0) as f64;
+    let cache_write_clamped = usage.cache_write.max(0) as f64;
+    let mut fold = CoverageFold::default();
+
+    if uses_full_session_long_context_tier(result) {
+        let use_long_context_rates =
+            input_clamped + cache_read_clamped > TIERED_PRICING_THRESHOLD_272K_TOKENS;
+        fold.observe(selected_long_context_bucket_coverage(
+            input_clamped,
+            result.pricing.input_cost_per_token,
+            result.pricing.input_cost_per_token_above_272k_tokens,
+            use_long_context_rates,
+        ));
+        fold.observe(selected_long_context_bucket_coverage(
+            output_clamped,
+            result.pricing.output_cost_per_token,
+            result.pricing.output_cost_per_token_above_272k_tokens,
+            use_long_context_rates,
+        ));
+        fold.observe(selected_long_context_bucket_coverage(
+            cache_read_clamped,
+            result.pricing.cache_read_input_token_cost,
+            result.pricing.cache_read_input_token_cost_above_272k_tokens,
+            use_long_context_rates,
+        ));
+    } else {
+        fold.observe(ordinary_bucket_coverage(
+            input_clamped,
+            result.pricing.input_cost_per_token,
+            &[
+                (
+                    TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                    result.pricing.input_cost_per_token_above_128k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                    result.pricing.input_cost_per_token_above_200k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                    result.pricing.input_cost_per_token_above_256k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                    result.pricing.input_cost_per_token_above_272k_tokens,
+                ),
+            ],
+        ));
+        fold.observe(ordinary_bucket_coverage(
+            output_clamped,
+            result.pricing.output_cost_per_token,
+            &[
+                (
+                    TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                    result.pricing.output_cost_per_token_above_128k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                    result.pricing.output_cost_per_token_above_200k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                    result.pricing.output_cost_per_token_above_256k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                    result.pricing.output_cost_per_token_above_272k_tokens,
+                ),
+            ],
+        ));
+        fold.observe(ordinary_bucket_coverage(
+            cache_read_clamped,
+            result.pricing.cache_read_input_token_cost,
+            &[
+                (
+                    TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                    result.pricing.cache_read_input_token_cost_above_200k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                    result.pricing.cache_read_input_token_cost_above_272k_tokens,
+                ),
+            ],
+        ));
+    }
+
+    // Cache-write remains an independent marginal bucket, including for the
+    // full-session long-context identities.
+    fold.observe(ordinary_bucket_coverage(
+        cache_write_clamped,
+        result.pricing.cache_creation_input_token_cost,
+        &[(
+            TIERED_PRICING_THRESHOLD_200K_TOKENS,
+            result
+                .pricing
+                .cache_creation_input_token_cost_above_200k_tokens,
+        )],
+    ));
+
+    fold.finish()
 }
 
 pub fn compute_cost(
@@ -5368,6 +5591,127 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_coverage_partial_keeps_known_input_subtotal() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "partial-model".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 10,
+            output: 5,
+            cache_write: 7,
+            ..Default::default()
+        };
+
+        let estimate = lookup
+            .estimate_cost_with_provider("partial-model", Some("provider"), &usage)
+            .unwrap();
+        assert_eq!(estimate.coverage, EstimateCoverage::Partial);
+        assert!((estimate.cost - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_estimate_coverage_zero_rates_is_complete() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "free-model".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                cache_read_input_token_cost: Some(0.0),
+                cache_creation_input_token_cost: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 10,
+            output: 5,
+            cache_read: 3,
+            cache_write: 7,
+            reasoning: 2,
+        };
+
+        let estimate = lookup
+            .estimate_cost_with_provider("free-model", None, &usage)
+            .unwrap();
+        assert_eq!(estimate.cost, 0.0);
+        assert_eq!(estimate.coverage, EstimateCoverage::Complete);
+    }
+
+    #[test]
+    fn test_estimate_lookup_miss_returns_none() {
+        let lookup = PricingLookup::new(HashMap::new(), HashMap::new(), HashMap::new());
+        assert!(lookup
+            .estimate_cost_with_provider("nonexistent-model", None, &TokenBreakdown::default())
+            .is_none());
+    }
+
+    #[test]
+    fn test_estimate_coverage_without_active_tokens_is_none() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "free-model".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let estimate = lookup
+            .estimate_cost_with_provider("free-model", None, &TokenBreakdown::default())
+            .unwrap();
+        assert_eq!(estimate.cost, 0.0);
+        assert_eq!(estimate.coverage, EstimateCoverage::None);
+    }
+
+    #[test]
+    fn test_estimate_coverage_missing_base_crossing_valid_tier_is_partial() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "tiered-model".into(),
+            ModelPricing {
+                input_cost_per_token_above_200k_tokens: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let above = lookup
+            .estimate_cost_with_provider(
+                "tiered-model",
+                None,
+                &TokenBreakdown {
+                    input: 200_001,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(above.coverage, EstimateCoverage::Partial);
+        assert!((above.cost - 0.002).abs() < 1e-12);
+
+        let at = lookup
+            .estimate_cost_with_provider(
+                "tiered-model",
+                None,
+                &TokenBreakdown {
+                    input: 200_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(at.coverage, EstimateCoverage::None);
+        assert_eq!(at.cost, 0.0);
+    }
+
+    #[test]
     fn test_calculate_cost_tiered_all_buckets_with_reasoning_threshold_crossing() {
         let mut litellm = HashMap::new();
         litellm.insert(
@@ -5850,7 +6194,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let cost = compute_cost_for_lookup_result(
+        let cost = compute_cost_and_coverage_for_lookup_result(
             &result,
             &TokenBreakdown {
                 input: 272_001,
@@ -5859,7 +6203,8 @@ mod tests {
                 cache_write: 0,
                 reasoning: 0,
             },
-        );
+        )
+        .cost;
         let expected = 272_000.0 * 0.000005 + 1.0 * 0.000010 + 0.000030;
         assert!((cost - expected).abs() < 1e-12);
     }

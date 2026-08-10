@@ -6,7 +6,9 @@ pub mod lookup;
 pub mod openrouter;
 
 use custom::CustomPricing;
-use lookup::{compute_cost_for_lookup_result, LookupResult, PricingLookup};
+use lookup::{
+    compute_cost_and_coverage_for_lookup_result, CostEstimate, LookupResult, PricingLookup,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -305,23 +307,30 @@ impl PricingService {
         self.calculate_cost_with_provider(model_id, None, &usage)
     }
 
+    pub(crate) fn estimate_cost_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> Option<CostEstimate> {
+        if self.custom.is_empty() {
+            return self
+                .lookup
+                .estimate_cost_with_provider(model_id, provider_id, usage);
+        }
+
+        let result = self.lookup_with_source_and_provider(model_id, None, provider_id)?;
+        Some(compute_cost_and_coverage_for_lookup_result(&result, usage))
+    }
+
     pub fn calculate_cost_with_provider(
         &self,
         model_id: &str,
         provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> f64 {
-        if self.custom.is_empty() {
-            return self
-                .lookup
-                .calculate_cost_with_provider(model_id, provider_id, usage);
-        }
-
-        let Some(result) = self.lookup_with_source_and_provider(model_id, None, provider_id) else {
-            return 0.0;
-        };
-
-        compute_cost_for_lookup_result(&result, usage)
+        self.estimate_cost_with_provider(model_id, provider_id, usage)
+            .map_or(0.0, |estimate| estimate.cost)
     }
 
     fn lookup_custom(&self, model_id: &str) -> Option<LookupResult> {
