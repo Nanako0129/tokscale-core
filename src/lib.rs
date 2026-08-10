@@ -4238,7 +4238,8 @@ where
     }
 
     // ---- Flush trae keep-latest (after all other lanes) ----
-    for m in trae_latest.into_values() {
+    for mut m in trae_latest.into_values() {
+        apply_pricing_if_available(&mut m, pricing);
         if passes_client(&m) && filter(&m) { sink(&m); }
     }
 
@@ -5947,6 +5948,79 @@ mod tests {
         .unwrap();
         assert!(best_effort.is_none());
         assert_eq!(best_effort_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trae_streaming_flush_applies_best_effort_pricing_after_latest_selection() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let trae_dir = PathBuf::from(
+            ClientId::Trae
+                .data()
+                .resolve_path_with_env_strategy(source_home.path().to_str().unwrap(), false),
+        );
+        std::fs::create_dir_all(&trae_dir).unwrap();
+        std::fs::write(
+            trae_dir.join("sessions.json"),
+            serde_json::json!([{
+                "model_name": "GPT-5.4",
+                "session_id": "missing-cost",
+                "usage_time": 1_776_000_000,
+                "extra_info": {
+                    "input_token": 10,
+                    "output_token": 5,
+                    "cache_read_token": 0,
+                    "cache_write_token": 0
+                }
+            }])
+            .to_string(),
+        )
+        .unwrap();
+
+        let clients = ["trae".to_string()];
+        let mut local = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| local.push(message.clone()),
+        );
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].cost, 0.0);
+        assert_eq!(local[0].cost_source, CostSource::Unknown);
+
+        let pricing = pricing::PricingService::new(
+            HashMap::from([(
+                "gpt-5.4".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.01),
+                    output_cost_per_token: Some(0.02),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::new(),
+        );
+        let mut best_effort = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| best_effort.push(message.clone()),
+        );
+        assert_eq!(best_effort.len(), 1);
+        assert!((best_effort[0].cost - 0.2).abs() < 1e-9);
+        assert_eq!(best_effort[0].cost_source, CostSource::Estimated);
     }
 
     #[test]
