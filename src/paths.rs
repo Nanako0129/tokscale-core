@@ -14,6 +14,26 @@
 
 use std::path::PathBuf;
 
+/// Resolve the process home used for scanner roots.
+///
+/// Non-Windows platforms keep the existing HOME-first behavior. Windows only
+/// accepts HOME when it crosses the existing String seam losslessly and Rust
+/// recognizes it as a native absolute path (drive or UNC); all other values
+/// fall back to the platform home.
+pub(crate) fn platform_home_dir() -> Option<PathBuf> {
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+
+    #[cfg(target_os = "windows")]
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+
+    home.or_else(dirs::home_dir)
+}
+
 /// Resolve the tokscale config dir, honoring `TOKSCALE_CONFIG_DIR` first.
 ///
 /// Resolution order:
@@ -113,57 +133,102 @@ mod tests {
     use std::env;
     use std::path::Path;
 
-    fn save_env() -> (
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-    ) {
-        (
-            env::var_os("TOKSCALE_CONFIG_DIR"),
-            env::var_os("HOME"),
-            env::var_os("XDG_CONFIG_HOME"),
-        )
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self(
+                ["TOKSCALE_CONFIG_DIR", "HOME", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key, env::var_os(key)))
+                    .collect(),
+            )
+        }
     }
 
-    fn restore_env(
-        prev: (
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-        ),
-    ) {
-        unsafe {
-            match prev.0 {
-                Some(v) => env::set_var("TOKSCALE_CONFIG_DIR", v),
-                None => env::remove_var("TOKSCALE_CONFIG_DIR"),
-            }
-            match prev.1 {
-                Some(v) => env::set_var("HOME", v),
-                None => env::remove_var("HOME"),
-            }
-            match prev.2 {
-                Some(v) => env::set_var("XDG_CONFIG_HOME", v),
-                None => env::remove_var("XDG_CONFIG_HOME"),
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                }
             }
         }
     }
 
     #[test]
     #[serial]
+    #[cfg(not(target_os = "windows"))]
+    fn platform_home_dir_preserves_non_windows_home_value() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("HOME", "relative/home");
+        }
+
+        assert_eq!(platform_home_dir(), Some(PathBuf::from("relative/home")));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(target_os = "windows")]
+    fn platform_home_dir_accepts_only_native_absolute_windows_home() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let _env = EnvGuard::capture();
+        let fallback = dirs::home_dir();
+
+        for invalid in ["", "/home/user", r"C:temp"] {
+            unsafe {
+                env::set_var("HOME", invalid);
+            }
+            assert_eq!(
+                platform_home_dir(),
+                fallback,
+                "invalid Windows HOME must fall back: {invalid:?}"
+            );
+        }
+
+        for valid in [r"C:\Users\tokscale-test", r"\\server\share\tokscale-test"] {
+            unsafe {
+                env::set_var("HOME", valid);
+            }
+            assert_eq!(
+                platform_home_dir(),
+                Some(PathBuf::from(valid)),
+                "native absolute Windows HOME must win: {valid:?}"
+            );
+        }
+
+        let non_unicode =
+            std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800]);
+        unsafe {
+            env::set_var("HOME", &non_unicode);
+        }
+        assert_eq!(
+            platform_home_dir(),
+            fallback,
+            "non-Unicode Windows HOME must fail closed because the scanner home seam is String"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn env_override_is_returned_verbatim() {
-        let prev = save_env();
+        let _env = EnvGuard::capture();
         unsafe {
             env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-custom");
         }
         assert_eq!(get_config_dir(), PathBuf::from("/tmp/tokscale-custom"));
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn unix_default_is_dot_config_tokscale_under_home() {
-        let prev = save_env();
+        let _env = EnvGuard::capture();
         unsafe {
             env::remove_var("TOKSCALE_CONFIG_DIR");
             env::remove_var("XDG_CONFIG_HOME");
@@ -173,14 +238,13 @@ mod tests {
             get_config_dir(),
             PathBuf::from("/tmp/tokscale-core-paths-home/.config/tokscale"),
         );
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
     fn linux_honors_xdg_config_home_when_set() {
-        let prev = save_env();
+        let _env = EnvGuard::capture();
         unsafe {
             env::remove_var("TOKSCALE_CONFIG_DIR");
             env::set_var("XDG_CONFIG_HOME", "/tmp/tokscale-core-paths-xdg");
@@ -189,13 +253,12 @@ mod tests {
             get_config_dir(),
             PathBuf::from("/tmp/tokscale-core-paths-xdg/tokscale"),
         );
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn cache_dir_is_cache_subdir_of_config_dir() {
-        let prev = save_env();
+        let _env = EnvGuard::capture();
         unsafe {
             env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-cache-test");
         }
@@ -203,25 +266,23 @@ mod tests {
             get_cache_dir(),
             PathBuf::from("/tmp/tokscale-cache-test/cache")
         );
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn legacy_helpers_return_none_when_overridden() {
-        let prev = save_env();
+        let _env = EnvGuard::capture();
         unsafe {
             env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-override");
         }
         assert!(legacy_dirs_cache_dir().is_none());
         assert!(legacy_dot_cache_tokscale_dir().is_none());
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn legacy_helpers_return_some_when_not_overridden() {
-        let prev = save_env();
+        let _env = EnvGuard::capture();
         unsafe {
             env::remove_var("TOKSCALE_CONFIG_DIR");
         }
@@ -233,7 +294,6 @@ mod tests {
             legacy_dot_cache_tokscale_dir().is_some(),
             "HOME is set in test environments"
         );
-        restore_env(prev);
     }
 
     #[test]
@@ -243,7 +303,7 @@ mod tests {
         // produced PathBuf::from(""), which silently relocated cache
         // writes to ./cache and ./.tokscale. The resolver must agree
         // with `is_config_dir_overridden`: empty == unset.
-        let prev = save_env();
+        let _env = EnvGuard::capture();
         unsafe {
             env::set_var("TOKSCALE_CONFIG_DIR", "");
         }
@@ -257,17 +317,15 @@ mod tests {
             resolved.is_absolute() || resolved == Path::new(".tokscale"),
             "empty override must fall through to platform default, got {resolved:?}"
         );
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn is_config_dir_overridden_treats_empty_string_as_unset() {
-        let prev = save_env();
+        let _env = EnvGuard::capture();
         unsafe {
             env::set_var("TOKSCALE_CONFIG_DIR", "");
         }
         assert!(!is_config_dir_overridden());
-        restore_env(prev);
     }
 }

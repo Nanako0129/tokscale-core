@@ -647,9 +647,10 @@ pub struct HourlyReport {
 
 pub fn get_home_dir_string(home_dir_option: &Option<String>) -> Result<String, String> {
     home_dir_option
-        .clone()
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+        .as_ref()
+        .filter(|home| !home.is_empty())
+        .cloned()
+        .or_else(|| paths::platform_home_dir().map(|path| path.to_string_lossy().into_owned()))
         .ok_or_else(|| {
             "HOME directory not specified and could not determine home directory".to_string()
         })
@@ -5871,6 +5872,34 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn get_home_dir_string_prefers_non_empty_explicit_home() {
+        let env_home = tempfile::TempDir::new().unwrap();
+        let explicit_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[("HOME", env_home.path().as_os_str())]);
+        let explicit = explicit_home.path().to_string_lossy().into_owned();
+
+        assert_eq!(
+            super::get_home_dir_string(&Some(explicit.clone())).unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_home_dir_string_empty_explicit_falls_through_platform_home() {
+        let env_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[("HOME", env_home.path().as_os_str())]);
+        let expected = env_home.path().to_string_lossy().into_owned();
+
+        assert_eq!(super::get_home_dir_string(&None).unwrap(), expected);
+        assert_eq!(
+            super::get_home_dir_string(&Some(String::new())).unwrap(),
+            expected
+        );
+    }
+
     fn scanner_fixture_path(home: &Path, relative: &str) -> PathBuf {
         #[cfg(windows)]
         {
@@ -10047,9 +10076,8 @@ mod tests {
         assert!(messages[0].cost > 0.0);
     }
 
-    fn write_kimi_repeated_status_fixture(source_home: &std::path::Path) {
-        let session_dir = source_home.join(".kimi/sessions/group-1/session-1");
-        std::fs::create_dir_all(&session_dir).unwrap();
+    fn write_kimi_repeated_status_fixture_at(session_dir: &Path) {
+        std::fs::create_dir_all(session_dir).unwrap();
         std::fs::write(
             session_dir.join("wire.jsonl"),
             r#"{"type": "metadata", "protocol_version": "1.3"}
@@ -10060,6 +10088,217 @@ mod tests {
 {"timestamp": 1770983450.0, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 8, "output": 1, "input_cache_read": 0, "input_cache_creation": 0}}}}"#,
         )
         .unwrap();
+    }
+
+    fn write_kimi_repeated_status_fixture(source_home: &Path) {
+        write_kimi_repeated_status_fixture_at(
+            &source_home.join(".kimi/sessions/group-1/session-1"),
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    #[serial_test::serial]
+    fn resolved_default_home_reaches_materialized_and_streaming_report_lanes() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", source_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        write_kimi_repeated_status_fixture(source_home.path());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let materialized = runtime
+            .block_on(parse_local_unified_messages(LocalParseOptions {
+                clients: Some(vec!["kimi".to_string()]),
+                ..Default::default()
+            }))
+            .unwrap();
+        let report = runtime
+            .block_on(get_model_report(ReportOptions {
+                clients: Some(vec!["kimi".to_string()]),
+                group_by: GroupBy::ClientModel,
+                ..Default::default()
+            }))
+            .unwrap();
+
+        assert_eq!(materialized.len(), 4);
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|message| message.tokens.input)
+                .sum::<i64>(),
+            40
+        );
+        assert_eq!(report.total_input, 40);
+        assert_eq!(report.total_output, 5);
+        assert_eq!(report.total_messages, 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial_test::serial]
+    fn windows_invalid_posix_home_falls_back_across_shipping_lanes() {
+        if std::env::var("GITHUB_ACTIONS").ok().as_deref() != Some("true") {
+            eprintln!(
+                "TS175-S1 Windows disposable-profile matrix skipped: GITHUB_ACTIONS is not exactly \"true\""
+            );
+            return;
+        }
+
+        let profile_home = dirs::home_dir().expect("GitHub-hosted Windows runner has a profile");
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", std::ffi::OsStr::new("/home/user")),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let sessions_root = profile_home.join(".kimi/sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let profile_group = tempfile::Builder::new()
+            .prefix("tokscale-ts175-")
+            .tempdir_in(&sessions_root)
+            .unwrap();
+        write_kimi_repeated_status_fixture_at(&profile_group.path().join("session-profile"));
+
+        let clients = vec!["kimi".to_string()];
+        let scanner_settings = scanner::ScannerSettings::default();
+        // Frozen 731a2dcc2589cbeaf82150933331b5b2b6b590ff returned HOME verbatim,
+        // handing exactly "/home/user" to this resolved materialized seam.
+        let frozen_materialized = parse_all_messages_with_pricing_with_env_strategy(
+            "/home/user",
+            &clients,
+            None,
+            false,
+            &scanner_settings,
+            None,
+        );
+        assert!(
+            frozen_materialized.is_empty(),
+            "the frozen raw POSIX HOME must not reach the native Windows profile fixture"
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let materialized = runtime
+            .block_on(parse_local_unified_messages(LocalParseOptions {
+                clients: Some(clients.clone()),
+                ..Default::default()
+            }))
+            .unwrap();
+        let report = runtime
+            .block_on(get_model_report(ReportOptions {
+                clients: Some(clients.clone()),
+                group_by: GroupBy::ClientModel,
+                ..Default::default()
+            }))
+            .unwrap();
+        let resolved_home = super::get_home_dir_string(&None).unwrap();
+        assert_eq!(PathBuf::from(&resolved_home), profile_home);
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            &resolved_home,
+            &clients,
+            None,
+            false,
+            &scanner_settings,
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+
+        let message_totals = |messages: &[UnifiedMessage]| {
+            (
+                messages.len(),
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                messages
+                    .iter()
+                    .map(|message| message.tokens.output)
+                    .sum::<i64>(),
+            )
+        };
+        // Legacy Kimi rows without a message_id have no dedup key, so the
+        // preserved source timestamp distinguishes those otherwise-unkeyed rows.
+        let source_identities = |messages: &[UnifiedMessage]| {
+            messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.client.clone(),
+                        message.session_id.clone(),
+                        message.timestamp,
+                        message.dedup_key.clone(),
+                    )
+                })
+                .collect::<HashSet<_>>()
+        };
+
+        assert_eq!(message_totals(&materialized), (4, 40, 5));
+        assert_eq!(
+            (
+                report.total_input,
+                report.total_output,
+                report.total_messages
+            ),
+            (40, 5, 4)
+        );
+        assert_eq!(message_totals(&streamed), (4, 40, 5));
+        assert!(materialized
+            .iter()
+            .all(|message| message.session_id == "session-profile"));
+        let materialized_identities = source_identities(&materialized);
+        assert_eq!(materialized_identities.len(), 4);
+        assert_eq!(source_identities(&streamed), materialized_identities);
+
+        let explicit_home = tempfile::TempDir::new().unwrap();
+        assert!(explicit_home.path().is_absolute());
+        write_kimi_repeated_status_fixture_at(
+            &explicit_home
+                .path()
+                .join(".kimi/sessions/group-explicit/session-explicit"),
+        );
+        let explicit_home_string = explicit_home.path().to_string_lossy().into_owned();
+        let explicit_materialized = runtime
+            .block_on(parse_local_unified_messages(LocalParseOptions {
+                home_dir: Some(explicit_home_string.clone()),
+                clients: Some(clients.clone()),
+                ..Default::default()
+            }))
+            .unwrap();
+        let explicit_report = runtime
+            .block_on(get_model_report(ReportOptions {
+                home_dir: Some(explicit_home_string),
+                clients: Some(clients),
+                group_by: GroupBy::ClientModel,
+                ..Default::default()
+            }))
+            .unwrap();
+
+        assert_eq!(message_totals(&explicit_materialized), (4, 40, 5));
+        assert!(
+            explicit_materialized
+                .iter()
+                .all(|message| message.session_id == "session-explicit"),
+            "the native explicit home must remain authoritative over the profile fallback"
+        );
+        assert_eq!(
+            (
+                explicit_report.total_input,
+                explicit_report.total_output,
+                explicit_report.total_messages,
+            ),
+            (40, 5, 4)
+        );
     }
 
     #[test]
