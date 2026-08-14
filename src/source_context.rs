@@ -78,6 +78,7 @@ pub(crate) struct SourceResolutionInputs {
     config_dir: Option<PathBuf>,
     data_local_dir: Option<PathBuf>,
     platform_home: Option<PathBuf>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     temp_dir: PathBuf,
 }
 
