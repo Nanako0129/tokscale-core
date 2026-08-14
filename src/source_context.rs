@@ -1578,7 +1578,7 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(
             context.identity_string(),
-            "sc1:feec4781dd7181640e65b2c558e217bbc053a987eb365f87eb86f6ac86b6b8ad"
+            "sc1:b50900ad7b9c7de3aa7aae5a1c629e1f9d86d422ad61686b57f307f7187b6a94"
         );
 
         #[cfg(unix)]
