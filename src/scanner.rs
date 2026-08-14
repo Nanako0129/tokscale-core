@@ -2491,7 +2491,7 @@ mod tests {
 
         let default_config_root = home.join(".config/tokscale/headless");
         let default_macos_root = home.join("Library/Application Support/tokscale/headless");
-        let whitespace_root = capture_cwd.join(" \t ");
+        let whitespace_root = capture_cwd.join("\u{00a0}");
         let custom_root = capture_cwd.join("custom-headless");
         let default_config_file = create_session(&default_config_root, "config.jsonl");
         let default_macos_file = create_session(&default_macos_root, "macos.jsonl");
@@ -2517,8 +2517,8 @@ mod tests {
             ),
             (
                 "whitespace",
-                Some(" \t "),
-                vec![PathBuf::from(" \t ")],
+                Some("\u{00a0}"),
+                vec![PathBuf::from("\u{00a0}")],
                 vec![whitespace_root],
                 vec![whitespace_file],
             ),

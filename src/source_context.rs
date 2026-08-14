@@ -3,7 +3,9 @@ use crate::scanner::ScannerSettings;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 const DOMAIN: &[u8] = b"tokenbar-source-context";
 const RESOLVER_CONTRACT_VERSION: u32 = 1;
@@ -153,8 +155,7 @@ impl SourceResolutionInputs {
     }
 
     pub(crate) fn var_string(&self, key: &str) -> Option<String> {
-        self.var_os(key)
-            .map(|value| value.to_string_lossy().into_owned())
+        self.var_os(key)?.to_str().map(ToOwned::to_owned)
     }
 }
 
@@ -274,7 +275,14 @@ impl ResolvedLocalSourceContext {
             platform_config_dir.as_deref(),
         )?;
         let extra_scan_paths = resolve_extra_scan_paths(&cwd, use_env_roots, &inputs)?;
-        let extra_dirs_input = inputs.input(ENV_TOKSCALE_EXTRA_DIRS);
+        let mut extra_dirs_input = inputs.input(ENV_TOKSCALE_EXTRA_DIRS);
+        if extra_dirs_input
+            .value
+            .as_deref()
+            .is_some_and(|value| value.to_str().is_none())
+        {
+            extra_dirs_input = CapturedInput::unset();
+        }
         source_env_paths.insert(
             ENV_TOKSCALE_EXTRA_DIRS,
             if !use_env_roots {
@@ -579,7 +587,7 @@ fn resolve_source_environment_paths(
 }
 
 fn source_env_uses_nonblank_semantics(key: &str) -> bool {
-    key != ENV_XDG_DATA_HOME && key != ENV_XDG_CONFIG_HOME
+    key != ENV_XDG_DATA_HOME && key != ENV_TOKSCALE_CONFIG_DIR && key != ENV_XDG_CONFIG_HOME
 }
 
 fn source_env_trims_surrounding_whitespace(key: &str) -> bool {
@@ -731,12 +739,11 @@ fn resolve_source_cache_dir(
 
 #[cfg(not(windows))]
 fn fully_qualified(base: &Path, path: &Path) -> Result<PathBuf, SourceContextUnavailable> {
-    let joined = if path.is_absolute() {
+    Ok(if path.is_absolute() {
         path.to_path_buf()
     } else {
         base.join(path)
-    };
-    Ok(lexically_normalize(&joined))
+    })
 }
 
 #[cfg(windows)]
@@ -744,7 +751,7 @@ fn fully_qualified(base: &Path, path: &Path) -> Result<PathBuf, SourceContextUna
     use std::path::Prefix;
 
     if path.is_absolute() {
-        return Ok(lexically_normalize(path));
+        return Ok(path.to_path_buf());
     }
     match path.components().next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
@@ -760,7 +767,7 @@ fn fully_qualified(base: &Path, path: &Path) -> Result<PathBuf, SourceContextUna
                     return Err(SourceContextUnavailable);
                 }
                 let tail = path.components().skip(1).collect::<PathBuf>();
-                Ok(lexically_normalize(&base.join(tail)))
+                Ok(base.join(tail))
             }
             _ => Err(SourceContextUnavailable),
         },
@@ -770,30 +777,10 @@ fn fully_qualified(base: &Path, path: &Path) -> Result<PathBuf, SourceContextUna
             };
             let mut result = PathBuf::from(prefix.as_os_str());
             result.push(path);
-            Ok(lexically_normalize(&result))
+            Ok(result)
         }
-        _ => Ok(lexically_normalize(&base.join(path))),
+        _ => Ok(base.join(path)),
     }
-}
-
-fn lexically_normalize(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let last_is_normal = result
-                    .components()
-                    .next_back()
-                    .is_some_and(|last| matches!(last, Component::Normal(_)));
-                if last_is_normal {
-                    result.pop();
-                }
-            }
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
 }
 
 fn target_os_tag() -> u8 {
@@ -972,10 +959,54 @@ mod tests {
     }
 
     #[test]
-    fn lexical_normalization_preserves_nonexistent_paths() {
+    fn path_qualification_preserves_parent_components() {
+        let base = fixture_path("base");
+        let relative = Path::new("a/../b/./c");
         assert_eq!(
-            lexically_normalize(Path::new("/tmp/a/../b/./c")),
-            PathBuf::from("/tmp/b/c")
+            fully_qualified(&base, relative).unwrap(),
+            base.join(relative)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_paths_preserve_symlink_parent_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let cwd = root.path().join("cwd");
+        let target = root.path().join("target");
+        let target_inner = target.join("inner");
+        let target_codex = target.join("codex");
+        let lexical_codex = cwd.join("codex");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&target_inner).unwrap();
+        fs::create_dir_all(&target_codex).unwrap();
+        fs::create_dir_all(&lexical_codex).unwrap();
+        symlink(&target_inner, cwd.join("link")).unwrap();
+
+        let configured = cwd.join("link/../codex");
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            cwd,
+            Some(root.path().join("home")),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(
+                root.path(),
+                [("CODEX_HOME", configured.clone().into_os_string())],
+            ),
+        )
+        .unwrap();
+        let resolved = context.source_env_path("CODEX_HOME").unwrap();
+
+        assert_eq!(resolved, configured);
+        assert_eq!(
+            fs::canonicalize(resolved).unwrap(),
+            fs::canonicalize(target_codex).unwrap()
+        );
+        assert_ne!(
+            fs::canonicalize(resolved).unwrap(),
+            fs::canonicalize(lexical_codex).unwrap()
         );
     }
 
@@ -1043,6 +1074,36 @@ mod tests {
         assert_eq!(
             context.resolve_client_root(PathRoot::Config).unwrap(),
             explicit
+        );
+    }
+
+    #[test]
+    fn tokscale_config_dir_preserves_whitespace_only_explicit_values() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let whitespace = "\u{00a0}";
+        let explicit = fully_qualified(&cwd, Path::new(whitespace)).unwrap();
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            cwd,
+            Some(home),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(
+                &root,
+                [(ENV_TOKSCALE_CONFIG_DIR, OsString::from(whitespace))],
+            ),
+        )
+        .unwrap();
+
+        assert!(context.source_env_is_explicit(ENV_TOKSCALE_CONFIG_DIR));
+        assert_eq!(
+            context.resolve_client_root(PathRoot::Config).unwrap(),
+            explicit
+        );
+        assert_eq!(
+            context.source_cache_dir(),
+            Some(explicit.join("cache").as_path())
         );
     }
 
@@ -1161,6 +1222,7 @@ mod tests {
         let copilot_raw = OsString::from_vec(b"  copilot-\xff  ".to_vec());
         let goose_raw = OsString::from_vec(b"  goose-\xff  ".to_vec());
         let codebuff_raw = OsString::from_vec(b"  codebuff-\xff  ".to_vec());
+        let extra_dirs_raw = OsString::from_vec(b"codex=extra-\xff".to_vec());
 
         let fallback_headless = home.join(".config/tokscale/headless/codex/fallback.jsonl");
         let fallback_copilot = home.join(".copilot/otel/fallback.jsonl");
@@ -1179,7 +1241,13 @@ mod tests {
         let copilot_decoy = cwd.join("copilot-\u{fffd}");
         let goose_decoy = cwd.join("goose-\u{fffd}/data/sessions/sessions.db");
         let codebuff_decoy = cwd.join("codebuff-\u{fffd}/projects/p/chats/c/chat-messages.json");
-        for path in [&copilot_decoy, &goose_decoy, &codebuff_decoy] {
+        let extra_dirs_decoy = cwd.join("extra-\u{fffd}/sessions/decoy.jsonl");
+        for path in [
+            &copilot_decoy,
+            &goose_decoy,
+            &codebuff_decoy,
+            &extra_dirs_decoy,
+        ] {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"{}\n").unwrap();
         }
@@ -1196,6 +1264,7 @@ mod tests {
                     (ENV_COPILOT_EXPORTER, copilot_raw),
                     (ENV_GOOSE_PATH_ROOT, goose_raw),
                     (ENV_CODEBUFF_DATA_DIR, codebuff_raw),
+                    (ENV_TOKSCALE_EXTRA_DIRS, extra_dirs_raw),
                 ],
             ),
         )
@@ -1255,6 +1324,8 @@ mod tests {
         assert_eq!(scan.get(ClientId::Copilot), &[fallback_copilot]);
         assert_eq!(scan.goose_db, Some(fallback_goose));
         assert_eq!(scan.get(ClientId::Codebuff), &[fallback_codebuff]);
+        assert!(context.extra_scan_paths().is_empty());
+        assert!(!context.source_env_is_explicit(ENV_TOKSCALE_EXTRA_DIRS));
 
         // Legacy std::env::var treats every invalid native value as unavailable,
         // so the rejected payload intentionally does not contribute to identity.
@@ -1295,6 +1366,9 @@ mod tests {
         let cwd = fixture_path("cwd");
         let home = fixture_path("home");
         let invalid = OsString::from_wide(&[0x0020, 0xd800, 0x0020]);
+        let mut extra_dirs_units = "codex=extra-".encode_utf16().collect::<Vec<_>>();
+        extra_dirs_units.push(0xd800);
+        let invalid_extra_dirs = OsString::from_wide(&extra_dirs_units);
         let context = ResolvedLocalSourceContext::capture_resolved(
             cwd.clone(),
             Some(home.clone()),
@@ -1307,6 +1381,7 @@ mod tests {
                     (ENV_COPILOT_EXPORTER, invalid.clone()),
                     (ENV_GOOSE_PATH_ROOT, invalid.clone()),
                     (ENV_CODEBUFF_DATA_DIR, invalid.clone()),
+                    (ENV_TOKSCALE_EXTRA_DIRS, invalid_extra_dirs),
                 ],
             ),
         )
@@ -1336,6 +1411,8 @@ mod tests {
                 "{key}"
             );
         }
+        assert!(context.extra_scan_paths().is_empty());
+        assert!(!context.source_env_is_explicit(ENV_TOKSCALE_EXTRA_DIRS));
         assert_eq!(context.identity_bytes(), unset.identity_bytes());
 
         let ordinary = ResolvedLocalSourceContext::capture_resolved(
@@ -1390,13 +1467,10 @@ mod tests {
             ResolvedLocalSourceContext::capture(Some(PathBuf::from("home")), false, settings)
                 .unwrap();
         std::env::set_current_dir(second.path()).unwrap();
-        assert_eq!(
-            context.home_dir(),
-            lexically_normalize(&captured_cwd.join("home"))
-        );
+        assert_eq!(context.home_dir(), captured_cwd.join("home"));
         assert_eq!(
             context.scanner_settings().opencode_db_paths,
-            vec![lexically_normalize(&captured_cwd.join("db/opencode.db"))]
+            vec![captured_cwd.join("db/opencode.db")]
         );
     }
 
@@ -1454,9 +1528,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             scan.get(ClientId::Codex),
-            &vec![lexically_normalize(
-                &captured_cwd.join("codex-a/sessions/a.jsonl")
-            )]
+            &vec![captured_cwd.join("codex-a/sessions/a.jsonl")]
         );
         assert_eq!(context.identity_string(), identity);
     }
