@@ -486,6 +486,9 @@ impl ResolvedLocalSourceContext {
         descriptor.field(13);
         descriptor.path(&self.codex_archive_root)?;
 
+        descriptor.field(14);
+        descriptor.optional_path(self.source_cache_dir.as_deref())?;
+
         Ok(Sha256::digest(descriptor.0).into())
     }
 }
@@ -1065,6 +1068,10 @@ mod tests {
             context.resolve_client_root(PathRoot::Config).unwrap(),
             root.join("platform-config/tokscale")
         );
+        assert_eq!(
+            context.source_cache_dir(),
+            Some(home.join(".config/tokscale/cache").as_path())
+        );
     }
 
     #[test]
@@ -1088,6 +1095,42 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn captured_runtime_fallback_cache_root_changes_identity_without_platform_config() {
+        let root = fixture_root();
+        let mut platform = fixture_platform(&root);
+        platform.config_dir = None;
+        let runtime_a = fixture_path("runtime-a");
+        let runtime_b = fixture_path("runtime-b");
+        let capture = |runtime: &Path| {
+            ResolvedLocalSourceContext::capture_resolved(
+                fixture_path("cwd"),
+                Some(fixture_path("home")),
+                false,
+                ScannerSettings::default(),
+                fixture_inputs_with_platform(
+                    [(ENV_XDG_RUNTIME_DIR, runtime.as_os_str().to_os_string())],
+                    platform.clone(),
+                ),
+            )
+            .unwrap()
+        };
+
+        let first = capture(&runtime_a);
+        let second = capture(&runtime_b);
+
+        assert_eq!(
+            first.source_cache_dir(),
+            Some(runtime_a.join("tokscale").as_path())
+        );
+        assert_eq!(
+            second.source_cache_dir(),
+            Some(runtime_b.join("tokscale").as_path())
+        );
+        assert_ne!(first.identity_bytes(), second.identity_bytes());
+    }
+
     #[test]
     fn explicit_tokscale_config_dir_wins_over_platform_and_home_fallbacks() {
         let root = fixture_root();
@@ -1108,6 +1151,64 @@ mod tests {
             context.resolve_client_root(PathRoot::Config).unwrap(),
             explicit
         );
+    }
+
+    #[test]
+    fn captured_cache_root_changes_identity_when_env_roots_are_disabled() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let cache_a = fixture_path("cache-config-a");
+        let cache_b = fixture_path("cache-config-b");
+        let capture = |cache_config: &Path| {
+            ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                false,
+                ScannerSettings::default(),
+                fixture_inputs(
+                    &root,
+                    [(
+                        ENV_TOKSCALE_CONFIG_DIR,
+                        cache_config.as_os_str().to_os_string(),
+                    )],
+                ),
+            )
+            .unwrap()
+        };
+
+        let first = capture(&cache_a);
+        let second = capture(&cache_b);
+
+        assert_eq!(
+            first.source_cache_dir(),
+            Some(cache_a.join("cache").as_path())
+        );
+        assert_eq!(
+            second.source_cache_dir(),
+            Some(cache_b.join("cache").as_path())
+        );
+        assert_eq!(first.source_env_path(ENV_TOKSCALE_CONFIG_DIR), None);
+        assert_eq!(second.source_env_path(ENV_TOKSCALE_CONFIG_DIR), None);
+        for client in ClientId::iter() {
+            assert_eq!(
+                first.resolve_client_path(client).unwrap(),
+                second.resolve_client_path(client).unwrap(),
+                "{}",
+                client.as_str()
+            );
+        }
+        assert_eq!(
+            first.scanner_settings().opencode_db_paths,
+            second.scanner_settings().opencode_db_paths
+        );
+        assert_eq!(
+            first.scanner_settings().extra_scan_paths,
+            second.scanner_settings().extra_scan_paths
+        );
+        assert_eq!(first.extra_scan_paths(), second.extra_scan_paths());
+        assert_eq!(first.codex_archive_root(), second.codex_archive_root());
+        assert_ne!(first.identity_bytes(), second.identity_bytes());
     }
 
     #[test]
@@ -1610,6 +1711,60 @@ mod tests {
     }
 
     #[test]
+    fn cache_content_and_mtime_are_excluded_from_source_identity() {
+        let root = TempDir::new().unwrap();
+        let cache_config = root.path().join("cache-config");
+        let cache_root = cache_config.join("cache");
+        let marker = cache_root.join("state.bin");
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::write(&marker, b"first").unwrap();
+        let set_mtime =
+            |seconds| {
+                fs::File::options()
+                    .write(true)
+                    .open(&marker)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    ))
+                    .unwrap();
+            };
+        let capture = || {
+            ResolvedLocalSourceContext::capture_resolved(
+                root.path().join("cwd"),
+                Some(root.path().join("home")),
+                false,
+                ScannerSettings::default(),
+                fixture_inputs(
+                    root.path(),
+                    [(
+                        ENV_TOKSCALE_CONFIG_DIR,
+                        cache_config.as_os_str().to_os_string(),
+                    )],
+                ),
+            )
+            .unwrap()
+        };
+
+        set_mtime(1_700_000_000);
+        let first_metadata = fs::metadata(&marker).unwrap();
+        let first = capture();
+        fs::write(&marker, b"different and longer cache content").unwrap();
+        set_mtime(1_800_000_000);
+        let second_metadata = fs::metadata(&marker).unwrap();
+        let second = capture();
+
+        assert_ne!(first_metadata.len(), second_metadata.len());
+        assert_ne!(
+            first_metadata.modified().unwrap(),
+            second_metadata.modified().unwrap()
+        );
+        assert_eq!(first.source_cache_dir(), Some(cache_root.as_path()));
+        assert_eq!(second.source_cache_dir(), Some(cache_root.as_path()));
+        assert_eq!(first.identity_bytes(), second.identity_bytes());
+    }
+
+    #[test]
     #[serial]
     fn captured_scanner_ignores_later_env_and_cwd_mutation() {
         let root = TempDir::new().unwrap();
@@ -1691,7 +1846,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(
             identity,
-            "sc1:71a08e3ea0fc17242e46aa010e2b36908671fe27ce4aef36cc06cd11f7b38891"
+            "sc1:f980f9db19f3217fcc6059d8e5f1253b50307020c97e8584f2da357dce7d3424"
         );
 
         #[cfg(unix)]
@@ -1739,6 +1894,81 @@ mod tests {
             descriptor.0,
             vec![2, 0, 0, 0, 5, 0x00, 0x43, 0x00, 0x3a, 0x00, 0x5c, 0xd8, 0x00, 0x00, 0x61,]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_none_and_some_cache_roots_have_distinct_identity() {
+        let root = fixture_root();
+        let mut platform = fixture_platform(&root);
+        platform.config_dir = None;
+        let without_cache = ResolvedLocalSourceContext::capture_resolved(
+            fixture_path("cwd"),
+            Some(fixture_path("home")),
+            false,
+            ScannerSettings::default(),
+            fixture_inputs_with_platform([], platform.clone()),
+        )
+        .unwrap();
+        let explicit = fixture_path("explicit-cache-config");
+        let with_cache = ResolvedLocalSourceContext::capture_resolved(
+            fixture_path("cwd"),
+            Some(fixture_path("home")),
+            false,
+            ScannerSettings::default(),
+            fixture_inputs_with_platform(
+                [(ENV_TOKSCALE_CONFIG_DIR, explicit.as_os_str().to_os_string())],
+                platform,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(without_cache.source_cache_dir(), None);
+        assert_eq!(
+            with_cache.source_cache_dir(),
+            Some(explicit.join("cache").as_path())
+        );
+        assert_ne!(without_cache.identity_bytes(), with_cache.identity_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cache_root_identity_preserves_unpaired_utf16() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = fixture_root();
+        let native_root = PathBuf::from(OsString::from_wide(&[0x0043, 0x003a, 0x005c, 0xd800]));
+        let replacement_decoy =
+            PathBuf::from(OsString::from_wide(&[0x0043, 0x003a, 0x005c, 0xfffd]));
+        let capture = |cache_config: &Path| {
+            ResolvedLocalSourceContext::capture_resolved(
+                fixture_path("cwd"),
+                Some(fixture_path("home")),
+                false,
+                ScannerSettings::default(),
+                fixture_inputs(
+                    &root,
+                    [(
+                        ENV_TOKSCALE_CONFIG_DIR,
+                        cache_config.as_os_str().to_os_string(),
+                    )],
+                ),
+            )
+            .unwrap()
+        };
+
+        let native = capture(&native_root);
+        let decoy = capture(&replacement_decoy);
+
+        assert_eq!(
+            native.source_cache_dir(),
+            Some(native_root.join("cache").as_path())
+        );
+        assert_eq!(
+            decoy.source_cache_dir(),
+            Some(replacement_decoy.join("cache").as_path())
+        );
+        assert_ne!(native.identity_bytes(), decoy.identity_bytes());
     }
 
     #[test]
@@ -1824,7 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn pricing_and_cache_configuration_do_not_change_source_identity() {
+    fn pricing_cache_only_and_unused_runtime_fallback_do_not_change_source_identity() {
         let root = fixture_root();
         let base = fixture_inputs(&root, [(ENV_HOME, fixture_path("home").into_os_string())]);
         let changed = fixture_inputs(
@@ -1854,6 +2084,7 @@ mod tests {
             changed,
         )
         .unwrap();
+        assert_eq!(first.source_cache_dir(), second.source_cache_dir());
         assert_eq!(first.identity_bytes(), second.identity_bytes());
         assert!(!first.pricing_cache_only());
         assert!(second.pricing_cache_only());
@@ -1883,6 +2114,101 @@ mod tests {
         assert!(contexts
             .windows(2)
             .all(|pair| pair[0].identity_bytes() == pair[1].identity_bytes()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn retained_only_report_is_bound_to_captured_cache_root_identity() {
+        let root = TempDir::new().unwrap();
+        let cwd = root.path().join("cwd");
+        let source_home = root.path().join("source-home");
+        let cache_config_a = root.path().join("cache-config-a");
+        let cache_config_b = root.path().join("cache-config-b");
+        let pricing_sandbox = root.path().join("pricing-sandbox");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&pricing_sandbox).unwrap();
+
+        let claude_dir = source_home.join(".claude/projects/myproject");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("conversation.jsonl");
+        let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let turn_two = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+        fs::write(&transcript, format!("{turn_one}\n{turn_two}\n")).unwrap();
+
+        let env = EnvGuard::capture(&[
+            ENV_HOME,
+            ENV_TOKSCALE_CONFIG_DIR,
+            ENV_XDG_CONFIG_HOME,
+            "XDG_CACHE_HOME",
+        ]);
+        env.set(ENV_HOME, &pricing_sandbox);
+        env.set(ENV_TOKSCALE_CONFIG_DIR, &pricing_sandbox);
+        env.set(ENV_XDG_CONFIG_HOME, pricing_sandbox.join("xdg-config"));
+        env.set("XDG_CACHE_HOME", pricing_sandbox.join("xdg-cache"));
+
+        let capture = |cache_config: &Path| {
+            ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(source_home.clone()),
+                false,
+                ScannerSettings::default(),
+                fixture_inputs(
+                    root.path(),
+                    [
+                        (
+                            ENV_TOKSCALE_CONFIG_DIR,
+                            cache_config.as_os_str().to_os_string(),
+                        ),
+                        (ENV_TOKSCALE_PRICING_CACHE_ONLY, OsString::from("1")),
+                    ],
+                ),
+            )
+            .unwrap()
+        };
+        let context_a = capture(&cache_config_a);
+        let context_b = capture(&cache_config_b);
+        let report_options = || crate::ReportOptions {
+            clients: Some(vec!["claude".to_string()]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            context_a.resolve_client_path(ClientId::Claude).unwrap(),
+            context_b.resolve_client_path(ClientId::Claude).unwrap()
+        );
+        assert_eq!(
+            context_a.source_cache_dir(),
+            Some(cache_config_a.join("cache").as_path())
+        );
+        assert_eq!(
+            context_b.source_cache_dir(),
+            Some(cache_config_b.join("cache").as_path())
+        );
+        assert_ne!(context_a.identity_bytes(), context_b.identity_bytes());
+
+        let seeded_a = crate::get_model_report_with_source_context(&context_a, report_options())
+            .await
+            .unwrap();
+        assert_eq!(seeded_a.total_messages, 2);
+        assert_eq!(seeded_a.total_input, 300);
+        assert_eq!(seeded_a.total_output, 110);
+
+        fs::write(&transcript, format!("{turn_two}\n")).unwrap();
+
+        let retained_a = crate::get_model_report_with_source_context(&context_a, report_options())
+            .await
+            .unwrap();
+        let cold_b = crate::get_model_report_with_source_context(&context_b, report_options())
+            .await
+            .unwrap();
+
+        assert_eq!(retained_a.total_messages, 2);
+        assert_eq!(retained_a.total_input, 300);
+        assert_eq!(retained_a.total_output, 110);
+        assert_eq!(cold_b.total_messages, 1);
+        assert_eq!(cold_b.total_input, 200);
+        assert_eq!(cold_b.total_output, 60);
+        assert_ne!(retained_a.total_output, cold_b.total_output);
     }
 
     #[test]
