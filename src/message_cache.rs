@@ -1210,11 +1210,17 @@ impl SourceMessageCache {
         max_shard_bytes: u64,
         cache_root_is_resolved: bool,
     ) -> Self {
-        let Some(root) = cache_root.clone() else {
-            return Self {
-                cache_root_is_resolved,
-                ..Self::default()
-            };
+        let failed_load = || Self {
+            cache_root: if cache_root_is_resolved {
+                cache_root.clone()
+            } else {
+                None
+            },
+            cache_root_is_resolved,
+            ..Self::default()
+        };
+        let Some(root) = cache_root.as_deref() else {
+            return failed_load();
         };
         let shard_root = root.join(CACHE_SHARD_DIRNAME);
         let lock_path = root.join(CACHE_LOCK_FILENAME);
@@ -1224,7 +1230,7 @@ impl SourceMessageCache {
                 &shard_root,
                 &error,
             );
-            return Self::default();
+            return failed_load();
         }
         let lock_file = match OpenOptions::new()
             .read(true)
@@ -1240,16 +1246,16 @@ impl SourceMessageCache {
                     &lock_path,
                     &error,
                 );
-                return Self::default();
+                return failed_load();
             }
         };
         if let Err(error) = fs2::FileExt::lock_shared(&lock_file) {
             warn_cache_failure_once("source message cache lock failed", &lock_path, &error);
-            return Self::default();
+            return failed_load();
         }
 
         let mut cache = Self {
-            cache_root,
+            cache_root: cache_root.clone(),
             cache_root_is_resolved,
             ..Self::default()
         };
@@ -2061,6 +2067,43 @@ mod tests {
     fn cache_shard_path(identity: CacheIdentity, path: &Path) -> PathBuf {
         let root = cache_shard_dir().unwrap();
         shard_path(&root, &CacheKey::new(identity, path).shard())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolved_root_survives_fail_soft_load_without_live_fallback() {
+        let profile_a = TempDir::new().unwrap();
+        let profile_b = TempDir::new().unwrap();
+        let captured_root = profile_a.path().join("cache");
+        std::fs::create_dir_all(&captured_root).unwrap();
+        std::fs::write(
+            captured_root.join(CACHE_SHARD_DIRNAME),
+            b"not a directory\n",
+        )
+        .unwrap();
+
+        let prev_env = sandbox_cache_env(profile_a.path());
+        let mut cache = SourceMessageCache::load_from_root(Some(&captured_root));
+        let retained_root = cache.cache_root.clone();
+        let retained_resolved_flag = cache.cache_root_is_resolved;
+
+        unsafe {
+            std::env::set_var("TOKSCALE_CONFIG_DIR", profile_b.path());
+        }
+        cache.dirty = true;
+        cache.save_if_dirty();
+        let live_cache_created = profile_b.path().join("cache").exists();
+        restore_cache_env(prev_env);
+
+        assert_eq!(retained_root.as_deref(), Some(captured_root.as_path()));
+        assert!(
+            retained_resolved_flag,
+            "a failed resolved-root load must retain resolved ownership"
+        );
+        assert!(
+            !live_cache_created,
+            "a dirty save must not fall back to the live profile after a resolved-root load fails"
+        );
     }
 
     #[test]
