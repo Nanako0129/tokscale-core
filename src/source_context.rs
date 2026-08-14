@@ -556,6 +556,11 @@ fn resolve_source_environment_paths(
                     )?),
                 },
             }
+        } else if cfg!(target_os = "linux")
+            && key == ENV_XDG_CONFIG_HOME
+            && input.state == InputState::Empty
+        {
+            ResolvedPathInput::explicit(&input, PathBuf::from(std::path::MAIN_SEPARATOR_STR))
         } else if input.state == InputState::Empty {
             ResolvedPathInput::fallback(
                 &input,
@@ -1104,6 +1109,26 @@ mod tests {
         assert_eq!(
             context.source_cache_dir(),
             Some(explicit.join("cache").as_path())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_config_home_preserves_explicit_empty_root() {
+        let root = fixture_root();
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            fixture_path("cwd"),
+            Some(fixture_path("home")),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, [(ENV_XDG_CONFIG_HOME, OsString::new())]),
+        )
+        .unwrap();
+
+        assert!(context.source_env_is_explicit(ENV_XDG_CONFIG_HOME));
+        assert_eq!(
+            context.resolve_client_root(PathRoot::Config).unwrap(),
+            PathBuf::from("/tokscale")
         );
     }
 
