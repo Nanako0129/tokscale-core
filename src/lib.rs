@@ -19451,3 +19451,95 @@ mod tests {
         });
     }
 }
+
+// ============================================================================
+// PROTOTYPE — window usage. Throwaway; not for commit.
+// Returns the window's messages, one row each. No bucketing: a quota window is
+// a tiny slice of history (~1.5k messages for 5h against 180k total), so the
+// consumer can fold it however the UI wants without another round trip.
+// ============================================================================
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowMessage {
+    pub timestamp: i64,
+    pub client: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub cost: f64,
+    pub is_turn_start: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowUsage {
+    pub messages: Vec<WindowMessage>,
+    /// Messages with no usable timestamp, so no window membership can be
+    /// decided. Counted, never silently dropped.
+    pub undated_count: u32,
+    pub processing_time_ms: u32,
+}
+
+pub async fn get_window_usage(
+    options: ReportOptions,
+    from_ms: i64,
+    until_ms: i64,
+) -> Result<WindowUsage, String> {
+    let start = Instant::now();
+    if until_ms <= from_ms {
+        return Err("until_ms must be greater than from_ms".to_string());
+    }
+    if options.since.is_some() || options.until.is_some() || options.year.is_some() {
+        return Err("since/until/year are local-date filters and cannot be combined with an absolute window".to_string());
+    }
+
+    let home_dir = get_home_dir_string(&options.home_dir)?;
+    let clients = resolve_report_clients(&options);
+    let pricing = load_pricing_for_local_parse().await;
+    let msg_filter = |_m: &UnifiedMessage| -> bool { true };
+
+    let mut messages: Vec<WindowMessage> = Vec::new();
+    let mut undated_count: u32 = 0;
+
+    scan_messages_streaming(
+        &home_dir,
+        &clients,
+        pricing.as_deref(),
+        options.use_env_roots,
+        &options.scanner_settings,
+        &msg_filter,
+        &mut |msg: &UnifiedMessage| {
+            if msg.timestamp <= 0 {
+                undated_count = undated_count.saturating_add(1);
+                return;
+            }
+            if msg.timestamp < from_ms || msg.timestamp >= until_ms {
+                return;
+            }
+            messages.push(WindowMessage {
+                timestamp: msg.timestamp,
+                client: msg.client.clone(),
+                provider_id: msg.provider_id.clone(),
+                model_id: canonical_model_id(&msg.model_id),
+                input: msg.tokens.input,
+                output: msg.tokens.output,
+                cache_read: msg.tokens.cache_read,
+                cache_write: msg.tokens.cache_write,
+                reasoning: msg.tokens.reasoning,
+                cost: msg.cost,
+                is_turn_start: msg.is_turn_start,
+            });
+        },
+    );
+
+    messages.sort_by_key(|m| m.timestamp);
+
+    Ok(WindowUsage {
+        messages,
+        undated_count,
+        processing_time_ms: start.elapsed().as_millis() as u32,
+    })
+}
