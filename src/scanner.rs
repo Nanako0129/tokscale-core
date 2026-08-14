@@ -2458,6 +2458,129 @@ mod tests {
 
     #[test]
     #[serial]
+    fn source_context_headless_overrides_match_legacy_capture_time_scan() {
+        let dir = TempDir::new().unwrap();
+        let requested_capture_cwd = dir.path().join("capture-cwd");
+        let requested_later_cwd = dir.path().join("later-cwd");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&requested_capture_cwd).unwrap();
+        fs::create_dir_all(&requested_later_cwd).unwrap();
+        let capture_cwd = fs::canonicalize(requested_capture_cwd).unwrap();
+        let later_cwd = fs::canonicalize(requested_later_cwd).unwrap();
+        let _cwd = CwdGuard::change(&capture_cwd);
+        let mut env =
+            EnvGuard::capture(&["TOKSCALE_HEADLESS_DIR", "TOKSCALE_EXTRA_DIRS", "CODEX_HOME"]);
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        env.remove("CODEX_HOME");
+
+        let create_session = |root: &Path, name: &str| {
+            let path = root.join("codex").join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"{}\n").unwrap();
+            path
+        };
+        let canonical_files = |files: &[PathBuf]| {
+            let mut files = files
+                .iter()
+                .map(fs::canonicalize)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            files.sort_unstable();
+            files
+        };
+
+        let default_config_root = home.join(".config/tokscale/headless");
+        let default_macos_root = home.join("Library/Application Support/tokscale/headless");
+        let whitespace_root = capture_cwd.join(" \t ");
+        let custom_root = capture_cwd.join("custom-headless");
+        let default_config_file = create_session(&default_config_root, "config.jsonl");
+        let default_macos_file = create_session(&default_macos_root, "macos.jsonl");
+        let empty_file = create_session(&capture_cwd, "capture-cwd.jsonl");
+        let later_empty_file = create_session(&later_cwd, "later-cwd.jsonl");
+        let whitespace_file = create_session(&whitespace_root, "whitespace.jsonl");
+        let custom_file = create_session(&custom_root, "custom.jsonl");
+
+        let cases = vec![
+            (
+                "unset",
+                None,
+                vec![default_config_root.clone(), default_macos_root.clone()],
+                vec![default_config_root, default_macos_root],
+                vec![default_config_file, default_macos_file],
+            ),
+            (
+                "empty",
+                Some(""),
+                vec![PathBuf::new()],
+                vec![capture_cwd.clone()],
+                vec![empty_file],
+            ),
+            (
+                "whitespace",
+                Some(" \t "),
+                vec![PathBuf::from(" \t ")],
+                vec![whitespace_root],
+                vec![whitespace_file],
+            ),
+            (
+                "nonempty",
+                Some("custom-headless"),
+                vec![PathBuf::from("custom-headless")],
+                vec![custom_root],
+                vec![custom_file],
+            ),
+        ];
+        let mut identities = BTreeMap::new();
+        let later_empty_file = fs::canonicalize(later_empty_file).unwrap();
+
+        for (name, override_value, legacy_roots, context_roots, expected_files) in cases {
+            std::env::set_current_dir(&capture_cwd).unwrap();
+            match override_value {
+                Some(value) => env.set("TOKSCALE_HEADLESS_DIR", value),
+                None => env.remove("TOKSCALE_HEADLESS_DIR"),
+            }
+
+            assert_eq!(
+                headless_roots_with_env_strategy(home.to_str().unwrap(), true),
+                legacy_roots,
+                "{name}"
+            );
+            let legacy_scan = scan_all_clients_with_env_strategy(
+                home.to_str().unwrap(),
+                &["codex".to_string()],
+                true,
+            );
+            let legacy_files = canonical_files(legacy_scan.get(ClientId::Codex));
+            let context = ResolvedLocalSourceContext::capture(
+                Some(home.clone()),
+                true,
+                ScannerSettings::default(),
+            )
+            .unwrap();
+            identities.insert(name, context.identity_bytes());
+
+            std::env::set_current_dir(&later_cwd).unwrap();
+            assert_eq!(
+                headless_roots_with_source_context(&context).unwrap(),
+                context_roots,
+                "{name}"
+            );
+            let context_scan =
+                scan_all_clients_with_source_context(&context, &["codex".to_string()]).unwrap();
+            let context_files = canonical_files(context_scan.get(ClientId::Codex));
+            let expected_files = canonical_files(&expected_files);
+            assert_eq!(legacy_files, expected_files, "legacy {name}");
+            assert_eq!(context_files, expected_files, "context {name}");
+            assert!(!context_files.contains(&later_empty_file), "{name}");
+        }
+
+        assert_ne!(identities["unset"], identities["empty"]);
+        assert_ne!(identities["unset"], identities["whitespace"]);
+        assert_ne!(identities["empty"], identities["whitespace"]);
+    }
+
+    #[test]
+    #[serial]
     fn test_scan_all_clients_opencode() {
         let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
 

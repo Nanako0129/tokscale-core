@@ -213,6 +213,14 @@ impl ResolvedPathInput {
         }
     }
 
+    fn unavailable(path: PathBuf) -> Self {
+        Self {
+            state: InputState::Unset,
+            resolution: PathResolution::Fallback,
+            path: Some(path),
+        }
+    }
+
     fn explicit(input: &CapturedInput, path: PathBuf) -> Self {
         Self {
             state: input.state,
@@ -501,13 +509,54 @@ fn resolve_source_environment_paths(
             ResolvedPathInput::fallback(&input, home.to_path_buf())
         } else if !use_env_roots {
             ResolvedPathInput::ignored()
+        } else if key == ENV_TOKSCALE_HEADLESS_DIR {
+            match input.value.as_deref() {
+                None => ResolvedPathInput::fallback(
+                    &input,
+                    fallback_source_env_path(key, home, platform_config_dir)?,
+                ),
+                Some(raw) => match raw.to_str() {
+                    Some(value) => {
+                        ResolvedPathInput::explicit(&input, fully_qualified(cwd, Path::new(value))?)
+                    }
+                    None => ResolvedPathInput::unavailable(fallback_source_env_path(
+                        key,
+                        home,
+                        platform_config_dir,
+                    )?),
+                },
+            }
+        } else if source_env_trims_surrounding_whitespace(key) {
+            match input.value.as_deref() {
+                None => ResolvedPathInput::fallback(
+                    &input,
+                    fallback_source_env_path(key, home, platform_config_dir)?,
+                ),
+                Some(raw) => match raw.to_str() {
+                    Some(value) if value.trim().is_empty() => ResolvedPathInput::fallback(
+                        &input,
+                        fallback_source_env_path(key, home, platform_config_dir)?,
+                    ),
+                    Some(value) => ResolvedPathInput::explicit(
+                        &input,
+                        fully_qualified(cwd, Path::new(value.trim()))?,
+                    ),
+                    None => ResolvedPathInput::unavailable(fallback_source_env_path(
+                        key,
+                        home,
+                        platform_config_dir,
+                    )?),
+                },
+            }
         } else if input.state == InputState::Empty {
             ResolvedPathInput::fallback(
                 &input,
                 fallback_source_env_path(key, home, platform_config_dir)?,
             )
         } else if let Some(raw) = input.value.as_deref() {
-            if source_env_uses_nonblank_semantics(key) && raw.to_string_lossy().trim().is_empty() {
+            if source_env_uses_nonblank_semantics(key)
+                && raw.to_str().is_some_and(|value| value.trim().is_empty())
+            {
                 ResolvedPathInput::fallback(
                     &input,
                     fallback_source_env_path(key, home, platform_config_dir)?,
@@ -515,12 +564,7 @@ fn resolve_source_environment_paths(
             } else if key == ENV_TOKSCALE_EXTRA_DIRS {
                 ResolvedPathInput::fallback(&input, home.to_path_buf())
             } else {
-                let path = if source_env_trims_surrounding_whitespace(key) {
-                    PathBuf::from(raw.to_string_lossy().trim())
-                } else {
-                    PathBuf::from(raw)
-                };
-                ResolvedPathInput::explicit(&input, fully_qualified(cwd, &path)?)
+                ResolvedPathInput::explicit(&input, fully_qualified(cwd, Path::new(raw))?)
             }
         } else {
             ResolvedPathInput::fallback(
@@ -1101,6 +1145,213 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unicode_string_overrides_reject_non_utf8_native_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = TempDir::new().unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("home");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let headless_raw = OsString::from_vec(b"  headless-\xff  ".to_vec());
+        let copilot_raw = OsString::from_vec(b"  copilot-\xff  ".to_vec());
+        let goose_raw = OsString::from_vec(b"  goose-\xff  ".to_vec());
+        let codebuff_raw = OsString::from_vec(b"  codebuff-\xff  ".to_vec());
+
+        let fallback_headless = home.join(".config/tokscale/headless/codex/fallback.jsonl");
+        let fallback_copilot = home.join(".copilot/otel/fallback.jsonl");
+        let fallback_goose = home.join(".local/share/goose/sessions/sessions.db");
+        let fallback_codebuff = home.join(".config/manicode/projects/p/chats/c/chat-messages.json");
+        for path in [
+            &fallback_headless,
+            &fallback_copilot,
+            &fallback_goose,
+            &fallback_codebuff,
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"{}\n").unwrap();
+        }
+
+        let copilot_decoy = cwd.join("copilot-\u{fffd}");
+        let goose_decoy = cwd.join("goose-\u{fffd}/data/sessions/sessions.db");
+        let codebuff_decoy = cwd.join("codebuff-\u{fffd}/projects/p/chats/c/chat-messages.json");
+        for path in [&copilot_decoy, &goose_decoy, &codebuff_decoy] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"{}\n").unwrap();
+        }
+
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(
+                root.path(),
+                [
+                    (ENV_TOKSCALE_HEADLESS_DIR, headless_raw),
+                    (ENV_COPILOT_EXPORTER, copilot_raw),
+                    (ENV_GOOSE_PATH_ROOT, goose_raw),
+                    (ENV_CODEBUFF_DATA_DIR, codebuff_raw),
+                ],
+            ),
+        )
+        .unwrap();
+        let unset = ResolvedLocalSourceContext::capture_resolved(
+            cwd,
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(root.path(), []),
+        )
+        .unwrap();
+
+        for (key, fallback) in [
+            (
+                ENV_TOKSCALE_HEADLESS_DIR,
+                home.join(".config/tokscale/headless"),
+            ),
+            (ENV_COPILOT_EXPORTER, home.join(".copilot/otel")),
+            (ENV_GOOSE_PATH_ROOT, home.join(".local/share/goose")),
+            (ENV_CODEBUFF_DATA_DIR, home.join(".config/manicode")),
+        ] {
+            assert!(!context.source_env_is_explicit(key), "{key}");
+            assert_eq!(
+                context.source_env_path(key),
+                Some(fallback.as_path()),
+                "{key}"
+            );
+            assert!(
+                !context
+                    .source_env_path(key)
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains('\u{fffd}'),
+                "{key}"
+            );
+        }
+
+        assert_eq!(
+            crate::scanner::headless_roots_with_source_context(&context).unwrap(),
+            vec![
+                home.join(".config/tokscale/headless"),
+                home.join("Library/Application Support/tokscale/headless"),
+            ]
+        );
+        let scan = crate::scanner::scan_all_clients_with_source_context(
+            &context,
+            &[
+                "codex".to_string(),
+                "copilot".to_string(),
+                "goose".to_string(),
+                "codebuff".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(scan.get(ClientId::Codex), &[fallback_headless]);
+        assert_eq!(scan.get(ClientId::Copilot), &[fallback_copilot]);
+        assert_eq!(scan.goose_db, Some(fallback_goose));
+        assert_eq!(scan.get(ClientId::Codebuff), &[fallback_codebuff]);
+
+        // Legacy std::env::var treats every invalid native value as unavailable,
+        // so the rejected payload intentionally does not contribute to identity.
+        assert_eq!(context.identity_bytes(), unset.identity_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_env_paths_preserve_non_utf8_native_units() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let raw = OsString::from_vec(b"  codex-\xff  ".to_vec());
+        let expected = fully_qualified(&cwd, Path::new(&raw)).unwrap();
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            cwd,
+            Some(fixture_path("home")),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, [("CODEX_HOME", raw)]),
+        )
+        .unwrap();
+
+        assert!(context.source_env_is_explicit("CODEX_HOME"));
+        assert_eq!(
+            context.source_env_path("CODEX_HOME"),
+            Some(expected.as_path())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unicode_string_overrides_reject_unpaired_utf16_values() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let invalid = OsString::from_wide(&[0x0020, 0xd800, 0x0020]);
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(
+                &root,
+                [
+                    (ENV_TOKSCALE_HEADLESS_DIR, invalid.clone()),
+                    (ENV_COPILOT_EXPORTER, invalid.clone()),
+                    (ENV_GOOSE_PATH_ROOT, invalid.clone()),
+                    (ENV_CODEBUFF_DATA_DIR, invalid.clone()),
+                ],
+            ),
+        )
+        .unwrap();
+        let unset = ResolvedLocalSourceContext::capture_resolved(
+            cwd,
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, []),
+        )
+        .unwrap();
+
+        for (key, fallback) in [
+            (
+                ENV_TOKSCALE_HEADLESS_DIR,
+                home.join(".config/tokscale/headless"),
+            ),
+            (ENV_COPILOT_EXPORTER, home.join(".copilot/otel")),
+            (ENV_GOOSE_PATH_ROOT, home.join(".local/share/goose")),
+            (ENV_CODEBUFF_DATA_DIR, home.join(".config/manicode")),
+        ] {
+            assert!(!context.source_env_is_explicit(key), "{key}");
+            assert_eq!(
+                context.source_env_path(key),
+                Some(fallback.as_path()),
+                "{key}"
+            );
+        }
+        assert_eq!(context.identity_bytes(), unset.identity_bytes());
+
+        let ordinary = ResolvedLocalSourceContext::capture_resolved(
+            fixture_path("cwd"),
+            Some(home),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, [("CODEX_HOME", invalid.clone())]),
+        )
+        .unwrap();
+        let expected = fully_qualified(&fixture_path("cwd"), Path::new(&invalid)).unwrap();
+        assert!(ordinary.source_env_is_explicit("CODEX_HOME"));
+        assert_eq!(
+            ordinary.source_env_path("CODEX_HOME"),
+            Some(expected.as_path())
+        );
     }
 
     #[test]
