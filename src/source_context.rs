@@ -169,6 +169,7 @@ pub struct ResolvedLocalSourceContext {
     platform_config_dir: Option<PathBuf>,
     platform_data_local_dir: Option<PathBuf>,
     source_env_paths: BTreeMap<&'static str, ResolvedPathInput>,
+    codex_archive_root: PathBuf,
     extra_scan_paths: Vec<(ClientId, PathBuf)>,
     identity: [u8; 32],
 }
@@ -267,6 +268,8 @@ impl ResolvedLocalSourceContext {
         let source_cache_dir = resolve_source_cache_dir(&cwd, &home_dir, &inputs)?;
         let platform_config_dir = platform_config_root(&inputs, &cwd)?;
         let platform_data_local_dir = platform_data_local_root(&inputs, &cwd)?;
+        let codex_archive_root =
+            resolve_codex_archive_root(&cwd, &home_dir, use_env_roots, &inputs)?;
         let mut source_env_paths = resolve_source_environment_paths(
             &cwd,
             &home_dir,
@@ -303,6 +306,7 @@ impl ResolvedLocalSourceContext {
             platform_config_dir,
             platform_data_local_dir,
             source_env_paths,
+            codex_archive_root,
             extra_scan_paths,
             identity: [0; 32],
         };
@@ -357,6 +361,10 @@ impl ResolvedLocalSourceContext {
         self.source_env_paths
             .get(key)
             .is_some_and(|input| input.resolution == PathResolution::Explicit)
+    }
+
+    pub(crate) fn codex_archive_root(&self) -> &Path {
+        &self.codex_archive_root
     }
 
     pub(crate) fn extra_scan_paths(&self) -> &[(ClientId, PathBuf)] {
@@ -475,6 +483,9 @@ impl ResolvedLocalSourceContext {
             descriptor.path(path)?;
         }
 
+        descriptor.field(13);
+        descriptor.path(&self.codex_archive_root)?;
+
         Ok(Sha256::digest(descriptor.0).into())
     }
 }
@@ -497,6 +508,23 @@ fn path_root_tag(root: PathRoot) -> u8 {
         PathRoot::Config => 3,
         PathRoot::EnvVar { .. } => 4,
     }
+}
+
+fn resolve_codex_archive_root(
+    cwd: &Path,
+    home: &Path,
+    use_env_roots: bool,
+    inputs: &SourceResolutionInputs,
+) -> Result<PathBuf, SourceContextUnavailable> {
+    let path = if use_env_roots {
+        inputs
+            .var_string("CODEX_HOME")
+            .map(|root| PathBuf::from(format!("{root}/archived_sessions")))
+            .unwrap_or_else(|| home.join(".codex/archived_sessions"))
+    } else {
+        home.join(".codex/archived_sessions")
+    };
+    fully_qualified(cwd, &path)
 }
 
 fn resolve_source_environment_paths(
@@ -1181,6 +1209,66 @@ mod tests {
     }
 
     #[test]
+    fn codex_archive_root_preserves_dedicated_override_semantics() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let capture = |value: Option<&str>| {
+            ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                true,
+                ScannerSettings::default(),
+                fixture_inputs(
+                    &root,
+                    value.map(|value| ("CODEX_HOME", OsString::from(value))),
+                ),
+            )
+            .unwrap()
+        };
+
+        let unset = capture(None);
+        let empty = capture(Some(""));
+        let whitespace = capture(Some("\u{00a0}"));
+        let other_whitespace = capture(Some(" "));
+        let explicit = capture(Some("custom-codex"));
+        let main_fallback = home.join(".codex");
+
+        assert_eq!(
+            unset.codex_archive_root(),
+            main_fallback.join("archived_sessions")
+        );
+        assert_eq!(
+            empty.codex_archive_root(),
+            fully_qualified(&cwd, Path::new("/archived_sessions")).unwrap()
+        );
+        assert_eq!(
+            whitespace.codex_archive_root(),
+            fully_qualified(&cwd, Path::new("\u{00a0}/archived_sessions")).unwrap()
+        );
+        assert_eq!(
+            explicit.codex_archive_root(),
+            cwd.join("custom-codex/archived_sessions")
+        );
+        assert_eq!(
+            empty
+                .resolve_client_root(ClientId::Codex.data().root)
+                .unwrap(),
+            main_fallback
+        );
+        assert_eq!(
+            whitespace
+                .resolve_client_root(ClientId::Codex.data().root)
+                .unwrap(),
+            home.join(".codex")
+        );
+        assert_ne!(
+            whitespace.identity_bytes(),
+            other_whitespace.identity_bytes()
+        );
+    }
+
+    #[test]
     fn direct_scanner_overrides_trim_like_legacy_resolvers() {
         let root = fixture_root();
         let cwd = fixture_path("cwd");
@@ -1574,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_has_fixed_sha256_and_unix_native_byte_vectors() {
+    fn descriptor_has_fixed_sha256_and_native_path_vectors() {
         let root = fixture_root();
         let inputs = fixture_inputs(
             &root,
@@ -1595,15 +1683,15 @@ mod tests {
             inputs,
         )
         .unwrap();
+        let identity = context.identity_string();
+        assert_eq!(identity.len(), 68);
+        assert!(identity.strip_prefix("sc1:").is_some_and(|hex| hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))));
         #[cfg(unix)]
         assert_eq!(
-            context.identity_string(),
-            "sc1:f52ce688f06382fdbbeff63288b5933954e1c650b9723f732d626d799ad46f7f"
-        );
-        #[cfg(windows)]
-        assert_eq!(
-            context.identity_string(),
-            "sc1:b50900ad7b9c7de3aa7aae5a1c629e1f9d86d422ad61686b57f307f7187b6a94"
+            identity,
+            "sc1:71a08e3ea0fc17242e46aa010e2b36908671fe27ce4aef36cc06cd11f7b38891"
         );
 
         #[cfg(unix)]

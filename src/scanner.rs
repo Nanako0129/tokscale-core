@@ -1087,7 +1087,7 @@ fn scan_all_clients_resolved_inner(
         );
         push(
             ClientId::Codex,
-            codex_home.join("archived_sessions"),
+            context.codex_archive_root().to_path_buf(),
             ClientId::Codex.data().pattern,
         );
         for root in &headless_roots {
@@ -2454,6 +2454,71 @@ mod tests {
                 PathBuf::from("/tmp/home/Library/Application Support/tokscale/headless")
             ]
         );
+    }
+
+    #[test]
+    #[serial]
+    fn source_context_codex_archives_match_legacy_capture_time_scan() {
+        let dir = TempDir::new().unwrap();
+        let capture_cwd = dir.path().join("capture-cwd");
+        let later_cwd = dir.path().join("later-cwd");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&capture_cwd).unwrap();
+        fs::create_dir_all(&later_cwd).unwrap();
+        let capture_cwd = fs::canonicalize(capture_cwd).unwrap();
+        let later_cwd = fs::canonicalize(later_cwd).unwrap();
+        let _cwd = CwdGuard::change(&capture_cwd);
+        let mut env = EnvGuard::capture(&["CODEX_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        env.set("CODEX_HOME", "\u{00a0}");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+
+        let write_session = |path: &Path| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"{}\n").unwrap();
+            fs::canonicalize(path).unwrap()
+        };
+        let main = write_session(&home.join(".codex/sessions/main.jsonl"));
+        let archive = write_session(&capture_cwd.join("\u{00a0}/archived_sessions/archive.jsonl"));
+        let fallback_archive = write_session(&home.join(".codex/archived_sessions/fallback.jsonl"));
+        let later_archive =
+            write_session(&later_cwd.join("\u{00a0}/archived_sessions/later.jsonl"));
+
+        let legacy = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["codex".to_string()],
+            true,
+        );
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home), true, ScannerSettings::default())
+                .unwrap();
+        std::env::set_current_dir(&later_cwd).unwrap();
+        let resolved =
+            scan_all_clients_with_source_context(&context, &["codex".to_string()]).unwrap();
+        let canonical = |scan: &ScanResult| {
+            let mut files = scan
+                .get(ClientId::Codex)
+                .iter()
+                .map(|path| {
+                    fs::canonicalize(if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        capture_cwd.join(path)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            files.sort_unstable();
+            files
+        };
+        let mut expected = vec![main, archive];
+        expected.sort_unstable();
+        let legacy = canonical(&legacy);
+        let resolved = canonical(&resolved);
+
+        assert_eq!(legacy, expected);
+        assert_eq!(resolved, expected);
+        assert!(!resolved.contains(&fallback_archive));
+        assert!(!resolved.contains(&later_archive));
     }
 
     #[test]
