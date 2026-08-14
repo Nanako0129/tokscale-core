@@ -9,8 +9,21 @@ use walkdir::WalkDir;
 
 use crate::clients::{ClientId, PathRoot};
 use crate::sessions::{normalize_workspace_key, workspace_label_from_key};
+use crate::{ResolvedLocalSourceContext, SourceContextUnavailable};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Source-affecting environment variables read directly by scanner resolvers
+/// rather than through a client's `PathRoot` definition.
+pub(crate) const DIRECT_SOURCE_ENV_KEYS: &[&str] = &[
+    "TOKSCALE_HEADLESS_DIR",
+    "COPILOT_OTEL_FILE_EXPORTER_PATH",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "KIMI_CODE_HOME",
+    "TOKSCALE_EXTRA_DIRS",
+    "GOOSE_PATH_ROOT",
+];
 
 /// Emit a one-time `tracing::warn!` if `path` does not start with the scan's
 /// supplied home directory. The scan is NOT blocked — this is a heads-up only.
@@ -276,12 +289,15 @@ fn is_kiro_ide_session_artifact(root: &Path, path: &Path) -> bool {
 
 /// Scan a single directory for session files
 pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
-    let root_path = std::path::Path::new(root);
+    scan_directory_path(Path::new(root), pattern)
+}
+
+fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
     if !root_path.exists() {
         return Vec::new();
     }
 
-    let mut paths: Vec<PathBuf> = WalkDir::new(root)
+    let mut paths: Vec<PathBuf> = WalkDir::new(root_path)
         .into_iter()
         .par_bridge()
         .filter_map(|e| e.ok())
@@ -875,6 +891,35 @@ pub fn scan_all_clients_with_scanner_settings(
     scan_all_clients_with_env_strategy_inner(home_dir, clients, use_env_roots, scanner_settings)
 }
 
+pub fn scan_all_clients_with_source_context(
+    context: &ResolvedLocalSourceContext,
+    clients: &[String],
+) -> Result<ScanResult, SourceContextUnavailable> {
+    scan_all_clients_resolved_inner(context, clients)
+}
+
+pub fn headless_roots_with_source_context(
+    context: &ResolvedLocalSourceContext,
+) -> Result<Vec<PathBuf>, SourceContextUnavailable> {
+    let roots =
+        if context.use_env_roots() && context.source_env_is_explicit("TOKSCALE_HEADLESS_DIR") {
+            vec![context
+                .source_env_path("TOKSCALE_HEADLESS_DIR")
+                .ok_or(SourceContextUnavailable)?
+                .to_path_buf()]
+        } else {
+            default_headless_roots(context.home_dir())
+        };
+    Ok(roots)
+}
+
+fn default_headless_roots(home_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        home_dir.join(".config/tokscale/headless"),
+        home_dir.join("Library/Application Support/tokscale/headless"),
+    ]
+}
+
 /// Scan all session client directories in parallel
 pub fn scan_all_clients_with_env_strategy(
     home_dir: &str,
@@ -887,6 +932,403 @@ pub fn scan_all_clients_with_env_strategy(
         use_env_roots,
         &ScannerSettings::default(),
     )
+}
+
+fn scan_all_clients_resolved_inner(
+    context: &ResolvedLocalSourceContext,
+    clients: &[String],
+) -> Result<ScanResult, SourceContextUnavailable> {
+    let mut result = ScanResult::default();
+    let home_dir = context.home_dir();
+    let use_env_roots = context.use_env_roots();
+    let scanner_settings = context.scanner_settings();
+
+    let include_all = clients.is_empty();
+    let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
+    let enabled: HashSet<ClientId> = if include_all || include_synthetic {
+        ClientId::iter().collect()
+    } else {
+        clients
+            .iter()
+            .filter_map(|s| ClientId::from_str(s))
+            .collect()
+    };
+    let headless_roots = headless_roots_with_source_context(context)?;
+    let mut tasks: Vec<(ClientId, PathBuf, &'static str)> = Vec::new();
+    let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
+
+    let mut push = |client_id: ClientId, path: PathBuf, pattern: &'static str| {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        if seen_scan_roots.insert((client_id, path.clone())) {
+            tasks.push((client_id, path, pattern));
+        }
+    };
+
+    for client_id in &enabled {
+        if matches!(
+            client_id,
+            ClientId::OpenCode
+                | ClientId::Codex
+                | ClientId::OpenClaw
+                | ClientId::RooCode
+                | ClientId::KiloCode
+                | ClientId::Cline
+                | ClientId::Kilo
+                | ClientId::Hermes
+                | ClientId::Goose
+                | ClientId::Zed
+                | ClientId::Crush
+                | ClientId::Codebuff
+        ) {
+            continue;
+        }
+        push(
+            *client_id,
+            context.resolve_client_path(*client_id)?,
+            client_id.data().pattern,
+        );
+    }
+
+    if enabled.contains(&ClientId::Kimi) {
+        let home = if use_env_roots {
+            context
+                .source_env_path("KIMI_CODE_HOME")
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home_dir.join(".kimi-code"))
+        } else {
+            home_dir.join(".kimi-code")
+        };
+        push(
+            ClientId::Kimi,
+            home.join("sessions"),
+            ClientId::Kimi.data().pattern,
+        );
+    }
+
+    let mut grok_unified_paths = Vec::new();
+    if enabled.contains(&ClientId::Grok) {
+        push_grok_unified_log_candidates(
+            &mut grok_unified_paths,
+            &context.resolve_client_path(ClientId::Grok)?,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    if enabled.contains(&ClientId::Kiro) {
+        for root in [
+            home_dir.join("Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent"),
+            home_dir.join("Library/Application Support/kiro/User/globalStorage/kiro.kiroagent"),
+        ] {
+            push(ClientId::Kiro, root, "kiro-globalstorage");
+        }
+    }
+    if enabled.contains(&ClientId::Kiro) {
+        push(
+            ClientId::Kiro,
+            home_dir.join(".kiro/sessions"),
+            "kiro-ide-session",
+        );
+    }
+
+    for (client_id, path) in extra_scan_paths_for(scanner_settings, &enabled) {
+        if client_id == ClientId::Grok {
+            push_grok_unified_log_candidates(&mut grok_unified_paths, &path);
+        }
+        push(client_id, path, client_id.data().pattern);
+    }
+
+    if enabled.contains(&ClientId::Claude) {
+        push(
+            ClientId::Claude,
+            home_dir.join(".claude/transcripts"),
+            ClientId::Claude.data().pattern,
+        );
+        for path in crate::cc_mirror::discover_claude_project_roots(home_dir) {
+            push(ClientId::Claude, path, ClientId::Claude.data().pattern);
+        }
+        for path in discover_cowork_project_roots(home_dir) {
+            push(ClientId::Claude, path, ClientId::Claude.data().pattern);
+        }
+    }
+
+    if use_env_roots {
+        for (client_id, path) in context.extra_scan_paths() {
+            if enabled.contains(client_id) {
+                if *client_id == ClientId::Grok {
+                    push_grok_unified_log_candidates(&mut grok_unified_paths, path);
+                }
+                push(*client_id, path.clone(), client_id.data().pattern);
+            }
+        }
+    }
+
+    let xdg_data = context.resolve_client_root(PathRoot::XdgData)?;
+    if enabled.contains(&ClientId::OpenCode) {
+        result.opencode_dbs = discover_opencode_dbs(&xdg_data.join("opencode"));
+        merge_user_opencode_db_paths(
+            &mut result.opencode_dbs,
+            &scanner_settings.opencode_db_paths,
+        );
+        result.opencode_dbs.sort_unstable();
+        result.opencode_dbs.dedup();
+        let path = context.resolve_client_path(ClientId::OpenCode)?;
+        result.opencode_json_dir = Some(path.clone());
+        push(ClientId::OpenCode, path, ClientId::OpenCode.data().pattern);
+    }
+
+    if enabled.contains(&ClientId::Codex) {
+        let codex_home = context.resolve_client_root(ClientId::Codex.data().root)?;
+        push(
+            ClientId::Codex,
+            codex_home.join("sessions"),
+            ClientId::Codex.data().pattern,
+        );
+        push(
+            ClientId::Codex,
+            codex_home.join("archived_sessions"),
+            ClientId::Codex.data().pattern,
+        );
+        for root in &headless_roots {
+            push(
+                ClientId::Codex,
+                root.join("codex"),
+                ClientId::Codex.data().pattern,
+            );
+        }
+    }
+
+    if enabled.contains(&ClientId::OpenClaw) {
+        for path in [
+            context.resolve_client_path(ClientId::OpenClaw)?,
+            home_dir.join(".clawdbot/agents"),
+            home_dir.join(".moltbot/agents"),
+            home_dir.join(".moldbot/agents"),
+        ] {
+            push(ClientId::OpenClaw, path, ClientId::OpenClaw.data().pattern);
+        }
+    }
+    if enabled.contains(&ClientId::Pi) {
+        push(
+            ClientId::Pi,
+            home_dir.join(".omp/agent/sessions"),
+            ClientId::Pi.data().pattern,
+        );
+    }
+    if include_synthetic {
+        let candidate = xdg_data.join("octofriend/sqlite.db");
+        if candidate.exists() {
+            result.synthetic_db = Some(candidate);
+        }
+    }
+
+    if enabled.contains(&ClientId::RooCode) {
+        push(
+            ClientId::RooCode,
+            context.resolve_client_path(ClientId::RooCode)?,
+            ClientId::RooCode.data().pattern,
+        );
+        push(
+            ClientId::RooCode,
+            home_dir
+                .join(".vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks"),
+            ClientId::RooCode.data().pattern,
+        );
+    }
+    if enabled.contains(&ClientId::KiloCode) {
+        push(
+            ClientId::KiloCode,
+            context.resolve_client_path(ClientId::KiloCode)?,
+            ClientId::KiloCode.data().pattern,
+        );
+        push(
+            ClientId::KiloCode,
+            home_dir.join(".vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks"),
+            ClientId::KiloCode.data().pattern,
+        );
+    }
+    if enabled.contains(&ClientId::Cline) {
+        push(
+            ClientId::Cline,
+            context.resolve_client_path(ClientId::Cline)?,
+            ClientId::Cline.data().pattern,
+        );
+        let mut roots = vec![
+            home_dir.join(
+                "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
+            ),
+            home_dir.join("AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/tasks"),
+            home_dir.join(".vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks"),
+        ];
+        if cfg!(target_os = "windows") && use_env_roots {
+            if let Some(app_data) = context.source_env_path("APPDATA") {
+                roots.push(app_data.join("Code/User/globalStorage/saoudrizwan.claude-dev/tasks"));
+            }
+        }
+        for root in roots {
+            push(ClientId::Cline, root, ClientId::Cline.data().pattern);
+        }
+    }
+
+    if enabled.contains(&ClientId::Kilo) {
+        let path = context.resolve_client_path(ClientId::Kilo)?;
+        if path.exists() {
+            result.kilo_db = Some(path);
+        }
+    }
+    if enabled.contains(&ClientId::Hermes) {
+        let hermes_root = context.resolve_client_root(ClientId::Hermes.data().root)?;
+        let hermes_is_set = use_env_roots && context.source_env_is_explicit("HERMES_HOME");
+        let mut homes = vec![hermes_root];
+        if !hermes_is_set {
+            if cfg!(target_os = "windows") && use_env_roots {
+                if let Some(local) = context.source_env_path("LOCALAPPDATA") {
+                    homes.push(local.join("hermes"));
+                }
+            }
+            homes.push(home_dir.join("AppData/Local/hermes"));
+        }
+        let mut extra_dbs = Vec::new();
+        for hermes_home in homes {
+            let default_db = hermes_home.join("state.db");
+            if default_db.is_file() {
+                if result.hermes_db.is_none() {
+                    result.hermes_db = Some(default_db);
+                } else if result.hermes_db.as_ref() != Some(&default_db) {
+                    extra_dbs.push(default_db);
+                }
+            }
+            extra_dbs.extend(discover_hermes_profile_state_dbs(&hermes_home));
+        }
+        extra_dbs.sort_unstable();
+        extra_dbs.dedup();
+        result.get_mut(ClientId::Hermes).extend(extra_dbs);
+    }
+
+    if enabled.contains(&ClientId::Goose) {
+        let mut candidates = Vec::new();
+        if use_env_roots && context.source_env_is_explicit("GOOSE_PATH_ROOT") {
+            if let Some(root) = context.source_env_path("GOOSE_PATH_ROOT") {
+                candidates.push(root.join("data/sessions/sessions.db"));
+            }
+        }
+        candidates.extend([
+            context.resolve_client_path(ClientId::Goose)?,
+            home_dir.join("Library/Application Support/goose/sessions/sessions.db"),
+            home_dir.join("Library/Application Support/Block/goose/sessions/sessions.db"),
+            home_dir.join(".local/share/Block/goose/sessions/sessions.db"),
+        ]);
+        result.goose_db = candidates.into_iter().find(|path| path.is_file());
+    }
+
+    if enabled.contains(&ClientId::Zed) {
+        let mut candidates = vec![context.resolve_client_path(ClientId::Zed)?];
+        #[cfg(target_os = "macos")]
+        candidates.push(home_dir.join("Library/Application Support/Zed/threads/threads.db"));
+        if !use_env_roots {
+            candidates.push(home_dir.join("AppData/Local/Zed/threads/threads.db"));
+        }
+        #[cfg(target_os = "windows")]
+        if use_env_roots {
+            if let Some(root) = context.data_local_dir() {
+                candidates.push(root.join("Zed/threads/threads.db"));
+            }
+        }
+        result.zed_db = candidates.into_iter().find(|path| path.is_file());
+    }
+
+    if enabled.contains(&ClientId::Crush) {
+        let path = context.resolve_client_path(ClientId::Crush)?;
+        let mut dbs = scan_crush_registry(&path);
+        dbs.sort_by(|a, b| a.db_path.cmp(&b.db_path));
+        dbs.dedup_by(|a, b| a.db_path == b.db_path);
+        result.crush_dbs = dbs;
+    }
+    if enabled.contains(&ClientId::Kiro) {
+        result.kiro_db = [
+            home_dir.join(".local/share/kiro-cli/data.sqlite3"),
+            home_dir.join("Library/Application Support/kiro-cli/data.sqlite3"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+    }
+    if enabled.contains(&ClientId::Codebuff) {
+        if use_env_roots {
+            if context.source_env_is_explicit("CODEBUFF_DATA_DIR") {
+                let root = context
+                    .source_env_path("CODEBUFF_DATA_DIR")
+                    .ok_or(SourceContextUnavailable)?;
+                push(
+                    ClientId::Codebuff,
+                    root.join("projects"),
+                    ClientId::Codebuff.data().pattern,
+                );
+            } else {
+                for channel in ["manicode", "manicode-dev", "manicode-staging"] {
+                    push(
+                        ClientId::Codebuff,
+                        home_dir.join(".config").join(channel).join("projects"),
+                        ClientId::Codebuff.data().pattern,
+                    );
+                }
+            }
+        } else {
+            for channel in ["manicode", "manicode-dev", "manicode-staging"] {
+                push(
+                    ClientId::Codebuff,
+                    home_dir.join(".config").join(channel).join("projects"),
+                    ClientId::Codebuff.data().pattern,
+                );
+            }
+        }
+    }
+
+    let scan_results: Vec<(ClientId, Vec<PathBuf>)> = tasks
+        .into_par_iter()
+        .map(|(client_id, path, pattern)| (client_id, scan_directory_path(&path, pattern)))
+        .collect();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for (client_id, files) in scan_results {
+        for file in files {
+            let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+            if seen.insert(key) {
+                result.get_mut(client_id).push(file);
+            }
+        }
+    }
+    grok_unified_paths.extend(
+        result
+            .get(ClientId::Grok)
+            .iter()
+            .filter_map(|path| grok_unified_log_path_from_updates(path)),
+    );
+    for path in grok_unified_paths {
+        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if path.is_file() && seen.insert(key) {
+            result.get_mut(ClientId::Grok).push(path);
+        }
+    }
+    result.get_mut(ClientId::Grok).sort_unstable();
+
+    if enabled.contains(&ClientId::Copilot) {
+        let desktop_db = home_dir.join(".copilot/data.db");
+        if desktop_db.is_file() {
+            result.copilot_desktop_db = Some(desktop_db);
+        }
+        if use_env_roots && context.source_env_is_explicit("COPILOT_OTEL_FILE_EXPORTER_PATH") {
+            if let Some(path) = context.source_env_path("COPILOT_OTEL_FILE_EXPORTER_PATH") {
+                let path = path.to_path_buf();
+                let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if path.is_file() && seen.insert(key) {
+                    result.get_mut(ClientId::Copilot).push(path);
+                    result.get_mut(ClientId::Copilot).sort_unstable();
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 fn scan_all_clients_with_env_strategy_inner(
@@ -1201,7 +1643,12 @@ fn scan_all_clients_with_env_strategy_inner(
         let local_path = ClientId::Cline
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
-        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Cline, local_path);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::Cline,
+            local_path,
+        );
 
         for root in cline_additional_vscode_task_roots(home_dir, use_env_roots) {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Cline, root);
@@ -1378,7 +1825,7 @@ fn scan_all_clients_with_env_strategy_inner(
     let scan_results: Vec<(ClientId, Vec<PathBuf>)> = tasks
         .into_par_iter()
         .map(|(client_id, path, pattern)| {
-            let files = scan_directory(&path, pattern);
+            let files = scan_directory_path(Path::new(&path), pattern);
             (client_id, files)
         })
         .collect();
@@ -2712,8 +3159,8 @@ mod tests {
         File::create(extra_root.join("extra.jsonl")).unwrap();
 
         _extra.set(
-                "TOKSCALE_EXTRA_DIRS",
-                format!("codex:{}", extra_root.join("..").join("sessions").display()),
+            "TOKSCALE_EXTRA_DIRS",
+            format!("codex:{}", extra_root.join("..").join("sessions").display()),
         );
 
         let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
@@ -2870,11 +3317,8 @@ mod tests {
         let home = dir.path();
         setup_mock_pi_dir(home);
 
-        let result = scan_all_clients_with_env_strategy(
-            home.to_str().unwrap(),
-            &["pi".to_string()],
-            false,
-        );
+        let result =
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
         assert_eq!(result.get(ClientId::Pi).len(), 1);
         assert!(result.get(ClientId::OpenCode).is_empty());
         assert!(result.get(ClientId::Claude).is_empty());
@@ -2886,11 +3330,8 @@ mod tests {
         let home = dir.path();
         setup_mock_omp_dir(home);
 
-        let result = scan_all_clients_with_env_strategy(
-            home.to_str().unwrap(),
-            &["pi".to_string()],
-            false,
-        );
+        let result =
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
         assert_eq!(result.get(ClientId::Pi).len(), 1);
         assert!(result.get(ClientId::Pi)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl"));
         assert!(result.get(ClientId::OpenCode).is_empty());
@@ -2903,11 +3344,8 @@ mod tests {
         setup_mock_pi_dir(home);
         setup_mock_omp_dir(home);
 
-        let result = scan_all_clients_with_env_strategy(
-            home.to_str().unwrap(),
-            &["pi".to_string()],
-            false,
-        );
+        let result =
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
         assert_eq!(result.get(ClientId::Pi).len(), 2);
     }
 
@@ -3269,18 +3707,18 @@ mod tests {
 
         let registry_path = dir.path().join("projects.json");
         let projects_json = serde_json::json!({
-  "projects": [
-                { "path": project_a, "data_dir": ".crush" },
-                {
-                    "path": dir.path().join("project-b"),
-                    "data_dir": project_b_data,
-                },
-                {
-                    "path": dir.path().join("missing-project"),
-                    "data_dir": ".crush",
-                },
-            ],
-        })
+        "projects": [
+                      { "path": project_a, "data_dir": ".crush" },
+                      {
+                          "path": dir.path().join("project-b"),
+                          "data_dir": project_b_data,
+                      },
+                      {
+                          "path": dir.path().join("missing-project"),
+                          "data_dir": ".crush",
+                      },
+                  ],
+              })
         .to_string();
         setup_mock_crush_registry(&registry_path, &projects_json);
 
@@ -3295,7 +3733,9 @@ mod tests {
                 },
                 CrushDbSource {
                     db_path: project_b_data.join("crush.db"),
-                    workspace_key: normalize_workspace_key(&dir.path().join("project-b").display().to_string()),
+                    workspace_key: normalize_workspace_key(
+                        &dir.path().join("project-b").display().to_string()
+                    ),
                     workspace_label: Some("project-b".to_string()),
                 },
             ]
@@ -3311,13 +3751,13 @@ mod tests {
 
         let registry_path = dir.path().join("projects.json");
         let projects_json = serde_json::json!({
-  "projects": [
-                { "path": valid_project, "data_dir": ".crush" },
-                { "path": 123, "data_dir": ".crush" },
-                { "data_dir": ".crush" },
-                "not-an-object",
-            ],
-        })
+        "projects": [
+                      { "path": valid_project, "data_dir": ".crush" },
+                      { "path": 123, "data_dir": ".crush" },
+                      { "data_dir": ".crush" },
+                      "not-an-object",
+                  ],
+              })
         .to_string();
         setup_mock_crush_registry(&registry_path, &projects_json);
 
@@ -3399,11 +3839,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_scan_all_clients_headless_paths() {
-        let mut _headless = EnvGuard::capture(&[
-            "TOKSCALE_HEADLESS_DIR",
-            "CODEX_HOME",
-            "GEMINI_CLI_HOME",
-        ]);
+        let mut _headless =
+            EnvGuard::capture(&["TOKSCALE_HEADLESS_DIR", "CODEX_HOME", "GEMINI_CLI_HOME"]);
         _headless.remove("TOKSCALE_HEADLESS_DIR");
         _headless.remove("CODEX_HOME");
         _headless.remove("GEMINI_CLI_HOME");
@@ -3822,8 +4259,8 @@ mod tests {
         File::create(extra_project.join("extra-session.jsonl")).unwrap();
 
         _extra.set(
-                "TOKSCALE_EXTRA_DIRS",
-                format!("claude:{}", extra_dir.path().to_string_lossy()),
+            "TOKSCALE_EXTRA_DIRS",
+            format!("claude:{}", extra_dir.path().to_string_lossy()),
         );
 
         let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
@@ -3922,8 +4359,8 @@ mod tests {
         File::create(extra_project.join("extra-session.jsonl")).unwrap();
 
         _extra.set(
-                "TOKSCALE_EXTRA_DIRS",
-                format!("claude:{}", extra_dir.path().to_string_lossy()),
+            "TOKSCALE_EXTRA_DIRS",
+            format!("claude:{}", extra_dir.path().to_string_lossy()),
         );
 
         let result = scan_all_clients_with_env_strategy(
@@ -3952,8 +4389,8 @@ mod tests {
         // Set TOKSCALE_EXTRA_DIRS to point claude at the outside path.
         let mut _extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
         _extra.set(
-                "TOKSCALE_EXTRA_DIRS",
-                format!("claude:{}", outside_path.to_string_lossy()),
+            "TOKSCALE_EXTRA_DIRS",
+            format!("claude:{}", outside_path.to_string_lossy()),
         );
 
         // The scan must complete without panicking.

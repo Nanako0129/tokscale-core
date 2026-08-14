@@ -55,12 +55,9 @@ fn cache_dir() -> Option<PathBuf> {
     }
 }
 
+#[cfg(test)]
 fn cache_shard_dir() -> Option<PathBuf> {
     Some(cache_dir()?.join(CACHE_SHARD_DIRNAME))
-}
-
-fn cache_lock_path() -> Option<PathBuf> {
-    Some(cache_dir()?.join(CACHE_LOCK_FILENAME))
 }
 
 fn fallback_cache_dir() -> Option<PathBuf> {
@@ -105,16 +102,19 @@ fn ensure_cache_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn warn_cache_failure_once(context: &'static str, path: &Path, error: &impl std::fmt::Display) {
-    tracing::warn!(path = %path.display(), %error, %context, "source message cache failure");
+fn warn_cache_failure_once(context: &'static str, _path: &Path, _error: &impl std::fmt::Display) {
+    // Cache persistence is fail-soft. Report only the bounded category: the
+    // configured cache root and native error can contain profile information,
+    // and local report callers must never copy either into stderr or tracing.
+    tracing::warn!(%context, "source message cache failure");
 
     // Most non-TUI commands (including `submit`) do not install a tracing
-    // subscriber. Surface persistence failures directly once per process so a
+    // subscriber. Surface the bounded category directly once per process so a
     // permanently cold cache can never fail silently again.
     static WARNED_CONTEXTS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let warned = WARNED_CONTEXTS.get_or_init(|| Mutex::new(HashSet::new()));
     if warned.lock().is_ok_and(|mut warned| warned.insert(context)) {
-        eprintln!("tokscale: warning: {context} ({}): {error}", path.display());
+        eprintln!("tokscale: warning: {context}");
     }
 }
 
@@ -1183,20 +1183,41 @@ pub(crate) struct SourceMessageCache {
     dirty_keys: HashSet<CacheKey>,
     deleted_keys: HashMap<CacheKey, DeletionReason>,
     rewrite_shards: HashSet<CacheShardKey>,
+    cache_root: Option<PathBuf>,
+    cache_root_is_resolved: bool,
 }
 
 impl SourceMessageCache {
     pub(crate) fn load() -> Self {
-        Self::load_with_limit(MAX_CACHE_SHARD_BYTES)
+        Self::load_with_root_and_limit(cache_dir(), MAX_CACHE_SHARD_BYTES, false)
     }
 
+    pub(crate) fn load_from_root(cache_root: Option<&Path>) -> Self {
+        Self::load_with_root_and_limit(
+            cache_root.map(Path::to_path_buf),
+            MAX_CACHE_SHARD_BYTES,
+            true,
+        )
+    }
+
+    #[cfg(test)]
     fn load_with_limit(max_shard_bytes: u64) -> Self {
-        let Some(shard_root) = cache_shard_dir() else {
-            return Self::default();
+        Self::load_with_root_and_limit(cache_dir(), max_shard_bytes, false)
+    }
+
+    fn load_with_root_and_limit(
+        cache_root: Option<PathBuf>,
+        max_shard_bytes: u64,
+        cache_root_is_resolved: bool,
+    ) -> Self {
+        let Some(root) = cache_root.clone() else {
+            return Self {
+                cache_root_is_resolved,
+                ..Self::default()
+            };
         };
-        let Some(lock_path) = cache_lock_path() else {
-            return Self::default();
-        };
+        let shard_root = root.join(CACHE_SHARD_DIRNAME);
+        let lock_path = root.join(CACHE_LOCK_FILENAME);
         if let Err(error) = ensure_cache_dir(&shard_root) {
             warn_cache_failure_once(
                 "source message cache directory is unavailable",
@@ -1227,7 +1248,11 @@ impl SourceMessageCache {
             return Self::default();
         }
 
-        let mut cache = Self::default();
+        let mut cache = Self {
+            cache_root,
+            cache_root_is_resolved,
+            ..Self::default()
+        };
         for identity in CacheIdentity::all() {
             let parser_dir = shard_root.join(identity.namespace);
             let read_dir = match fs::read_dir(&parser_dir) {
@@ -1334,9 +1359,15 @@ impl SourceMessageCache {
             return;
         }
 
-        let Some(shard_root) = cache_shard_dir() else {
+        let root = if self.cache_root_is_resolved {
+            self.cache_root.clone()
+        } else {
+            self.cache_root.clone().or_else(cache_dir)
+        };
+        let Some(root) = root else {
             return;
         };
+        let shard_root = root.join(CACHE_SHARD_DIRNAME);
         if let Err(error) = ensure_cache_dir(&shard_root) {
             warn_cache_failure_once(
                 "source message cache directory is unavailable",
@@ -1345,9 +1376,7 @@ impl SourceMessageCache {
             );
             return;
         }
-        let Some(lock_path) = cache_lock_path() else {
-            return;
-        };
+        let lock_path = root.join(CACHE_LOCK_FILENAME);
         let lock_file = match OpenOptions::new()
             .read(true)
             .write(true)
