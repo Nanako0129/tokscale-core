@@ -2769,6 +2769,7 @@ async fn get_model_report_inner(
             context,
             &clients,
             pricing.as_deref(),
+            None,
             &msg_filter,
             &mut |message| model_msgs.push(message.clone()),
         )
@@ -3052,6 +3053,7 @@ async fn get_agents_report_inner(
             context,
             &clients,
             pricing.as_deref(),
+            None,
             &msg_filter,
             &mut fold,
         )
@@ -3233,6 +3235,7 @@ async fn get_hourly_report_inner(
             context,
             &clients,
             pricing.as_deref(),
+            None,
             &msg_filter,
             &mut fold,
         )
@@ -3464,6 +3467,7 @@ fn scan_messages_streaming_with_context<F, S>(
     context: &ResolvedLocalSourceContext,
     clients: &[String],
     pricing: Option<&pricing::PricingService>,
+    modified_after: Option<u64>,
     filter: &F,
     sink: &mut S,
 ) -> Result<(), SourceContextUnavailable>
@@ -3478,6 +3482,7 @@ where
         pricing,
         context.use_env_roots(),
         context.scanner_settings(),
+        modified_after,
         filter,
         sink,
     )
@@ -3502,6 +3507,7 @@ fn scan_messages_streaming<F, S>(
         pricing,
         use_env_roots,
         scanner_settings,
+        None,
         filter,
         sink,
     )
@@ -3516,6 +3522,7 @@ fn scan_messages_streaming_inner<F, S>(
     pricing: Option<&pricing::PricingService>,
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
+    modified_after: Option<u64>,
     filter: &F,
     sink: &mut S,
 ) -> Result<(), SourceContextUnavailable>
@@ -3523,7 +3530,7 @@ where
     F: Fn(&UnifiedMessage) -> bool,
     S: FnMut(&UnifiedMessage),
 {
-    let scan_result = if let Some(context) = context {
+    let mut scan_result = if let Some(context) = context {
         scanner::scan_all_clients_with_source_context(context, clients)?
     } else {
         scanner::scan_all_clients_with_scanner_settings(
@@ -3533,6 +3540,9 @@ where
             scanner_settings,
         )
     };
+    if let Some(threshold_ms) = modified_after {
+        prune_scan_result_by_mtime(&mut scan_result, threshold_ms);
+    }
     let headless_roots = if let Some(context) = context {
         scanner::headless_roots_with_source_context(context)?
     } else {
@@ -4695,8 +4705,15 @@ async fn generate_graph_with_loaded_pricing_inner(
         sess_agg.feed(message);
     };
     if let Some(context) = context {
-        scan_messages_streaming_with_context(context, &clients, pricing, &msg_filter, &mut fold)
-            .map_err(|error| error.to_string())?;
+        scan_messages_streaming_with_context(
+            context,
+            &clients,
+            pricing,
+            None,
+            &msg_filter,
+            &mut fold,
+        )
+        .map_err(|error| error.to_string())?;
     } else {
         scan_messages_streaming(
             &home_dir,
@@ -5640,6 +5657,7 @@ fn parse_local_clients_inner(
                     context,
                     std::slice::from_ref(&ClientId::Claude.as_str().to_string()),
                     None,
+                    options.modified_after,
                     &|_| true,
                     &mut |message| messages.push(unified_to_parsed(message)),
                 )
@@ -6293,13 +6311,14 @@ mod tests {
         message_cache, model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
         opencode_authoritative_sources, opencode_identity_group,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
-        parse_local_unified_messages, parsed_to_unified, pricing, prune_scan_result_by_mtime,
-        register_usage_data_invalidation_hook, reprice_lane_message, resolve_graph_pricing,
-        retain_for_requested_clients, scan_messages_streaming, scanner, select_local_parse_pricing,
-        sessions, set_model_aliases, snapshot_grouping_aliases, unified_to_parsed,
-        AgentAccumulator, ClientId, CostCoverage, CostSource, GraphPricingMode, GroupBy,
-        LocalParseOptions, ModelAliasMap, OpenCodeSelection, OpenCodeSourceIdentity, ReportOptions,
-        TokenBreakdown, UnifiedMessage, RETAIN_OBSERVED_MESSAGES_CALLS, UNKNOWN_WORKSPACE_LABEL,
+        parse_local_clients_with_source_context, parse_local_unified_messages, parsed_to_unified,
+        pricing, prune_scan_result_by_mtime, register_usage_data_invalidation_hook,
+        reprice_lane_message, resolve_graph_pricing, retain_for_requested_clients,
+        scan_messages_streaming, scanner, select_local_parse_pricing, sessions, set_model_aliases,
+        snapshot_grouping_aliases, unified_to_parsed, AgentAccumulator, ClientId, CostCoverage,
+        CostSource, GraphPricingMode, GroupBy, LocalParseOptions, ModelAliasMap, OpenCodeSelection,
+        OpenCodeSourceIdentity, ReportOptions, ResolvedLocalSourceContext, TokenBreakdown,
+        UnifiedMessage, RETAIN_OBSERVED_MESSAGES_CALLS, UNKNOWN_WORKSPACE_LABEL,
     };
     use bincode::Options;
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -8033,6 +8052,62 @@ mod tests {
             "modified_after must exclude a Claude transcript older than the threshold, matching \
              how other file-backed clients behave under the same option"
         );
+        assert_eq!(pruned.counts.get(ClientId::Claude), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_with_source_context_honors_modified_after_for_claude() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("session.jsonl"),
+            r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_context","message":{"id":"msg_context","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+        )
+        .unwrap();
+
+        let context = ResolvedLocalSourceContext::capture(
+            Some(source_home.path().to_path_buf()),
+            false,
+            scanner::ScannerSettings::default(),
+        )
+        .unwrap();
+        let local_options = |modified_after| LocalParseOptions {
+            home_dir: None,
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after,
+        };
+
+        let included =
+            parse_local_clients_with_source_context(&context, local_options(None)).unwrap();
+        assert_eq!(included.messages.len(), 1);
+        assert_eq!(included.counts.get(ClientId::Claude), 1);
+
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        let pruned =
+            parse_local_clients_with_source_context(&context, local_options(Some(future_ms)))
+                .unwrap();
+        assert!(pruned.messages.is_empty());
         assert_eq!(pruned.counts.get(ClientId::Claude), 0);
     }
 

@@ -19,6 +19,7 @@ const ENV_APPDATA: &str = "APPDATA";
 const ENV_KIMI_CODE_HOME: &str = "KIMI_CODE_HOME";
 const ENV_TOKSCALE_EXTRA_DIRS: &str = "TOKSCALE_EXTRA_DIRS";
 const ENV_GOOSE_PATH_ROOT: &str = "GOOSE_PATH_ROOT";
+const ENV_CODEBUFF_DATA_DIR: &str = "CODEBUFF_DATA_DIR";
 const ENV_XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
 const ENV_TOKSCALE_PRICING_CACHE_ONLY: &str = "TOKSCALE_PRICING_CACHE_ONLY";
 
@@ -514,7 +515,12 @@ fn resolve_source_environment_paths(
             } else if key == ENV_TOKSCALE_EXTRA_DIRS {
                 ResolvedPathInput::fallback(&input, home.to_path_buf())
             } else {
-                ResolvedPathInput::explicit(&input, fully_qualified(cwd, Path::new(raw))?)
+                let path = if source_env_trims_surrounding_whitespace(key) {
+                    PathBuf::from(raw.to_string_lossy().trim())
+                } else {
+                    PathBuf::from(raw)
+                };
+                ResolvedPathInput::explicit(&input, fully_qualified(cwd, &path)?)
             }
         } else {
             ResolvedPathInput::fallback(
@@ -529,7 +535,11 @@ fn resolve_source_environment_paths(
 }
 
 fn source_env_uses_nonblank_semantics(key: &str) -> bool {
-    key != ENV_XDG_CONFIG_HOME
+    key != ENV_XDG_DATA_HOME && key != ENV_XDG_CONFIG_HOME
+}
+
+fn source_env_trims_surrounding_whitespace(key: &str) -> bool {
+    key == ENV_COPILOT_EXPORTER || key == ENV_GOOSE_PATH_ROOT || key == ENV_CODEBUFF_DATA_DIR
 }
 
 fn fallback_source_env_path(
@@ -541,9 +551,12 @@ fn fallback_source_env_path(
         return Ok(home.join(".local/share"));
     }
     if key == ENV_TOKSCALE_CONFIG_DIR {
-        return platform_config_dir
+        if cfg!(target_os = "macos") {
+            return Ok(home.join(".config/tokscale"));
+        }
+        return Ok(platform_config_dir
             .map(|root| root.join("tokscale"))
-            .ok_or(SourceContextUnavailable);
+            .unwrap_or_else(|| home.join(".config/tokscale")));
     }
     if key == ENV_XDG_CONFIG_HOME {
         return Ok(home.join(".config"));
@@ -846,8 +859,15 @@ mod tests {
         root: &Path,
         values: impl IntoIterator<Item = (&'static str, OsString)>,
     ) -> SourceResolutionInputs {
+        fixture_inputs_with_platform(values, fixture_platform(root))
+    }
+
+    fn fixture_inputs_with_platform(
+        values: impl IntoIterator<Item = (&'static str, OsString)>,
+        platform: PlatformInputs,
+    ) -> SourceResolutionInputs {
         let values = values.into_iter().collect::<BTreeMap<_, _>>();
-        SourceResolutionInputs::capture_with(|key| values.get(key).cloned(), fixture_platform(root))
+        SourceResolutionInputs::capture_with(|key| values.get(key).cloned(), platform)
     }
 
     fn fixture_root() -> PathBuf {
@@ -912,6 +932,195 @@ mod tests {
         assert_eq!(
             lexically_normalize(Path::new("/tmp/a/../b/./c")),
             PathBuf::from("/tmp/b/c")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_generic_config_root_uses_captured_home() {
+        let root = fixture_root();
+        let home = fixture_path("home");
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            fixture_path("cwd"),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, []),
+        )
+        .unwrap();
+
+        assert_eq!(
+            context.resolve_client_root(PathRoot::Config).unwrap(),
+            home.join(".config/tokscale")
+        );
+        assert_ne!(
+            context.resolve_client_root(PathRoot::Config).unwrap(),
+            root.join("platform-config/tokscale")
+        );
+    }
+
+    #[test]
+    fn missing_platform_config_dir_falls_back_to_captured_home() {
+        let root = fixture_root();
+        let home = fixture_path("home");
+        let mut platform = fixture_platform(&root);
+        platform.config_dir = None;
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            fixture_path("cwd"),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs_with_platform([], platform),
+        )
+        .unwrap();
+
+        assert_eq!(
+            context.resolve_client_root(PathRoot::Config).unwrap(),
+            home.join(".config/tokscale")
+        );
+    }
+
+    #[test]
+    fn explicit_tokscale_config_dir_wins_over_platform_and_home_fallbacks() {
+        let root = fixture_root();
+        let explicit = fixture_path("explicit-config");
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            fixture_path("cwd"),
+            Some(fixture_path("home")),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(
+                &root,
+                [(ENV_TOKSCALE_CONFIG_DIR, explicit.clone().into_os_string())],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            context.resolve_client_root(PathRoot::Config).unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn xdg_data_home_preserves_whitespace_only_explicit_values() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let unset = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, []),
+        )
+        .unwrap();
+        let empty = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, [(ENV_XDG_DATA_HOME, OsString::new())]),
+        )
+        .unwrap();
+        let whitespace = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, [(ENV_XDG_DATA_HOME, OsString::from(" \t "))]),
+        )
+        .unwrap();
+
+        let fallback = home.join(".local/share");
+        assert_eq!(
+            unset.resolve_client_root(PathRoot::XdgData).unwrap(),
+            fallback
+        );
+        assert_eq!(
+            empty.resolve_client_root(PathRoot::XdgData).unwrap(),
+            fallback
+        );
+        assert!(!unset.source_env_is_explicit(ENV_XDG_DATA_HOME));
+        assert!(!empty.source_env_is_explicit(ENV_XDG_DATA_HOME));
+        assert!(whitespace.source_env_is_explicit(ENV_XDG_DATA_HOME));
+        assert_eq!(
+            whitespace.resolve_client_root(PathRoot::XdgData).unwrap(),
+            fully_qualified(&cwd, Path::new(" \t ")).unwrap()
+        );
+    }
+
+    #[test]
+    fn direct_scanner_overrides_trim_like_legacy_resolvers() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+
+        for (key, raw) in [
+            (ENV_COPILOT_EXPORTER, "  copilot.jsonl  "),
+            (ENV_GOOSE_PATH_ROOT, "  goose-root  "),
+            (ENV_CODEBUFF_DATA_DIR, "  codebuff-root  "),
+        ] {
+            let context = ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                true,
+                ScannerSettings::default(),
+                fixture_inputs(&root, [(key, OsString::from(raw))]),
+            )
+            .unwrap();
+            assert!(context.source_env_is_explicit(key));
+            assert_eq!(
+                context.source_env_path(key),
+                Some(
+                    fully_qualified(&cwd, Path::new(raw.trim()))
+                        .unwrap()
+                        .as_path()
+                ),
+                "{key}"
+            );
+        }
+
+        for (key, fallback) in [
+            (ENV_COPILOT_EXPORTER, home.join(".copilot/otel")),
+            (ENV_GOOSE_PATH_ROOT, home.join(".local/share/goose")),
+            (ENV_CODEBUFF_DATA_DIR, home.join(".config/manicode")),
+        ] {
+            let context = ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                true,
+                ScannerSettings::default(),
+                fixture_inputs(&root, [(key, OsString::from(" \t "))]),
+            )
+            .unwrap();
+            assert!(!context.source_env_is_explicit(key));
+            assert_eq!(
+                context.source_env_path(key),
+                Some(fallback.as_path()),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_env_paths_preserve_surrounding_whitespace() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let raw = "  codex-root  ";
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(fixture_path("home")),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, [("CODEX_HOME", OsString::from(raw))]),
+        )
+        .unwrap();
+
+        assert!(context.source_env_is_explicit("CODEX_HOME"));
+        assert_eq!(
+            context.source_env_path("CODEX_HOME"),
+            Some(fully_qualified(&cwd, Path::new(raw)).unwrap().as_path())
         );
     }
 
@@ -1041,7 +1250,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(
             context.identity_string(),
-            "sc1:ec742e1aed93e5a289aec6f187315ea2df114057523eea30e3c6952c0a605d80"
+            "sc1:f52ce688f06382fdbbeff63288b5933954e1c650b9723f732d626d799ad46f7f"
         );
         #[cfg(windows)]
         assert_eq!(
