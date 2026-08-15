@@ -4041,8 +4041,8 @@ mod tests {
         let relative_db = Path::new("project/.crush/crush.db");
         fs::create_dir_all(capture_cwd.join(relative_db).parent().unwrap()).unwrap();
         fs::create_dir_all(later_cwd.join(relative_db).parent().unwrap()).unwrap();
-        File::create(capture_cwd.join(relative_db)).unwrap();
-        File::create(later_cwd.join(relative_db)).unwrap();
+        fs::write(capture_cwd.join(relative_db), b"capture").unwrap();
+        fs::write(later_cwd.join(relative_db), b"later").unwrap();
         setup_mock_crush_registry(
             &xdg.join("crush/projects.json"),
             r#"{"projects":[{"path":"project","data_dir":".crush"}]}"#,
@@ -4053,7 +4053,7 @@ mod tests {
         let _cwd = CwdGuard::change(&capture_cwd);
         let clients = ["crush".to_string()];
         let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, true);
-        let legacy_db = fs::canonicalize(&legacy.crush_dbs[0].db_path).unwrap();
+        assert_eq!(fs::read(&legacy.crush_dbs[0].db_path).unwrap(), b"capture");
         let context = ResolvedLocalSourceContext::capture(
             Some(home.clone()),
             true,
@@ -4067,7 +4067,10 @@ mod tests {
                 .unwrap();
         let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
 
-        assert_eq!(resolved.crush_dbs[0].db_path, legacy_db);
+        assert_eq!(
+            fs::read(&resolved.crush_dbs[0].db_path).unwrap(),
+            b"capture"
+        );
         assert_eq!(
             resolved.crush_dbs[0].workspace_key,
             legacy.crush_dbs[0].workspace_key
