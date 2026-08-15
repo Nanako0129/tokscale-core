@@ -1538,6 +1538,84 @@ fn shard_path(root: &Path, key: &CacheShardKey) -> PathBuf {
     root.join(&key.namespace).join(shard_filename(key.index))
 }
 
+/// Hash the retained Claude messages for the exact source paths in a scan.
+///
+/// This probe is deliberately read-only: it opens only the canonical Claude
+/// shard files selected by the requested cache keys and never loads the cache,
+/// enumerates directories, or creates a lock/cache directory. A missing,
+/// stale, or unreadable shard contributes no retained messages.
+pub(crate) fn retained_state_change_token(
+    cache_root: Option<&Path>,
+    source_paths: &[PathBuf],
+) -> u64 {
+    let identity = CacheIdentity::for_client(ClientId::Claude);
+    let requested_keys: HashMap<CacheKey, u64> = source_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (CacheKey::new(identity, path), index as u64))
+        .collect();
+    let shard_keys: HashSet<CacheShardKey> = requested_keys.keys().map(CacheKey::shard).collect();
+    let mut record_digests: Vec<[u8; 32]> = Vec::new();
+
+    if let Some(cache_root) = cache_root {
+        let shard_root = cache_root.join(CACHE_SHARD_DIRNAME);
+        for shard_key in shard_keys {
+            let path = shard_path(&shard_root, &shard_key);
+            let ShardReadStatus::Loaded(entries) =
+                read_shard_with_limit(&path, identity, MAX_CACHE_SHARD_BYTES)
+            else {
+                continue;
+            };
+
+            for entry in entries {
+                let entry_key = CacheKey::from_entry(&entry);
+                let Some(source_index) = requested_keys.get(&entry_key) else {
+                    continue;
+                };
+                if !entry.identity_is_current() || entry_key.shard() != shard_key {
+                    continue;
+                }
+                for message in entry.messages {
+                    let Some(dedup_key) = message.dedup_key.as_ref() else {
+                        continue;
+                    };
+                    if !entry.retained_keys.contains(dedup_key) {
+                        continue;
+                    }
+                    let Ok(serialized) = bincode::options().serialize(&message) else {
+                        continue;
+                    };
+                    let mut path_hasher = Sha256::new();
+                    entry_key.path.update_digest(&mut path_hasher);
+                    let mut record_hasher = Sha256::new();
+                    record_hasher.update(b"tokscale-retained-state-v1:record");
+                    record_hasher.update(source_index.to_le_bytes());
+                    record_hasher.update(path_hasher.finalize());
+                    record_hasher.update(serialized);
+                    record_digests.push(record_hasher.finalize().into());
+                }
+            }
+        }
+    }
+
+    record_digests.sort_unstable();
+    let mut hasher = Sha256::new();
+    if record_digests.is_empty() {
+        hasher.update(b"tokscale-retained-state-v1:empty");
+    } else {
+        hasher.update(b"tokscale-retained-state-v1:records");
+        for digest in record_digests {
+            hasher.update(digest);
+        }
+    }
+    let digest = hasher.finalize();
+    u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest is at least 8 bytes"),
+    )
+}
+
 enum ShardReadStatus {
     Missing,
     Stale,
@@ -2062,6 +2140,129 @@ mod tests {
         }
 
         panic!("failed to find paths in the same cache shard");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_retained_state_change_token_tracks_only_report_visible_claude_state() {
+        let source_dir = TempDir::new().unwrap();
+        let cache_root = TempDir::new().unwrap();
+        let live_cache_root = TempDir::new().unwrap();
+        let source = source_dir.path().join("session.jsonl");
+        std::fs::write(&source, b"source\n").unwrap();
+        let source_metadata = std::fs::metadata(&source).unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let dedup_key = "message:req";
+        let mut retained_entry = entry_with_messages(
+            identity,
+            &source,
+            vec![keyed_message("claude", "session", dedup_key)],
+        );
+        retained_entry.retained_keys.insert(dedup_key.to_string());
+
+        let empty =
+            retained_state_change_token(Some(cache_root.path()), std::slice::from_ref(&source));
+        let mut cache = SourceMessageCache::load_from_root(Some(cache_root.path()));
+        cache.insert(retained_entry.clone());
+        cache.save_if_dirty();
+        let retained =
+            retained_state_change_token(Some(cache_root.path()), std::slice::from_ref(&source));
+        assert_ne!(retained, empty);
+        assert_eq!(
+            retained,
+            retained_state_change_token(Some(cache_root.path()), std::slice::from_ref(&source)),
+            "unchanged retained state must be stable"
+        );
+
+        let mut live_entry = retained_entry.clone();
+        live_entry.retained_keys.clear();
+        let live_before = retained_state_change_token(
+            Some(live_cache_root.path()),
+            std::slice::from_ref(&source),
+        );
+        let mut live_cache = SourceMessageCache::load_from_root(Some(live_cache_root.path()));
+        live_cache.insert(live_entry);
+        live_cache.save_if_dirty();
+        assert_eq!(
+            live_before,
+            retained_state_change_token(
+                Some(live_cache_root.path()),
+                std::slice::from_ref(&source),
+            ),
+            "live-only cache creation must not change the retained-state token"
+        );
+
+        let shard_root = cache_root.path().join(CACHE_SHARD_DIRNAME);
+        let shard_path = shard_path(&shard_root, &CacheKey::new(identity, &source).shard());
+        std::fs::remove_file(&shard_path).unwrap();
+        assert_ne!(
+            retained,
+            retained_state_change_token(Some(cache_root.path()), std::slice::from_ref(&source)),
+            "deleting the requested shard must retire its retained state"
+        );
+
+        cache.insert(retained_entry.clone());
+        cache.save_if_dirty();
+        std::fs::write(&shard_path, b"corrupt").unwrap();
+        assert_ne!(
+            retained,
+            retained_state_change_token(Some(cache_root.path()), std::slice::from_ref(&source)),
+            "a corrupt requested shard must retire its retained state"
+        );
+
+        cache.insert(retained_entry.clone());
+        cache.save_if_dirty();
+        let mut replacement = retained_entry;
+        replacement.messages[0].tokens.output = 99;
+        cache.insert(replacement);
+        cache.save_if_dirty();
+        assert_ne!(
+            retained,
+            retained_state_change_token(Some(cache_root.path()), std::slice::from_ref(&source)),
+            "a changed retained message must change the token"
+        );
+        let source_metadata_after = std::fs::metadata(&source).unwrap();
+        assert_eq!(source_metadata.len(), source_metadata_after.len());
+        assert_eq!(
+            source_metadata.modified().unwrap(),
+            source_metadata_after.modified().unwrap()
+        );
+
+        let other_source = source_dir.path().join("other-session.jsonl");
+        std::fs::write(&other_source, b"other source\n").unwrap();
+        let shared_key = "shared:req";
+        let mut first = entry_with_messages(
+            identity,
+            &source,
+            vec![keyed_message("claude", "first", shared_key)],
+        );
+        first.messages[0].tokens.output = 50;
+        first.retained_keys.insert(shared_key.to_string());
+        let mut second = entry_with_messages(
+            identity,
+            &other_source,
+            vec![keyed_message("claude", "second", shared_key)],
+        );
+        second.messages[0].tokens.output = 999;
+        second.retained_keys.insert(shared_key.to_string());
+        let association_root = TempDir::new().unwrap();
+        let mut association_cache =
+            SourceMessageCache::load_from_root(Some(association_root.path()));
+        association_cache.insert(first.clone());
+        association_cache.insert(second.clone());
+        association_cache.save_if_dirty();
+        let paths = [source.clone(), other_source];
+        let association_before = retained_state_change_token(Some(association_root.path()), &paths);
+
+        std::mem::swap(&mut first.messages, &mut second.messages);
+        association_cache.insert(first);
+        association_cache.insert(second);
+        association_cache.save_if_dirty();
+        assert_ne!(
+            association_before,
+            retained_state_change_token(Some(association_root.path()), &paths),
+            "moving unequal retained copies between ordered sources must change the token"
+        );
     }
 
     fn cache_shard_path(identity: CacheIdentity, path: &Path) -> PathBuf {
