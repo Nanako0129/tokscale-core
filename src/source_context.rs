@@ -799,7 +799,7 @@ fn fully_qualified(base: &Path, path: &Path) -> Result<PathBuf, SourceContextUna
                     Prefix::Disk(base_drive) | Prefix::VerbatimDisk(base_drive) => base_drive,
                     _ => return Err(SourceContextUnavailable),
                 };
-                if drive != base_drive {
+                if !drive.eq_ignore_ascii_case(&base_drive) {
                     return Err(SourceContextUnavailable);
                 }
                 let tail = path.components().skip(1).collect::<PathBuf>();
@@ -1866,6 +1866,10 @@ mod tests {
         let base = Path::new(r"C:\capture\work");
         assert_eq!(
             fully_qualified(base, Path::new(r"C:profile\sessions")).unwrap(),
+            PathBuf::from(r"C:\capture\work\profile\sessions")
+        );
+        assert_eq!(
+            fully_qualified(base, Path::new(r"c:profile\sessions")).unwrap(),
             PathBuf::from(r"C:\capture\work\profile\sessions")
         );
         assert_eq!(
