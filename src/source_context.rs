@@ -391,8 +391,10 @@ impl ResolvedLocalSourceContext {
                 .unwrap_or_else(|| self.home_dir.join(".local/share")),
             PathRoot::Config => {
                 if self.use_env_roots {
-                    if let Some(custom) = self.source_env_path(ENV_TOKSCALE_CONFIG_DIR) {
-                        custom.to_path_buf()
+                    if self.source_env_is_explicit(ENV_TOKSCALE_CONFIG_DIR) {
+                        self.source_env_path(ENV_TOKSCALE_CONFIG_DIR)
+                            .ok_or(SourceContextUnavailable)?
+                            .to_path_buf()
                     } else if cfg!(target_os = "linux") {
                         self.source_env_path(ENV_XDG_CONFIG_HOME)
                             .map(|root| root.join("tokscale"))
@@ -1123,6 +1125,30 @@ mod tests {
         assert_eq!(
             context.source_cache_dir(),
             Some(home.join(".config/tokscale/cache").as_path())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_generic_config_root_uses_captured_home_without_explicit_env() {
+        let root = fixture_root();
+        let home = fixture_path("home");
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            fixture_path("cwd"),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(&root, []),
+        )
+        .unwrap();
+
+        assert_eq!(
+            context.resolve_client_root(PathRoot::Config).unwrap(),
+            home.join(".config/tokscale")
+        );
+        assert_ne!(
+            context.resolve_client_root(PathRoot::Config).unwrap(),
+            root.join("platform-config/tokscale")
         );
     }
 
