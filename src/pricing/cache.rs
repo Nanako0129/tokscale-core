@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const CACHE_TTL_SECS: u64 = 3600;
@@ -57,6 +57,24 @@ pub fn load_cache<T: for<'de> Deserialize<'de>>(filename: &str) -> Option<T> {
 
 pub fn load_cache_any_age<T: for<'de> Deserialize<'de>>(filename: &str) -> Option<T> {
     load_cache_with_policy(filename, true)
+}
+
+pub(crate) fn load_cache_any_age_from_dir<T: for<'de> Deserialize<'de>>(
+    cache_dir: &Path,
+    filename: &str,
+) -> Option<T> {
+    let content = fs::read_to_string(cache_dir.join(filename)).ok()?;
+    let cached: CachedData<T> = serde_json::from_str(&content).ok()?;
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if cached.timestamp > now {
+        return None;
+    }
+
+    Some(cached.data)
 }
 
 /// Unix-seconds timestamp recorded when this cache file was last written (i.e.

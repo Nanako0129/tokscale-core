@@ -2,6 +2,7 @@ use super::cache;
 use super::litellm::ModelPricing;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -90,6 +91,12 @@ pub fn load_cached() -> Option<HashMap<String, ModelPricing>> {
 
 pub fn load_cached_any_age() -> Option<HashMap<String, ModelPricing>> {
     cache::load_cache_any_age(CACHE_FILENAME)
+}
+
+pub(crate) fn load_cached_any_age_from_dir(
+    cache_dir: &Path,
+) -> Option<HashMap<String, ModelPricing>> {
+    cache::load_cache_any_age_from_dir(cache_dir, CACHE_FILENAME)
 }
 
 fn parse_price(s: &str) -> Option<f64> {

@@ -10,6 +10,7 @@ use lookup::{
     compute_cost_and_coverage_for_lookup_result, CostEstimate, LookupResult, PricingLookup,
 };
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -180,12 +181,24 @@ impl PricingService {
         litellm_data: Option<HashMap<String, ModelPricing>>,
         openrouter_data: Option<HashMap<String, ModelPricing>>,
     ) -> Option<Self> {
+        Self::from_cached_datasets_with_custom(
+            CustomPricing::load_from_default_path(),
+            litellm_data,
+            openrouter_data,
+        )
+    }
+
+    fn from_cached_datasets_with_custom(
+        custom: CustomPricing,
+        litellm_data: Option<HashMap<String, ModelPricing>>,
+        openrouter_data: Option<HashMap<String, ModelPricing>>,
+    ) -> Option<Self> {
         if litellm_data.is_none() && openrouter_data.is_none() {
             return None;
         }
 
         Some(Self::new_with_custom(
-            CustomPricing::load_from_default_path(),
+            custom,
             Self::filter_litellm_data(litellm_data.unwrap_or_default()),
             openrouter_data.unwrap_or_default(),
         ))
@@ -195,6 +208,15 @@ impl PricingService {
         Self::from_cached_datasets(
             litellm::load_cached_any_age(),
             openrouter::load_cached_any_age(),
+        )
+    }
+
+    pub(crate) fn load_cached_any_age_from_config_dir(config_dir: &Path) -> Option<Self> {
+        let cache_dir = config_dir.join("cache");
+        Self::from_cached_datasets_with_custom(
+            CustomPricing::load_from_path(&config_dir.join("custom-pricing.json")),
+            litellm::load_cached_any_age_from_dir(&cache_dir),
+            openrouter::load_cached_any_age_from_dir(&cache_dir),
         )
     }
 
