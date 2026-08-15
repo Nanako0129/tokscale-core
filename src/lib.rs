@@ -5031,7 +5031,14 @@ async fn load_pricing_for_local_parse_with_context(
                 .unwrap_or(false)
         });
     if cache_only {
-        return pricing::PricingService::load_cached_any_age().map(Arc::new);
+        return context
+            .map(|context| {
+                pricing::PricingService::load_cached_any_age_from_config_dir(
+                    context.pricing_config_dir(),
+                )
+            })
+            .unwrap_or_else(pricing::PricingService::load_cached_any_age)
+            .map(Arc::new);
     }
 
     // Interactive/local views should pick up newly released model pricing as soon
@@ -6307,8 +6314,9 @@ mod tests {
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
         canonical_model_id, clear_model_aliases, coverage_for_messages,
         dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
-        get_model_report, get_monthly_report, latest_source_mtime_ms, local_source_change_token,
-        message_cache, model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
+        get_model_report, get_monthly_report, latest_source_mtime_ms,
+        load_pricing_for_local_parse_with_context, local_source_change_token, message_cache,
+        model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
         opencode_authoritative_sources, opencode_identity_group,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
         parse_local_clients_with_source_context, parse_local_unified_messages, parsed_to_unified,
@@ -15054,6 +15062,91 @@ mod tests {
 
         assert!(Arc::ptr_eq(&selected, &fresh));
         assert!(!stale_called);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn context_pricing_reads_captured_config_after_live_override_changes() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config_a = root.path().join("config-a");
+        let config_b = root.path().join("config-b");
+        let cache_a = config_a.join("cache");
+        let cache_b = config_b.join("cache");
+        std::fs::create_dir_all(&cache_a).unwrap();
+        std::fs::create_dir_all(&cache_b).unwrap();
+
+        let write_cache = |path: &Path, data: &str| {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            std::fs::write(
+                path,
+                format!(r#"{{"timestamp":{timestamp},"data":{data}}}"#),
+            )
+            .unwrap();
+        };
+        let litellm_a = r#"{"litellm-context-drift":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002}}"#;
+        let litellm_b = r#"{"litellm-context-drift":{"input_cost_per_token":0.000011,"output_cost_per_token":0.000012}}"#;
+        let openrouter_a = r#"{"openrouter-context-drift":{"input_cost_per_token":0.000003,"output_cost_per_token":0.000004}}"#;
+        let openrouter_b = r#"{"openrouter-context-drift":{"input_cost_per_token":0.000013,"output_cost_per_token":0.000014}}"#;
+        write_cache(&cache_a.join("pricing-litellm.json"), litellm_a);
+        write_cache(&cache_b.join("pricing-litellm.json"), litellm_b);
+        write_cache(&cache_a.join("pricing-openrouter.json"), openrouter_a);
+        write_cache(&cache_b.join("pricing-openrouter.json"), openrouter_b);
+
+        std::fs::write(
+            config_a.join("custom-pricing.json"),
+            r#"{"models":{"custom-context-drift":{"input_cost_per_token":0.000005,"output_cost_per_token":0.000006}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_b.join("custom-pricing.json"),
+            r#"{"models":{"custom-context-drift":{"input_cost_per_token":0.000015,"output_cost_per_token":0.000016}}}"#,
+        )
+        .unwrap();
+
+        let _env = EnvGuard::set(&[
+            ("TOKSCALE_CONFIG_DIR", config_a.as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let context = ResolvedLocalSourceContext::capture(
+            Some(root.path().join("home")),
+            true,
+            scanner::ScannerSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(context.pricing_config_dir(), config_a.as_path());
+
+        unsafe { std::env::set_var("TOKSCALE_CONFIG_DIR", &config_b) };
+        let service = load_pricing_for_local_parse_with_context(Some(&context))
+            .await
+            .expect("captured pricing cache should load");
+
+        assert_eq!(
+            service
+                .lookup_with_source("litellm-context-drift", Some("litellm"))
+                .unwrap()
+                .pricing
+                .input_cost_per_token,
+            Some(0.000001)
+        );
+        assert_eq!(
+            service
+                .lookup_with_source("openrouter-context-drift", Some("openrouter"))
+                .unwrap()
+                .pricing
+                .input_cost_per_token,
+            Some(0.000003)
+        );
+        assert_eq!(
+            service
+                .lookup_with_source("custom-context-drift", Some("custom"))
+                .unwrap()
+                .pricing
+                .input_cost_per_token,
+            Some(0.000005)
+        );
     }
 
     #[test]

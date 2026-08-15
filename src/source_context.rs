@@ -166,6 +166,7 @@ pub struct ResolvedLocalSourceContext {
     scanner_settings: ScannerSettings,
     pricing_cache_only: bool,
     source_cache_dir: Option<PathBuf>,
+    pricing_config_dir: PathBuf,
     platform_config_dir: Option<PathBuf>,
     platform_data_local_dir: Option<PathBuf>,
     source_env_paths: BTreeMap<&'static str, ResolvedPathInput>,
@@ -265,8 +266,10 @@ impl ResolvedLocalSourceContext {
         let pricing_cache_only = inputs
             .var_string(ENV_TOKSCALE_PRICING_CACHE_ONLY)
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
-        let source_cache_dir = resolve_source_cache_dir(&cwd, &home_dir, &inputs)?;
         let platform_config_dir = platform_config_root(&inputs, &cwd)?;
+        let pricing_config_dir =
+            resolve_pricing_config_dir(&cwd, &home_dir, &inputs, platform_config_dir.as_deref())?;
+        let source_cache_dir = resolve_source_cache_dir(&cwd, &home_dir, &inputs)?;
         let platform_data_local_dir = platform_data_local_root(&inputs, &cwd)?;
         let codex_archive_root =
             resolve_codex_archive_root(&cwd, &home_dir, use_env_roots, &inputs)?;
@@ -303,6 +306,7 @@ impl ResolvedLocalSourceContext {
             scanner_settings,
             pricing_cache_only,
             source_cache_dir,
+            pricing_config_dir,
             platform_config_dir,
             platform_data_local_dir,
             source_env_paths,
@@ -346,6 +350,10 @@ impl ResolvedLocalSourceContext {
 
     pub(crate) fn source_cache_dir(&self) -> Option<&Path> {
         self.source_cache_dir.as_deref()
+    }
+
+    pub(crate) fn pricing_config_dir(&self) -> &Path {
+        &self.pricing_config_dir
     }
 
     #[cfg(target_os = "windows")]
@@ -739,6 +747,24 @@ fn resolve_extra_scan_paths(
         .into_iter()
         .map(|(client, path)| fully_qualified(cwd, Path::new(&path)).map(|path| (client, path)))
         .collect()
+}
+
+fn resolve_pricing_config_dir(
+    cwd: &Path,
+    home: &Path,
+    inputs: &SourceResolutionInputs,
+    platform_config_dir: Option<&Path>,
+) -> Result<PathBuf, SourceContextUnavailable> {
+    let config = if let Some(custom) = inputs.var_nonempty(ENV_TOKSCALE_CONFIG_DIR) {
+        PathBuf::from(custom)
+    } else if cfg!(target_os = "macos") {
+        home.join(".config/tokscale")
+    } else {
+        platform_config_dir
+            .map(|root| root.join("tokscale"))
+            .unwrap_or_else(|| PathBuf::from(".tokscale"))
+    };
+    fully_qualified(cwd, &config)
 }
 
 fn resolve_scanner_settings(

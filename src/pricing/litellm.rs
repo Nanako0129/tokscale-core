@@ -1,6 +1,7 @@
 use super::cache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 const CACHE_FILENAME: &str = "pricing-litellm.json";
 const PRICING_URL: &str =
@@ -35,6 +36,10 @@ pub fn load_cached() -> Option<PricingDataset> {
 
 pub fn load_cached_any_age() -> Option<PricingDataset> {
     cache::load_cache_any_age(CACHE_FILENAME)
+}
+
+pub(crate) fn load_cached_any_age_from_dir(cache_dir: &Path) -> Option<PricingDataset> {
+    cache::load_cache_any_age_from_dir(cache_dir, CACHE_FILENAME)
 }
 
 /// Unix-seconds time the LiteLLM pricing cache was last fetched, if present.
