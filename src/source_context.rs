@@ -598,7 +598,13 @@ fn resolve_source_environment_paths(
                 fallback_source_env_path(key, home, platform_config_dir)?,
             )
         } else if let Some(raw) = input.value.as_deref() {
-            if source_env_uses_nonblank_semantics(key)
+            if source_env_requires_unicode(key) && raw.to_str().is_none() {
+                ResolvedPathInput::unavailable(fallback_source_env_path(
+                    key,
+                    home,
+                    platform_config_dir,
+                )?)
+            } else if source_env_uses_nonblank_semantics(key)
                 && raw.to_str().is_some_and(|value| value.trim().is_empty())
             {
                 ResolvedPathInput::fallback(
@@ -622,8 +628,19 @@ fn resolve_source_environment_paths(
     Ok(resolved)
 }
 
+fn source_env_requires_unicode(key: &str) -> bool {
+    key == ENV_XDG_DATA_HOME
+        || (cfg!(target_os = "linux") && key == ENV_XDG_CONFIG_HOME)
+        || ClientId::iter()
+            .any(|client| matches!(client.data().root, PathRoot::EnvVar { var, .. } if var == key))
+}
+
 fn source_env_uses_nonblank_semantics(key: &str) -> bool {
-    key != ENV_XDG_DATA_HOME && key != ENV_TOKSCALE_CONFIG_DIR && key != ENV_XDG_CONFIG_HOME
+    key != ENV_XDG_DATA_HOME
+        && key != ENV_TOKSCALE_CONFIG_DIR
+        && key != ENV_XDG_CONFIG_HOME
+        && key != ENV_APPDATA
+        && key != ENV_LOCALAPPDATA
 }
 
 fn source_env_trims_surrounding_whitespace(key: &str) -> bool {
@@ -966,6 +983,11 @@ mod tests {
 
         fn set(&self, key: &'static str, value: impl AsRef<OsStr>) {
             unsafe { std::env::set_var(key, value) };
+        }
+
+        #[cfg(windows)]
+        fn remove(&self, key: &'static str) {
+            unsafe { std::env::remove_var(key) };
         }
     }
 
@@ -1552,27 +1574,58 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ordinary_env_paths_preserve_non_utf8_native_units() {
+    fn unicode_only_env_roots_reject_non_utf8_native_values() {
         use std::os::unix::ffi::OsStringExt;
 
-        let root = fixture_root();
-        let cwd = fixture_path("cwd");
-        let raw = OsString::from_vec(b"  codex-\xff  ".to_vec());
-        let expected = fully_qualified(&cwd, Path::new(&raw)).unwrap();
-        let context = ResolvedLocalSourceContext::capture_resolved(
-            cwd,
-            Some(fixture_path("home")),
+        let root = TempDir::new().unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("home");
+        let invalid = OsString::from_vec(b"invalid-\xff".to_vec());
+        let unset = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(home.clone()),
             true,
             ScannerSettings::default(),
-            fixture_inputs(&root, [("CODEX_HOME", raw)]),
+            fixture_inputs(root.path(), []),
         )
         .unwrap();
 
-        assert!(context.source_env_is_explicit("CODEX_HOME"));
-        assert_eq!(
-            context.source_env_path("CODEX_HOME"),
-            Some(expected.as_path())
-        );
+        let mut keys = resolver_environment_keys()
+            .into_iter()
+            .filter(|key| source_env_requires_unicode(key))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            let invalid_context = ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                true,
+                ScannerSettings::default(),
+                fixture_inputs(root.path(), [(key, invalid.clone())]),
+            )
+            .unwrap();
+
+            assert!(!invalid_context.source_env_is_explicit(key), "{key}");
+            assert_eq!(
+                invalid_context.source_env_path(key),
+                unset.source_env_path(key),
+                "{key}"
+            );
+            assert_eq!(
+                invalid_context.identity_bytes(),
+                unset.identity_bytes(),
+                "{key}"
+            );
+            assert!(
+                !invalid_context
+                    .source_env_path(key)
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains('\u{fffd}'),
+                "{key}"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -1632,21 +1685,64 @@ mod tests {
         assert!(context.extra_scan_paths().is_empty());
         assert!(!context.source_env_is_explicit(ENV_TOKSCALE_EXTRA_DIRS));
         assert_eq!(context.identity_bytes(), unset.identity_bytes());
+    }
 
-        let ordinary = ResolvedLocalSourceContext::capture_resolved(
-            fixture_path("cwd"),
-            Some(home),
+    #[cfg(windows)]
+    #[test]
+    fn unicode_only_env_roots_reject_unpaired_utf16_values() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let invalid = OsString::from_wide(&[
+            0x0069, 0x006e, 0x0076, 0x0061, 0x006c, 0x0069, 0x0064, 0xd800,
+        ]);
+        let unset = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(home.clone()),
             true,
             ScannerSettings::default(),
-            fixture_inputs(&root, [("CODEX_HOME", invalid.clone())]),
+            fixture_inputs(&root, []),
         )
         .unwrap();
-        let expected = fully_qualified(&fixture_path("cwd"), Path::new(&invalid)).unwrap();
-        assert!(ordinary.source_env_is_explicit("CODEX_HOME"));
-        assert_eq!(
-            ordinary.source_env_path("CODEX_HOME"),
-            Some(expected.as_path())
-        );
+
+        let mut keys = resolver_environment_keys()
+            .into_iter()
+            .filter(|key| source_env_requires_unicode(key))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            let invalid_context = ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                true,
+                ScannerSettings::default(),
+                fixture_inputs(&root, [(key, invalid.clone())]),
+            )
+            .unwrap();
+
+            assert!(!invalid_context.source_env_is_explicit(key), "{key}");
+            assert_eq!(
+                invalid_context.source_env_path(key),
+                unset.source_env_path(key),
+                "{key}"
+            );
+            assert_eq!(
+                invalid_context.identity_bytes(),
+                unset.identity_bytes(),
+                "{key}"
+            );
+            assert!(
+                !invalid_context
+                    .source_env_path(key)
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains('\u{fffd}'),
+                "{key}"
+            );
+        }
     }
 
     #[test]
@@ -1955,6 +2051,22 @@ mod tests {
     }
 
     #[test]
+    fn unicode_only_env_classification_tracks_every_client_env_root() {
+        for client in ClientId::iter() {
+            if let PathRoot::EnvVar { var, .. } = client.data().root {
+                assert!(source_env_requires_unicode(var), "missing {var}");
+            }
+        }
+        assert!(source_env_requires_unicode(ENV_XDG_DATA_HOME));
+        assert_eq!(
+            source_env_requires_unicode(ENV_XDG_CONFIG_HOME),
+            cfg!(target_os = "linux")
+        );
+        assert!(!source_env_requires_unicode(ENV_APPDATA));
+        assert!(!source_env_requires_unicode(ENV_LOCALAPPDATA));
+    }
+
+    #[test]
     fn descriptor_has_fixed_sha256_and_native_path_vectors() {
         let root = fixture_root();
         let inputs = fixture_inputs(
@@ -1996,6 +2108,234 @@ mod tests {
                 .unwrap();
             assert_eq!(descriptor.0, vec![1, 1, 0, 0, 0, 3, b'/', b'x', 0xff]);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_appdata_and_localappdata_preserve_native_state_matrix() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+
+        for (key, fallback, absolute_name) in [
+            (ENV_APPDATA, home.join("AppData/Roaming"), "appdata-root"),
+            (
+                ENV_LOCALAPPDATA,
+                home.join("AppData/Local"),
+                "localappdata-root",
+            ),
+        ] {
+            let capture = |value: Option<OsString>, use_env_roots| {
+                ResolvedLocalSourceContext::capture_resolved(
+                    cwd.clone(),
+                    Some(home.clone()),
+                    use_env_roots,
+                    ScannerSettings::default(),
+                    fixture_inputs(&root, value.map(|value| (key, value))),
+                )
+                .unwrap()
+            };
+            let whitespace_raw = OsString::from(" \t ");
+            let relative_raw = OsString::from("relative-root");
+            let absolute = fixture_path(absolute_name);
+            let invalid_raw = OsString::from_wide(&[
+                0x006e, 0x0061, 0x0074, 0x0069, 0x0076, 0x0065, 0x002d, 0xd800,
+            ]);
+
+            let unset = capture(None, true);
+            let empty = capture(Some(OsString::new()), true);
+            let whitespace = capture(Some(whitespace_raw.clone()), true);
+            let relative = capture(Some(relative_raw.clone()), true);
+            let absolute_context = capture(Some(absolute.clone().into_os_string()), true);
+            let invalid = capture(Some(invalid_raw.clone()), true);
+            let disabled_unset = capture(None, false);
+            let disabled_invalid = capture(Some(invalid_raw.clone()), false);
+
+            assert_eq!(unset.source_env_path(key), Some(fallback.as_path()));
+            assert_eq!(empty.source_env_path(key), Some(fallback.as_path()));
+            assert!(!unset.source_env_is_explicit(key));
+            assert!(!empty.source_env_is_explicit(key));
+            assert_ne!(unset.identity_bytes(), empty.identity_bytes());
+
+            for context in [&whitespace, &relative, &absolute_context, &invalid] {
+                assert!(context.source_env_is_explicit(key));
+            }
+            assert_eq!(
+                whitespace.source_env_path(key),
+                Some(
+                    fully_qualified(&cwd, Path::new(&whitespace_raw))
+                        .unwrap()
+                        .as_path()
+                )
+            );
+            assert_eq!(
+                relative.source_env_path(key),
+                Some(
+                    fully_qualified(&cwd, Path::new(&relative_raw))
+                        .unwrap()
+                        .as_path()
+                )
+            );
+            assert_eq!(
+                absolute_context.source_env_path(key),
+                Some(absolute.as_path())
+            );
+            assert_eq!(
+                invalid.source_env_path(key),
+                Some(
+                    fully_qualified(&cwd, Path::new(&invalid_raw))
+                        .unwrap()
+                        .as_path()
+                )
+            );
+            assert_eq!(
+                std::collections::BTreeSet::from([
+                    whitespace.identity_bytes(),
+                    relative.identity_bytes(),
+                    absolute_context.identity_bytes(),
+                    invalid.identity_bytes(),
+                ])
+                .len(),
+                4
+            );
+
+            assert_eq!(disabled_unset.source_env_path(key), None);
+            assert_eq!(disabled_invalid.source_env_path(key), None);
+            assert!(!disabled_invalid.source_env_is_explicit(key));
+            assert_eq!(
+                disabled_unset.identity_bytes(),
+                disabled_invalid.identity_bytes()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn windows_cline_appdata_context_matches_legacy_and_preserves_wtf16() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = TempDir::new().unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("home");
+        let appdata = root.path().join("appdata");
+        let relative_tasks = Path::new(
+            "Code/User/globalStorage/saoudrizwan.claude-dev/tasks/task-valid/ui_messages.json",
+        );
+        let valid_file = appdata.join(relative_tasks);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(valid_file.parent().unwrap()).unwrap();
+        fs::write(&valid_file, b"[]").unwrap();
+
+        let env = EnvGuard::capture(&[ENV_APPDATA, ENV_TOKSCALE_EXTRA_DIRS]);
+        env.set(ENV_APPDATA, &appdata);
+        env.remove(ENV_TOKSCALE_EXTRA_DIRS);
+        let legacy = crate::scanner::scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let valid_context = ResolvedLocalSourceContext::capture_resolved(
+            cwd.clone(),
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(
+                root.path(),
+                [(ENV_APPDATA, appdata.clone().into_os_string())],
+            ),
+        )
+        .unwrap();
+        let resolved = crate::scanner::scan_all_clients_with_source_context(
+            &valid_context,
+            &["cline".to_string()],
+        )
+        .unwrap();
+        assert_eq!(resolved.get(ClientId::Cline), legacy.get(ClientId::Cline));
+        assert_eq!(resolved.get(ClientId::Cline), &[valid_file]);
+
+        let mut native_name = "native-appdata-".encode_utf16().collect::<Vec<_>>();
+        native_name.push(0xd800);
+        let native_root = root.path().join(OsString::from_wide(&native_name));
+        let decoy_root = root.path().join("native-appdata-\u{fffd}");
+        let native_file = native_root.join(relative_tasks);
+        let decoy_file = decoy_root.join(relative_tasks);
+        fs::create_dir_all(native_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(decoy_file.parent().unwrap()).unwrap();
+        fs::write(&native_file, b"[]").unwrap();
+        fs::write(&decoy_file, b"[]").unwrap();
+        assert!(native_root.to_str().is_none());
+        assert!(decoy_root.to_str().is_some());
+
+        env.set(ENV_APPDATA, &decoy_root);
+        let invalid_context = ResolvedLocalSourceContext::capture_resolved(
+            cwd,
+            Some(home),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(
+                root.path(),
+                [(ENV_APPDATA, native_root.clone().into_os_string())],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_context.source_env_path(ENV_APPDATA),
+            Some(native_root.as_path())
+        );
+        let invalid_scan = crate::scanner::scan_all_clients_with_source_context(
+            &invalid_context,
+            &["cline".to_string()],
+        )
+        .unwrap();
+        assert_eq!(invalid_scan.get(ClientId::Cline), &[native_file]);
+        assert!(!invalid_scan.get(ClientId::Cline).contains(&decoy_file));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_invalid_hermes_home_keeps_localappdata_discovery() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = TempDir::new().unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("home");
+        let localappdata = root.path().join("localappdata");
+        let local_db = localappdata.join("hermes/state.db");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(local_db.parent().unwrap()).unwrap();
+        fs::write(&local_db, b"").unwrap();
+
+        let mut invalid_name = "invalid-hermes-".encode_utf16().collect::<Vec<_>>();
+        invalid_name.push(0xd800);
+        let invalid_home = root.path().join(OsString::from_wide(&invalid_name));
+        let context = ResolvedLocalSourceContext::capture_resolved(
+            cwd,
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+            fixture_inputs(
+                root.path(),
+                [
+                    ("HERMES_HOME", invalid_home.into_os_string()),
+                    (ENV_LOCALAPPDATA, localappdata.clone().into_os_string()),
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert!(!context.source_env_is_explicit("HERMES_HOME"));
+        assert_eq!(
+            context.source_env_path("HERMES_HOME"),
+            Some(home.join(".hermes").as_path())
+        );
+        assert!(context.source_env_is_explicit(ENV_LOCALAPPDATA));
+        let scan =
+            crate::scanner::scan_all_clients_with_source_context(&context, &["hermes".to_string()])
+                .unwrap();
+        assert_eq!(scan.hermes_db, Some(local_db));
     }
 
     #[cfg(windows)]
