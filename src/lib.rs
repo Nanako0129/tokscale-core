@@ -10,6 +10,7 @@ mod parser;
 pub mod paths;
 pub mod pricing;
 mod provider_identity;
+pub mod remote_report;
 pub mod scanner;
 pub mod sessionize;
 pub mod sessions;
@@ -23,6 +24,11 @@ pub use model_alias::{
     GroupingAliasSnapshot, ModelAliasMap,
 };
 pub use parser::*;
+pub use remote_report::{
+    aggregate_remote_usage_v1, RemoteAgentsRecordV1, RemoteGraphRecordV1, RemoteHourlyRecordV1,
+    RemoteModelsRecordV1, RemoteUsageBundleV1, RemoteUsageError, RemoteUsageQueryV1,
+    REMOTE_TZDB_REVISION,
+};
 pub use scanner::*;
 pub use sessionize::{
     compute_daily_active_time, compute_time_metrics, sessionize, SessionInterval,

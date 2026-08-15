@@ -41,6 +41,9 @@ tracing = "0.1"
 sha2 = "0.10"
 libc = "0.2"
 fs2 = "0.4"
+jiff = { version = "=0.2.32", default-features = false, features = ["std"] }
+jiff-tzdb = "=0.1.8"
+unicode-normalization = { version = "=0.1.25", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
