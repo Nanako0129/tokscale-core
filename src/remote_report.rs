@@ -502,6 +502,9 @@ fn normalize_agent(client: &str, value: Option<&str>) -> Result<String, RemoteUs
     let Some(value) = value else {
         return Ok("Main".to_owned());
     };
+    if value.len() > MAX_TEXT_BYTES {
+        return Err(RemoteUsageError::InvalidText);
+    }
     let normalized = if client == "copilot" {
         normalize_copilot_agent_name(value)
     } else {

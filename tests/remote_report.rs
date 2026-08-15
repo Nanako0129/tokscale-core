@@ -348,3 +348,25 @@ fn remote_report_authoritative_label_occurrences_enforce_cap() {
         Err(RemoteUsageError::LimitExceeded)
     );
 }
+
+#[test]
+fn remote_report_accepts_nfc_unicode_model_without_panicking() {
+    let bundle = aggregate_remote_usage_v1(
+        &[message("alpha", "aébbbbbbb", "provider", 1_730_613_600_000)],
+        &query("UTC"),
+    )
+    .expect("valid NFC model");
+
+    assert_eq!(bundle.models[0].model.as_deref(), Some("aébbbbbbb"));
+}
+
+#[test]
+fn remote_report_rejects_oversized_raw_agent_before_normalization() {
+    let mut oversized = message("alpha", "model", "provider", 1_730_613_600_000);
+    oversized.agent = Some("\u{200b}".repeat(86));
+
+    assert_eq!(
+        aggregate_remote_usage_v1(&[oversized], &query("UTC")),
+        Err(RemoteUsageError::InvalidText)
+    );
+}
