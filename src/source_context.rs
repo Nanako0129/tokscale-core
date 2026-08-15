@@ -736,9 +736,13 @@ fn resolve_scanner_settings(
     for paths in settings.extra_scan_paths.values_mut() {
         *paths = std::mem::take(paths)
             .into_iter()
+            .filter(|path| !path.as_os_str().is_empty())
             .map(|path| fully_qualified(cwd, &path))
             .collect::<Result<_, _>>()?;
     }
+    settings
+        .extra_scan_paths
+        .retain(|_, paths| !paths.is_empty());
     Ok(settings)
 }
 
@@ -1686,6 +1690,140 @@ mod tests {
             context.scanner_settings().opencode_db_paths,
             vec![captured_cwd.join("db/opencode.db")]
         );
+    }
+
+    #[test]
+    fn scanner_setting_empty_paths_are_identity_neutral() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let capture = |settings| {
+            ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                false,
+                settings,
+                fixture_inputs(&root, []),
+            )
+            .unwrap()
+        };
+
+        let default = capture(ScannerSettings::default());
+        let empty_only = capture(ScannerSettings {
+            extra_scan_paths: BTreeMap::from([
+                ("codex".to_string(), vec![PathBuf::new()]),
+                ("gemini".to_string(), Vec::new()),
+            ]),
+            ..Default::default()
+        });
+
+        let codex_root = PathBuf::from("extra/codex");
+        let codex_sibling = PathBuf::from("extra/codex-sibling");
+        let whitespace = PathBuf::from(" \t ");
+        let gemini_root = PathBuf::from("extra/gemini");
+        let normalized = capture(ScannerSettings {
+            extra_scan_paths: BTreeMap::from([
+                (
+                    "codex".to_string(),
+                    vec![
+                        codex_root.clone(),
+                        codex_sibling.clone(),
+                        whitespace.clone(),
+                    ],
+                ),
+                ("gemini".to_string(), vec![gemini_root.clone()]),
+            ]),
+            ..Default::default()
+        });
+        let mixed = capture(ScannerSettings {
+            extra_scan_paths: BTreeMap::from([
+                (
+                    "codex".to_string(),
+                    vec![
+                        PathBuf::new(),
+                        codex_root.clone(),
+                        PathBuf::new(),
+                        codex_sibling.clone(),
+                        whitespace.clone(),
+                    ],
+                ),
+                (
+                    "gemini".to_string(),
+                    vec![PathBuf::new(), gemini_root.clone(), PathBuf::new()],
+                ),
+                ("claude".to_string(), vec![PathBuf::new()]),
+            ]),
+            ..Default::default()
+        });
+
+        assert!(empty_only.scanner_settings().extra_scan_paths.is_empty());
+        assert_eq!(
+            default.scanner_settings().extra_scan_paths,
+            empty_only.scanner_settings().extra_scan_paths
+        );
+        assert_eq!(default.identity_bytes(), empty_only.identity_bytes());
+        assert_eq!(
+            normalized.scanner_settings().extra_scan_paths,
+            mixed.scanner_settings().extra_scan_paths
+        );
+        assert_eq!(normalized.identity_bytes(), mixed.identity_bytes());
+        assert_eq!(
+            normalized.scanner_settings().extra_scan_paths["codex"],
+            vec![
+                cwd.join(codex_root),
+                cwd.join(codex_sibling),
+                cwd.join(whitespace),
+            ]
+        );
+        assert_eq!(
+            normalized.scanner_settings().extra_scan_paths["gemini"],
+            vec![cwd.join(gemini_root)]
+        );
+        assert!(!mixed
+            .scanner_settings()
+            .extra_scan_paths
+            .contains_key("claude"));
+    }
+
+    #[test]
+    fn context_scanner_does_not_expand_empty_extra_path_to_capture_cwd() {
+        let root = TempDir::new().unwrap();
+        let cwd = root.path().join("capture-cwd");
+        let home = root.path().join("home");
+        let intended_relative = PathBuf::from("configured-codex");
+        let intended_root = cwd.join(&intended_relative);
+        let unrelated = cwd.join("unrelated.jsonl");
+        let intended = intended_root.join("intended.jsonl");
+        fs::create_dir_all(&intended_root).unwrap();
+        fs::write(&unrelated, b"{}\n").unwrap();
+        fs::write(&intended, b"{}\n").unwrap();
+
+        let capture = |paths: Vec<PathBuf>| {
+            ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                false,
+                ScannerSettings {
+                    extra_scan_paths: BTreeMap::from([("codex".to_string(), paths)]),
+                    ..Default::default()
+                },
+                fixture_inputs(root.path(), []),
+            )
+            .unwrap()
+        };
+        let mixed = capture(vec![PathBuf::new(), intended_relative.clone()]);
+        let normalized = capture(vec![intended_relative]);
+        let clients = ["codex".to_string()];
+
+        let mixed_scan =
+            crate::scanner::scan_all_clients_with_source_context(&mixed, &clients).unwrap();
+        let normalized_scan =
+            crate::scanner::scan_all_clients_with_source_context(&normalized, &clients).unwrap();
+        let mixed_files = mixed_scan.get(ClientId::Codex);
+
+        assert_eq!(mixed_files, normalized_scan.get(ClientId::Codex));
+        assert_eq!(mixed_files, &vec![intended]);
+        assert!(!mixed_files.contains(&unrelated));
     }
 
     #[test]
