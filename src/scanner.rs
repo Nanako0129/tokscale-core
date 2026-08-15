@@ -683,16 +683,21 @@ fn crush_db_path(data_dir: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-fn resolve_crush_data_dir(project: &CrushProject) -> PathBuf {
+fn resolve_crush_data_dir(project: &CrushProject, relative_base: Option<&Path>) -> PathBuf {
     let data_dir = PathBuf::from(&project.data_dir);
     if data_dir.is_absolute() {
         data_dir
     } else {
-        PathBuf::from(&project.path).join(data_dir)
+        relative_base
+            .map_or_else(
+                || PathBuf::from(&project.path),
+                |base| base.join(&project.path),
+            )
+            .join(data_dir)
     }
 }
 
-fn scan_crush_registry(registry_path: &Path) -> Vec<CrushDbSource> {
+fn scan_crush_registry(registry_path: &Path, relative_base: Option<&Path>) -> Vec<CrushDbSource> {
     let registry = match std::fs::read_to_string(registry_path) {
         Ok(contents) => contents,
         Err(_) => return Vec::new(),
@@ -707,7 +712,7 @@ fn scan_crush_registry(registry_path: &Path) -> Vec<CrushDbSource> {
         .into_iter()
         .filter_map(|project| serde_json::from_value::<CrushProject>(project).ok())
         .filter_map(|project| {
-            let db_path = crush_db_path(&resolve_crush_data_dir(&project))?;
+            let db_path = crush_db_path(&resolve_crush_data_dir(&project, relative_base))?;
             let workspace_key = normalize_workspace_key(&project.path);
             let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
             Some(CrushDbSource {
@@ -725,7 +730,7 @@ fn discover_crush_dbs(home_dir: &str, use_env_roots: bool) -> Vec<CrushDbSource>
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots),
     );
-    let mut dbs = scan_crush_registry(&registry_path);
+    let mut dbs = scan_crush_registry(&registry_path, None);
     dbs.sort_by(|a, b| a.db_path.cmp(&b.db_path));
     dbs.dedup_by(|a, b| a.db_path == b.db_path);
     dbs
@@ -1240,7 +1245,7 @@ fn scan_all_clients_resolved_inner(
 
     if enabled.contains(&ClientId::Crush) {
         let path = context.resolve_client_path(ClientId::Crush)?;
-        let mut dbs = scan_crush_registry(&path);
+        let mut dbs = scan_crush_registry(&path, Some(context.capture_cwd()));
         dbs.sort_by(|a, b| a.db_path.cmp(&b.db_path));
         dbs.dedup_by(|a, b| a.db_path == b.db_path);
         result.crush_dbs = dbs;
@@ -3910,7 +3915,7 @@ mod tests {
         .to_string();
         setup_mock_crush_registry(&registry_path, &projects_json);
 
-        let result = scan_crush_registry(&registry_path);
+        let result = scan_crush_registry(&registry_path, None);
         assert_eq!(
             result,
             vec![
@@ -3949,7 +3954,7 @@ mod tests {
         .to_string();
         setup_mock_crush_registry(&registry_path, &projects_json);
 
-        let result = scan_crush_registry(&registry_path);
+        let result = scan_crush_registry(&registry_path, None);
         assert_eq!(
             result,
             vec![CrushDbSource {
@@ -4022,6 +4027,52 @@ mod tests {
             }]
         );
         assert!(result.get(ClientId::Crush).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn source_context_crush_relative_projects_use_capture_cwd() {
+        let mut env = EnvGuard::capture(&["XDG_DATA_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        let dir = TempDir::new().unwrap();
+        let capture_cwd = dir.path().join("capture-cwd");
+        let later_cwd = dir.path().join("later-cwd");
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        let relative_db = Path::new("project/.crush/crush.db");
+        fs::create_dir_all(capture_cwd.join(relative_db).parent().unwrap()).unwrap();
+        fs::create_dir_all(later_cwd.join(relative_db).parent().unwrap()).unwrap();
+        File::create(capture_cwd.join(relative_db)).unwrap();
+        File::create(later_cwd.join(relative_db)).unwrap();
+        setup_mock_crush_registry(
+            &xdg.join("crush/projects.json"),
+            r#"{"projects":[{"path":"project","data_dir":".crush"}]}"#,
+        );
+        env.set("XDG_DATA_HOME", &xdg);
+        env.remove("TOKSCALE_EXTRA_DIRS");
+
+        let _cwd = CwdGuard::change(&capture_cwd);
+        let clients = ["crush".to_string()];
+        let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, true);
+        let legacy_db = fs::canonicalize(&legacy.crush_dbs[0].db_path).unwrap();
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+
+        std::env::set_current_dir(&later_cwd).unwrap();
+        let later_context =
+            ResolvedLocalSourceContext::capture(Some(home), true, ScannerSettings::default())
+                .unwrap();
+        let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
+
+        assert_eq!(resolved.crush_dbs[0].db_path, legacy_db);
+        assert_eq!(
+            resolved.crush_dbs[0].workspace_key,
+            legacy.crush_dbs[0].workspace_key
+        );
+        assert_ne!(context.identity_bytes(), later_context.identity_bytes());
     }
 
     #[test]

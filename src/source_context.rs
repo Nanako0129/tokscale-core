@@ -161,6 +161,7 @@ impl SourceResolutionInputs {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedLocalSourceContext {
+    capture_cwd: PathBuf,
     home_dir: PathBuf,
     use_env_roots: bool,
     scanner_settings: ScannerSettings,
@@ -301,6 +302,7 @@ impl ResolvedLocalSourceContext {
         );
 
         let mut context = Self {
+            capture_cwd: cwd,
             home_dir,
             use_env_roots,
             scanner_settings,
@@ -320,6 +322,10 @@ impl ResolvedLocalSourceContext {
 
     pub fn home_dir(&self) -> &Path {
         &self.home_dir
+    }
+
+    pub(crate) fn capture_cwd(&self) -> &Path {
+        &self.capture_cwd
     }
 
     pub fn use_env_roots(&self) -> bool {
@@ -498,6 +504,9 @@ impl ResolvedLocalSourceContext {
 
         descriptor.field(14);
         descriptor.optional_path(self.source_cache_dir.as_deref())?;
+
+        descriptor.field(15);
+        descriptor.path(&self.capture_cwd)?;
 
         Ok(Sha256::digest(descriptor.0).into())
     }
@@ -2148,7 +2157,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(
             identity,
-            "sc1:f980f9db19f3217fcc6059d8e5f1253b50307020c97e8584f2da357dce7d3424"
+            "sc1:b3b65ffcb00dacb7c35d9cf0d5221750b4151135ee8d19158cf4061c64cd3406"
         );
 
         #[cfg(unix)]
