@@ -24,6 +24,7 @@ pub use model_alias::{
     GroupingAliasSnapshot, ModelAliasMap,
 };
 pub use parser::*;
+pub use pricing::{RemotePricingDiagnostic, RemotePricingSnapshot};
 pub use remote_report::{
     aggregate_remote_usage_v1, RemoteAgentsRecordV1, RemoteGraphRecordV1, RemoteHourlyRecordV1,
     RemoteModelsRecordV1, RemoteUsageBundleV1, RemoteUsageError, RemoteUsageQueryV1,
@@ -35,7 +36,10 @@ pub use sessionize::{
     SessionizeAccumulator, TimeMetrics, DEFAULT_IDLE_GAP_MS,
 };
 pub use sessions::{CostSource, UnifiedMessage};
-pub use source_context::{ResolvedLocalSourceContext, SourceContextUnavailable};
+pub use source_context::{
+    RemoteSourceContextError, RemoteSourceContextV1, RemoteSourceFingerprintV1,
+    RemoteSourceScopeTokenV1, ResolvedLocalSourceContext, SourceContextUnavailable,
+};
 
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -381,6 +385,93 @@ pub struct LocalParseOptions {
     /// source-specific DB/WAL/dependency probes because WAL writes may not touch
     /// the main database mtime.
     pub modified_after: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteSourceUsageError {
+    SourceUnavailable,
+    InvalidQuery,
+    IncompatibleTzdb,
+    InvalidTimeZone,
+    InvalidTimestamp,
+    InvalidText,
+    InvalidNumerator,
+    LimitExceeded,
+}
+
+impl std::fmt::Display for RemoteSourceUsageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SourceUnavailable => "source unavailable",
+            Self::InvalidQuery => "invalid query",
+            Self::IncompatibleTzdb => "incompatible tzdb",
+            Self::InvalidTimeZone => "invalid timezone",
+            Self::InvalidTimestamp => "invalid timestamp",
+            Self::InvalidText => "invalid text",
+            Self::InvalidNumerator => "invalid numerator",
+            Self::LimitExceeded => "limit exceeded",
+        })
+    }
+}
+
+impl std::error::Error for RemoteSourceUsageError {}
+
+impl From<remote_report::RemoteUsageError> for RemoteSourceUsageError {
+    fn from(error: remote_report::RemoteUsageError) -> Self {
+        match error {
+            remote_report::RemoteUsageError::InvalidQuery => Self::InvalidQuery,
+            remote_report::RemoteUsageError::IncompatibleTzdb => Self::IncompatibleTzdb,
+            remote_report::RemoteUsageError::InvalidTimeZone => Self::InvalidTimeZone,
+            remote_report::RemoteUsageError::InvalidTimestamp => Self::InvalidTimestamp,
+            remote_report::RemoteUsageError::InvalidText => Self::InvalidText,
+            remote_report::RemoteUsageError::InvalidNumerator => Self::InvalidNumerator,
+            remote_report::RemoteUsageError::LimitExceeded => Self::LimitExceeded,
+        }
+    }
+}
+
+/// Fold the production streaming source lane into the remote four-page
+/// bundle.  Source parsing, cache reads, per-client deduplication, and pricing
+/// all stay in the existing streaming driver; only the final fold is remote
+/// specific.
+pub fn aggregate_remote_usage_from_source_v1(
+    context: &RemoteSourceContextV1,
+    query: &RemoteUsageQueryV1,
+    pricing_snapshot: &RemotePricingSnapshot,
+) -> Result<RemoteUsageBundleV1, RemoteSourceUsageError> {
+    let mut fold =
+        remote_report::RemoteUsageFold::new(query).map_err(RemoteSourceUsageError::from)?;
+    let clients = if query.clients.is_empty() {
+        Vec::new()
+    } else {
+        split_report_client_filter(&ReportOptions {
+            clients: Some(query.clients.clone()),
+            ..Default::default()
+        })
+        .0
+    };
+    let mut source_error = None;
+    fn accept_remote_message(_: &UnifiedMessage) -> bool {
+        true
+    }
+    let mut sink = |message: &UnifiedMessage| {
+        if source_error.is_none() {
+            source_error = fold.push(message).err().map(Into::into);
+        }
+    };
+    scan_messages_streaming_with_context(
+        context.local(),
+        &clients,
+        pricing_snapshot.service(),
+        None,
+        &accept_remote_message,
+        &mut sink,
+    )
+    .map_err(|_| RemoteSourceUsageError::SourceUnavailable)?;
+    if let Some(error) = source_error {
+        return Err(error);
+    }
+    fold.finish().map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]

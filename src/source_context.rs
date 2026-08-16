@@ -7,6 +7,155 @@ use std::ffi::{OsStr, OsString};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
+/// Opaque digest of the roots and scanner settings used by a remote source
+/// context.  The bytes are intentionally not a path-bearing public value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct RemoteSourceFingerprintV1([u8; 32]);
+
+impl RemoteSourceFingerprintV1 {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Durable owner approval for one exact remote source scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteSourceScopeTokenV1 {
+    fingerprint: RemoteSourceFingerprintV1,
+    generation: u64,
+}
+
+impl RemoteSourceScopeTokenV1 {
+    pub fn new(fingerprint: RemoteSourceFingerprintV1, generation: u64) -> Self {
+        Self {
+            fingerprint,
+            generation,
+        }
+    }
+
+    pub fn fingerprint(&self) -> RemoteSourceFingerprintV1 {
+        self.fingerprint
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteSourceContextError {
+    InvalidRoots,
+    InvalidScannerSettings,
+    ScopeNotApproved,
+}
+
+impl std::fmt::Display for RemoteSourceContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidRoots => "invalid source roots",
+            Self::InvalidScannerSettings => "invalid scanner settings",
+            Self::ScopeNotApproved => "source scope not approved",
+        })
+    }
+}
+
+impl std::error::Error for RemoteSourceContextError {}
+
+/// Environment-independent source context used by remote report producers.
+///
+/// The inner local context is assembled from caller-owned absolute paths.  It
+/// is deliberately not constructible through `capture`, which remains the
+/// compatibility API for local reports.
+#[derive(Clone)]
+pub struct RemoteSourceContextV1 {
+    local: ResolvedLocalSourceContext,
+    fingerprint: RemoteSourceFingerprintV1,
+    generation: u64,
+}
+
+impl std::fmt::Debug for RemoteSourceContextV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteSourceContextV1")
+            .field("fingerprint", &self.fingerprint)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteSourceContextV1 {
+    pub fn preview_fingerprint(
+        home_dir: &Path,
+        platform_config_dir: &Path,
+        platform_data_dir: &Path,
+        source_cache_dir: &Path,
+        scanner_settings: &ScannerSettings,
+    ) -> Result<RemoteSourceFingerprintV1, RemoteSourceContextError> {
+        let local = ResolvedLocalSourceContext::from_remote_explicit(
+            home_dir,
+            platform_config_dir,
+            platform_data_dir,
+            source_cache_dir,
+            scanner_settings,
+        )?;
+        Ok(RemoteSourceFingerprintV1(
+            local
+                .compute_remote_identity()
+                .map_err(|_| RemoteSourceContextError::InvalidRoots)?,
+        ))
+    }
+
+    pub fn new(
+        home_dir: impl AsRef<Path>,
+        platform_config_dir: impl AsRef<Path>,
+        platform_data_dir: impl AsRef<Path>,
+        source_cache_dir: impl AsRef<Path>,
+        scanner_settings: ScannerSettings,
+        approved_scope: RemoteSourceScopeTokenV1,
+    ) -> Result<Self, RemoteSourceContextError> {
+        let home_dir = home_dir.as_ref();
+        let platform_config_dir = platform_config_dir.as_ref();
+        let platform_data_dir = platform_data_dir.as_ref();
+        let source_cache_dir = source_cache_dir.as_ref();
+        let local = ResolvedLocalSourceContext::from_remote_explicit(
+            home_dir,
+            platform_config_dir,
+            platform_data_dir,
+            source_cache_dir,
+            &scanner_settings,
+        )?;
+        let fingerprint = RemoteSourceFingerprintV1(
+            local
+                .compute_remote_identity()
+                .map_err(|_| RemoteSourceContextError::InvalidRoots)?,
+        );
+        if approved_scope.fingerprint != fingerprint {
+            return Err(RemoteSourceContextError::ScopeNotApproved);
+        }
+        Ok(Self {
+            local,
+            fingerprint,
+            generation: approved_scope.generation,
+        })
+    }
+
+    pub fn preview(&self) -> RemoteSourceFingerprintV1 {
+        self.fingerprint
+    }
+
+    pub fn fingerprint(&self) -> RemoteSourceFingerprintV1 {
+        self.fingerprint
+    }
+
+    pub fn source_scope_generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn local(&self) -> &ResolvedLocalSourceContext {
+        &self.local
+    }
+}
+
 const DOMAIN: &[u8] = b"tokenbar-source-context";
 const RESOLVER_CONTRACT_VERSION: u32 = 1;
 
@@ -235,6 +384,131 @@ impl ResolvedPathInput {
 }
 
 impl ResolvedLocalSourceContext {
+    fn from_remote_explicit(
+        home_dir: &Path,
+        platform_config_dir: &Path,
+        platform_data_local_dir: &Path,
+        source_cache_dir: &Path,
+        scanner_settings: &ScannerSettings,
+    ) -> Result<Self, RemoteSourceContextError> {
+        for path in [
+            home_dir,
+            platform_config_dir,
+            platform_data_local_dir,
+            source_cache_dir,
+        ] {
+            if !path.is_absolute() || path.as_os_str().is_empty() {
+                return Err(RemoteSourceContextError::InvalidRoots);
+            }
+        }
+        if !scanner_settings
+            .opencode_db_paths
+            .iter()
+            .all(|path| path.is_absolute())
+            || !scanner_settings
+                .extra_scan_paths
+                .values()
+                .flatten()
+                .all(|path| path.is_absolute())
+        {
+            return Err(RemoteSourceContextError::InvalidScannerSettings);
+        }
+
+        let home_dir = home_dir.to_path_buf();
+        let platform_config_dir = platform_config_dir.to_path_buf();
+        let platform_data_local_dir = platform_data_local_dir.to_path_buf();
+        let scanner_settings = scanner_settings.clone();
+        let mut source_env_paths = BTreeMap::new();
+        let mut keys = resolver_environment_keys();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            let path = fallback_source_env_path(key, &home_dir, Some(&platform_config_dir))
+                .map_err(|_| RemoteSourceContextError::InvalidRoots)?;
+            source_env_paths.insert(key, ResolvedPathInput::unavailable(path));
+        }
+        // Explicit platform roots are the only substitutes for platform
+        // environment roots.  They never come from process state.
+        source_env_paths.insert(
+            ENV_XDG_DATA_HOME,
+            ResolvedPathInput::unavailable(platform_data_local_dir.clone()),
+        );
+        source_env_paths.insert(
+            ENV_XDG_CONFIG_HOME,
+            ResolvedPathInput::unavailable(platform_config_dir.clone()),
+        );
+        source_env_paths.insert(
+            ENV_TOKSCALE_CONFIG_DIR,
+            ResolvedPathInput {
+                state: InputState::Unset,
+                resolution: PathResolution::Explicit,
+                path: Some(platform_config_dir.join("tokscale")),
+            },
+        );
+        source_env_paths.insert(ENV_HOME, ResolvedPathInput::unavailable(home_dir.clone()));
+        source_env_paths.insert(
+            ENV_TOKSCALE_EXTRA_DIRS,
+            ResolvedPathInput::unavailable(home_dir.clone()),
+        );
+
+        let codex_archive_root = home_dir.join(".codex/archived_sessions");
+        let local = Self {
+            capture_cwd: home_dir.clone(),
+            home_dir,
+            use_env_roots: true,
+            scanner_settings,
+            pricing_cache_only: true,
+            source_cache_dir: Some(source_cache_dir.to_path_buf()),
+            pricing_config_dir: platform_config_dir.join("tokscale"),
+            platform_config_dir: Some(platform_config_dir),
+            platform_data_local_dir: Some(platform_data_local_dir),
+            source_env_paths,
+            codex_archive_root,
+            extra_scan_paths: Vec::new(),
+            identity: [0; 32],
+        };
+        Ok(local)
+    }
+
+    fn compute_remote_identity(&self) -> Result<[u8; 32], SourceContextUnavailable> {
+        let mut descriptor = Descriptor::default();
+        descriptor.field(1);
+        descriptor.bytes(b"tokenbar-remote-source-context-v1")?;
+        descriptor.field(2);
+        descriptor.path(&self.home_dir)?;
+        descriptor.field(3);
+        descriptor.optional_path(self.platform_config_dir.as_deref())?;
+        descriptor.field(4);
+        descriptor.optional_path(self.platform_data_local_dir.as_deref())?;
+        descriptor.field(5);
+        descriptor.path(
+            self.source_cache_dir
+                .as_deref()
+                .ok_or(SourceContextUnavailable)?,
+        )?;
+        descriptor.field(6);
+        descriptor.count(self.scanner_settings.opencode_db_paths.len())?;
+        for path in &self.scanner_settings.opencode_db_paths {
+            descriptor.path(path)?;
+        }
+        descriptor.field(7);
+        descriptor.count(self.scanner_settings.extra_scan_paths.len())?;
+        for (client, paths) in &self.scanner_settings.extra_scan_paths {
+            descriptor.text(client)?;
+            descriptor.count(paths.len())?;
+            for path in paths {
+                descriptor.path(path)?;
+            }
+        }
+        descriptor.field(8);
+        descriptor.count(ClientId::COUNT)?;
+        for client in ClientId::iter() {
+            descriptor.u32(client as u32);
+            descriptor.path(&self.resolve_client_path(client)?)?;
+        }
+        Ok(Sha256::digest(descriptor.0).into())
+    }
+
     pub fn capture(
         home_dir: Option<PathBuf>,
         use_env_roots: bool,

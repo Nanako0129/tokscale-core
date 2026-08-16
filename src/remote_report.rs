@@ -199,171 +199,218 @@ pub fn aggregate_remote_usage_v1(
     messages: &[UnifiedMessage],
     query: &RemoteUsageQueryV1,
 ) -> Result<RemoteUsageBundleV1, RemoteUsageError> {
-    let (start_date, end_date_exclusive) = validate_query(query)?;
-    let timezone = bundled_timezone(query)?;
-
+    let mut fold = RemoteUsageFold::new(query)?;
     if messages.len() > MAX_MESSAGES {
         return Err(RemoteUsageError::LimitExceeded);
     }
-
-    let mut label_bytes = 0usize;
-    let mut prepared = Vec::new();
     for message in messages {
+        fold.push(message)?;
+    }
+    fold.finish()
+}
+
+pub(crate) struct RemoteUsageFold {
+    query: RemoteUsageQueryV1,
+    timezone: TimeZone,
+    start_date: Date,
+    end_date_exclusive: Date,
+    accumulator: RemoteUsageAccumulator,
+}
+
+impl RemoteUsageFold {
+    pub(crate) fn new(query: &RemoteUsageQueryV1) -> Result<Self, RemoteUsageError> {
+        let (start_date, end_date_exclusive) = validate_query(query)?;
+        let timezone = bundled_timezone(query)?;
+        Ok(Self {
+            query: query.clone(),
+            timezone,
+            start_date,
+            end_date_exclusive,
+            accumulator: RemoteUsageAccumulator::default(),
+        })
+    }
+
+    pub(crate) fn push(&mut self, message: &UnifiedMessage) -> Result<(), RemoteUsageError> {
+        self.accumulator.add(
+            message,
+            &self.query,
+            &self.timezone,
+            self.start_date,
+            self.end_date_exclusive,
+        )
+    }
+
+    pub(crate) fn finish(self) -> Result<RemoteUsageBundleV1, RemoteUsageError> {
+        self.accumulator.finish()
+    }
+}
+
+#[derive(Default)]
+struct RemoteUsageAccumulator {
+    messages: usize,
+    label_bytes: usize,
+    graph: BTreeMap<GraphKey, CommonAccumulator>,
+    models: BTreeMap<ModelKey, ModelAccumulator>,
+    hourly: BTreeMap<HourlyKey, CommonAccumulator>,
+    agents: BTreeMap<AgentKey, CommonAccumulator>,
+    saturated: bool,
+}
+
+impl RemoteUsageAccumulator {
+    fn add(
+        &mut self,
+        message: &UnifiedMessage,
+        query: &RemoteUsageQueryV1,
+        timezone: &TimeZone,
+        start_date: Date,
+        end_date_exclusive: Date,
+    ) -> Result<(), RemoteUsageError> {
+        self.messages = self
+            .messages
+            .checked_add(1)
+            .ok_or(RemoteUsageError::LimitExceeded)?;
+        if self.messages > MAX_MESSAGES {
+            return Err(RemoteUsageError::LimitExceeded);
+        }
         validate_message_timestamp(message.timestamp)?;
         let timestamp = timestamp_from_millisecond(message.timestamp)?;
         let local_datetime = timezone.to_datetime(timestamp);
         let local_date = local_datetime.date();
-        let local_date_text = local_date.to_string();
-        let utc_offset_seconds = timezone.to_offset(timestamp).seconds();
-        let bucket_start_unix_ms = bucket_start(
-            &timezone,
+        let date_text = local_date.to_string();
+        let offset = timezone.to_offset(timestamp).seconds();
+        let bucket = bucket_start(
+            timezone,
             timestamp,
             local_date,
             local_datetime.hour(),
-            utc_offset_seconds,
+            offset,
         )?;
-
         let client = validate_client(&message.client)?;
         let numerators = validate_numerators(message)?;
-
         let included = query.clients.is_empty()
             || query
                 .clients
                 .binary_search_by(|candidate| candidate.as_bytes().cmp(client.as_bytes()))
                 .is_ok();
-        let in_date_range = local_date >= start_date && local_date < end_date_exclusive;
-        if !included || !in_date_range {
-            continue;
+        if !included || !(start_date..end_date_exclusive).contains(&local_date) {
+            return Ok(());
         }
-
         let model = normalize_model(&message.model_id)?;
         let provider = normalize_provider(&message.provider_id)?;
         let agent = normalize_agent(&message.client, message.agent.as_deref())?;
-
-        add_label_bytes(&mut label_bytes, &client)?;
+        add_label_bytes(&mut self.label_bytes, &client)?;
         if let Some(model) = &model {
-            add_label_bytes(&mut label_bytes, model)?;
+            add_label_bytes(&mut self.label_bytes, model)?;
         }
         if let Some(provider) = &provider {
-            add_label_bytes(&mut label_bytes, provider)?;
+            add_label_bytes(&mut self.label_bytes, provider)?;
         }
-        add_label_bytes(&mut label_bytes, &agent)?;
+        add_label_bytes(&mut self.label_bytes, &agent)?;
 
-        prepared.push(PreparedMessage {
-            date_text: local_date_text,
+        let prepared = PreparedMessage {
+            date_text,
             client,
             model,
             provider,
             agent,
-            bucket_start_unix_ms,
-            utc_offset_seconds,
+            bucket_start_unix_ms: bucket,
+            utc_offset_seconds: offset,
             numerators,
-        });
-    }
-
-    let mut graph: BTreeMap<GraphKey, CommonAccumulator> = BTreeMap::new();
-    let mut models: BTreeMap<ModelKey, ModelAccumulator> = BTreeMap::new();
-    let mut hourly: BTreeMap<HourlyKey, CommonAccumulator> = BTreeMap::new();
-    let mut agents: BTreeMap<AgentKey, CommonAccumulator> = BTreeMap::new();
-    let mut saturated = false;
-
-    for message in &prepared {
-        let token_total = token_total(&message.numerators, &mut saturated);
+        };
+        let token_total = token_total(&prepared.numerators, &mut self.saturated);
         add_common(
-            graph
+            self.graph
                 .entry((
-                    message.date_text.clone(),
-                    message.client.clone(),
-                    message.model.clone(),
-                    message.provider.clone(),
+                    prepared.date_text.clone(),
+                    prepared.client.clone(),
+                    prepared.model.clone(),
+                    prepared.provider.clone(),
                 ))
                 .or_default(),
-            &message.numerators,
-            &mut saturated,
+            &prepared.numerators,
+            &mut self.saturated,
         );
         add_common(
-            hourly
+            self.hourly
                 .entry((
-                    message.bucket_start_unix_ms,
-                    message.utc_offset_seconds,
-                    message.client.clone(),
-                    message.model.clone(),
-                    message.provider.clone(),
+                    prepared.bucket_start_unix_ms,
+                    prepared.utc_offset_seconds,
+                    prepared.client.clone(),
+                    prepared.model.clone(),
+                    prepared.provider.clone(),
                 ))
                 .or_default(),
-            &message.numerators,
-            &mut saturated,
+            &prepared.numerators,
+            &mut self.saturated,
         );
         add_common(
-            agents
+            self.agents
                 .entry((
-                    message.agent.clone(),
-                    message.client.clone(),
-                    message.model.clone(),
-                    message.provider.clone(),
+                    prepared.agent.clone(),
+                    prepared.client.clone(),
+                    prepared.model.clone(),
+                    prepared.provider.clone(),
                 ))
                 .or_default(),
-            &message.numerators,
-            &mut saturated,
+            &prepared.numerators,
+            &mut self.saturated,
         );
-
-        let model_accumulator = models
-            .entry((
-                message.client.clone(),
-                message.model.clone(),
-                message.provider.clone(),
-            ))
+        let model_accumulator = self
+            .models
+            .entry((prepared.client, prepared.model, prepared.provider))
             .or_default();
         add_common(
             &mut model_accumulator.common,
-            &message.numerators,
-            &mut saturated,
+            &prepared.numerators,
+            &mut self.saturated,
         );
-        if let Some(duration_millis) = message.numerators.duration_millis {
+        if let Some(duration_millis) = prepared.numerators.duration_millis {
             if duration_millis > 0 && token_total > 0 {
                 saturating_add(
                     &mut model_accumulator.duration_millis,
                     duration_millis,
-                    &mut saturated,
+                    &mut self.saturated,
                 );
                 saturating_add(
                     &mut model_accumulator.timed_tokens,
                     token_total,
-                    &mut saturated,
+                    &mut self.saturated,
                 );
-                saturating_add(&mut model_accumulator.sample_count, 1, &mut saturated);
+                saturating_add(&mut model_accumulator.sample_count, 1, &mut self.saturated);
             }
         }
-
-        if graph.len() > MAX_RECORDS
-            || models.len() > MAX_RECORDS
-            || hourly.len() > MAX_RECORDS
-            || agents.len() > MAX_RECORDS
+        if self.graph.len() > MAX_RECORDS
+            || self.models.len() > MAX_RECORDS
+            || self.hourly.len() > MAX_RECORDS
+            || self.agents.len() > MAX_RECORDS
         {
             return Err(RemoteUsageError::LimitExceeded);
         }
+        Ok(())
     }
 
-    let graph = build_graph_records(graph, &mut saturated);
-    let models = build_model_records(models, &mut saturated);
-    let hourly = build_hourly_records(hourly, &mut saturated);
-    let agents = build_agent_records(agents, &mut saturated);
-    if output_string_bytes_graph(&graph) > MAX_OUTPUT_STRING_BYTES
-        || output_string_bytes_models(&models) > MAX_OUTPUT_STRING_BYTES
-        || output_string_bytes_hourly(&hourly) > MAX_OUTPUT_STRING_BYTES
-        || output_string_bytes_agents(&agents) > MAX_OUTPUT_STRING_BYTES
-    {
-        return Err(RemoteUsageError::LimitExceeded);
+    fn finish(self) -> Result<RemoteUsageBundleV1, RemoteUsageError> {
+        let mut saturated = self.saturated;
+        let graph = build_graph_records(self.graph, &mut saturated);
+        let models = build_model_records(self.models, &mut saturated);
+        let hourly = build_hourly_records(self.hourly, &mut saturated);
+        let agents = build_agent_records(self.agents, &mut saturated);
+        if output_string_bytes_graph(&graph) > MAX_OUTPUT_STRING_BYTES
+            || output_string_bytes_models(&models) > MAX_OUTPUT_STRING_BYTES
+            || output_string_bytes_hourly(&hourly) > MAX_OUTPUT_STRING_BYTES
+            || output_string_bytes_agents(&agents) > MAX_OUTPUT_STRING_BYTES
+        {
+            return Err(RemoteUsageError::LimitExceeded);
+        }
+        Ok(RemoteUsageBundleV1 {
+            tzdb_revision: REMOTE_TZDB_REVISION.to_owned(),
+            graph,
+            models,
+            hourly,
+            agents,
+            saturated,
+        })
     }
-
-    Ok(RemoteUsageBundleV1 {
-        tzdb_revision: REMOTE_TZDB_REVISION.to_owned(),
-        graph,
-        models,
-        hourly,
-        agents,
-        saturated,
-    })
 }
 
 fn validate_query(query: &RemoteUsageQueryV1) -> Result<(Date, Date), RemoteUsageError> {

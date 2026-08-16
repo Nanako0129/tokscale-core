@@ -12,6 +12,14 @@ patch ledger from TokenBar.
 The selective-port method and streaming adaptation rules are documented in
 TokenBar's [`vendor-tokscale.md`](https://github.com/Nanako0129/TokenBar/blob/729dc3adf21cc31e16ef0b8b742f0244197d7058/docs/knowledge/vendor-tokscale.md).
 
+## SA-1B remote source seam
+
+The local `RemoteSourceContextV1` and cache-only `RemotePricingSnapshot` are
+TokenBar extraction seams. They inject all roots and scanner settings and feed
+the existing streaming scanner, source cache, parser, deduplication, and
+pricing flow into the remote report fold. They do not alter parser semantics,
+the materialized compatibility lane, or the remote wire/report schema.
+
 | Crate | Source | Original TokenBar vendor seed |
 |---|---|---|
 | `tokscale-core` | [junhoyeo/tokscale](https://github.com/junhoyeo/tokscale) (`crates/tokscale-core`, MIT) | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) `vendor/tokscale-core` @ `606cae1` (v0.4.4: backfill missing cache rates from runner-up pricing source) |
