@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,6 +68,20 @@ fn write_cc_mirror_fixture(home: &Path) {
         r#"{"type":"assistant","timestamp":"2040-01-01T11:00:00.000Z","requestId":"req_variant","message":{"id":"msg_variant","model":"claude-3-5-sonnet","usage":{"input_tokens":300,"output_tokens":70}}}"#,
     )
     .unwrap();
+}
+
+fn write_unrelated_claude_fixture(home: &Path) {
+    let project = home.join(".claude/projects/unrelated");
+    fs::create_dir_all(&project).unwrap();
+    let mut content = String::new();
+    for index in 0..=262_144 {
+        writeln!(
+            content,
+            r#"{{"type":"assistant","timestamp":"2040-01-01T11:01:00.000Z","requestId":"req_unrelated_{index}","message":{{"id":"msg_unrelated_{index}","model":"claude-3-5-sonnet","usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+        )
+        .unwrap();
+    }
+    fs::write(project.join("conversation.jsonl"), content).unwrap();
 }
 
 fn fresh_pricing(path: &Path, input: f64) {
@@ -285,6 +300,54 @@ fn source_fold_expands_dynamic_cc_mirror_client_for_scanner() {
     let pure = aggregate_remote_usage_v1(&pure_rows, &query).unwrap();
     assert_eq!(pure.graph.len(), 1);
     assert_eq!(pure.graph[0].input_tokens, 300);
+    assert_eq!(
+        serde_json::to_vec(&streamed).unwrap(),
+        serde_json::to_vec(&pure).unwrap()
+    );
+}
+
+#[test]
+fn source_fold_filters_unrelated_expanded_lane_before_remote_validation() {
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    let config = roots.path().join("config");
+    let data = roots.path().join("data");
+    let cache = roots.path().join("source-cache");
+    write_cc_mirror_fixture(&home);
+    write_unrelated_claude_fixture(&home);
+    let (context, _) = context(&home, &config, &data, &cache, ScannerSettings::default());
+    let query = query_for_clients(vec!["cc-mirror/kimi-code".to_owned()]);
+    let pricing = RemotePricingSnapshot::from_cache_root(roots.path().join("pricing"));
+
+    let streamed = aggregate_remote_usage_from_source_v1(&context, &query, &pricing)
+        .expect("an unrelated Claude sibling must not reach the remote fold");
+    assert_eq!(streamed.graph.len(), 1);
+    assert_eq!(streamed.graph[0].client, "cc-mirror/kimi-code");
+    assert_eq!(streamed.graph[0].input_tokens, 300);
+
+    let pure_roots = TempDir::new().unwrap();
+    let pure_home = pure_roots.path().join("home");
+    write_cc_mirror_fixture(&pure_home);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let rows = runtime
+        .block_on(tokscale_core::parse_local_unified_messages_with_pricing(
+            LocalParseOptions {
+                home_dir: Some(pure_home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                clients: Some(vec!["claude".to_owned()]),
+                ..Default::default()
+            },
+            None,
+        ))
+        .unwrap();
+    let pure_rows: Vec<_> = rows
+        .into_iter()
+        .filter(|message| message.client == "cc-mirror/kimi-code")
+        .collect();
+    let pure = aggregate_remote_usage_v1(&pure_rows, &query).unwrap();
     assert_eq!(
         serde_json::to_vec(&streamed).unwrap(),
         serde_json::to_vec(&pure).unwrap()

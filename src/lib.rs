@@ -441,19 +441,17 @@ pub fn aggregate_remote_usage_from_source_v1(
 ) -> Result<RemoteUsageBundleV1, RemoteSourceUsageError> {
     let mut fold =
         remote_report::RemoteUsageFold::new(query).map_err(RemoteSourceUsageError::from)?;
-    let clients = if query.clients.is_empty() {
-        Vec::new()
+    let (clients, exact) = if query.clients.is_empty() {
+        (Vec::new(), None)
     } else {
         split_report_client_filter(&ReportOptions {
             clients: Some(query.clients.clone()),
             ..Default::default()
         })
-        .0
     };
     let mut source_error = None;
-    fn accept_remote_message(_: &UnifiedMessage) -> bool {
-        true
-    }
+    let accept_remote_message =
+        |message: &UnifiedMessage| report_message_client_passes(&exact, message);
     let mut sink = |message: &UnifiedMessage| {
         if source_error.is_none() {
             source_error = fold.push(message).err().map(Into::into);

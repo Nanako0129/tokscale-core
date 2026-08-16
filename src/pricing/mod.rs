@@ -107,13 +107,12 @@ impl RemotePricingSnapshot {
             }
         }
         let digest = Sha256::digest(descriptor).into();
-        let service = match (datasets.remove(0), datasets.remove(0)) {
-            (None, None) => None,
-            (litellm, openrouter) => Some(Arc::new(PricingService::new(
-                litellm.unwrap_or_default(),
-                openrouter.unwrap_or_default(),
-            ))),
-        };
+        let service = PricingService::from_cached_datasets_with_custom(
+            CustomPricing::default(),
+            datasets.remove(0),
+            datasets.remove(0),
+        )
+        .map(Arc::new);
         Self {
             service,
             digest,
@@ -903,6 +902,55 @@ mod tests {
         assert!(service
             .lookup_with_source("gpt-5.2", Some("litellm"))
             .is_some());
+    }
+
+    #[test]
+    fn remote_snapshot_filters_subscription_rows_before_fallback_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "github_copilot/gpt-5.3-codex".to_owned(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "gpt-5.3-codex".to_owned(),
+            model_pricing(0.00000175, 0.000014),
+        );
+
+        for (name, data) in [
+            ("pricing-litellm.json", litellm),
+            ("pricing-openrouter.json", openrouter),
+        ] {
+            let envelope = serde_json::json!({ "timestamp": now, "data": data });
+            std::fs::write(
+                root.path().join(name),
+                serde_json::to_vec(&envelope).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let snapshot = RemotePricingSnapshot::from_cache_root(root.path());
+        let service = snapshot
+            .service()
+            .expect("fresh cache should build a service");
+        let result = service
+            .lookup_with_source_and_provider("github_copilot/gpt-5.3-codex", None, None)
+            .expect("the filtered subscription row should fall back to OpenRouter");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.00000175));
+        assert!(service
+            .lookup_with_source("github_copilot/gpt-5.3-codex", Some("litellm"))
+            .is_none());
     }
 
     #[test]
