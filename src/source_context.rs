@@ -437,6 +437,30 @@ impl ResolvedLocalSourceContext {
             ENV_XDG_CONFIG_HOME,
             ResolvedPathInput::unavailable(platform_config_dir.clone()),
         );
+        // On Windows the injected platform roots *are* the roots the Cline and
+        // Hermes lanes reach for, so leaving these two keys derived from
+        // `home_dir` would skip an approved but redirected profile entirely:
+        // `fallback_source_env_path` would hand back `home/AppData/Roaming`
+        // and `home/AppData/Local`, which the scanner already probes directly,
+        // so the caller's roots would never be scanned at all.
+        //
+        // Only Windows, deliberately. Both consumers are guarded by
+        // `cfg!(target_os = "windows")` (`scanner.rs`), so elsewhere these keys
+        // are never read and remapping them would churn the context identity —
+        // what an approved source-scope token binds to — for no effect. Worse,
+        // on macOS it would aim `APPDATA` at a real `Application Support` tree
+        // instead of the inert `home/AppData/Roaming` placeholder it is now.
+        #[cfg(windows)]
+        {
+            source_env_paths.insert(
+                ENV_APPDATA,
+                ResolvedPathInput::unavailable(platform_config_dir.clone()),
+            );
+            source_env_paths.insert(
+                ENV_LOCALAPPDATA,
+                ResolvedPathInput::unavailable(platform_data_local_dir.clone()),
+            );
+        }
         source_env_paths.insert(
             ENV_TOKSCALE_CONFIG_DIR,
             ResolvedPathInput {
@@ -2456,6 +2480,43 @@ mod tests {
                 .unwrap();
             assert_eq!(descriptor.0, vec![1, 1, 0, 0, 0, 3, b'/', b'x', 0xff]);
         }
+    }
+
+    /// A redirected Windows profile: the approved platform roots are nowhere
+    /// under `home`. The Cline (`APPDATA`) and Hermes (`LOCALAPPDATA`) lanes
+    /// must reach the approved roots, not a guess derived from `home`, which
+    /// the scanner already probes on its own.
+    #[cfg(windows)]
+    #[test]
+    fn remote_explicit_roots_replace_home_derived_appdata() {
+        let root = fixture_root();
+        let home = root.join("profile/home");
+        let config = root.join("redirected/Roaming");
+        let data = root.join("redirected/Local");
+        let context = ResolvedLocalSourceContext::from_remote_explicit(
+            &home,
+            &config,
+            &data,
+            &root.join("syrtis-cache"),
+            &ScannerSettings::default(),
+        )
+        .unwrap();
+
+        assert_eq!(context.source_env_path(ENV_APPDATA), Some(config.as_path()));
+        assert_eq!(
+            context.source_env_path(ENV_LOCALAPPDATA),
+            Some(data.as_path())
+        );
+        // The home-derived fallback is what this replaces; asserting its
+        // absence is what makes the test fail if the mapping is dropped.
+        assert_ne!(
+            context.source_env_path(ENV_APPDATA),
+            Some(home.join("AppData/Roaming").as_path())
+        );
+        assert_ne!(
+            context.source_env_path(ENV_LOCALAPPDATA),
+            Some(home.join("AppData/Local").as_path())
+        );
     }
 
     #[cfg(windows)]
