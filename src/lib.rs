@@ -2472,7 +2472,10 @@ fn split_report_client_filter(options: &ReportOptions) -> (Vec<String>, Option<H
 /// Exact per-message client gate for `split_report_client_filter`'s aggregation
 /// half: keep a message iff its exact client id was requested, or it is a
 /// synthetic match when `synthetic` was requested. `None` keeps every message.
-fn report_message_client_passes(exact: &Option<HashSet<String>>, m: &UnifiedMessage) -> bool {
+pub(crate) fn report_message_client_passes(
+    exact: &Option<HashSet<String>>,
+    m: &UnifiedMessage,
+) -> bool {
     match exact {
         None => true,
         Some(req) => {

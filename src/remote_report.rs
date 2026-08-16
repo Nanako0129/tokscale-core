@@ -1,11 +1,15 @@
-use std::{cmp::Ordering, collections::BTreeMap, fmt};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashSet},
+    fmt,
+};
 
 use jiff::{civil::Date, tz::TimeZone, Timestamp};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    canonical_model_id,
+    canonical_model_id, report_message_client_passes,
     sessions::{normalize_agent_name, normalize_copilot_agent_name},
     UnifiedMessage,
 };
@@ -210,7 +214,7 @@ pub fn aggregate_remote_usage_v1(
 }
 
 pub(crate) struct RemoteUsageFold {
-    query: RemoteUsageQueryV1,
+    exact_clients: Option<HashSet<String>>,
     timezone: TimeZone,
     start_date: Date,
     end_date_exclusive: Date,
@@ -221,8 +225,13 @@ impl RemoteUsageFold {
     pub(crate) fn new(query: &RemoteUsageQueryV1) -> Result<Self, RemoteUsageError> {
         let (start_date, end_date_exclusive) = validate_query(query)?;
         let timezone = bundled_timezone(query)?;
+        let exact_clients = if query.clients.is_empty() {
+            None
+        } else {
+            Some(query.clients.iter().cloned().collect())
+        };
         Ok(Self {
-            query: query.clone(),
+            exact_clients,
             timezone,
             start_date,
             end_date_exclusive,
@@ -233,7 +242,7 @@ impl RemoteUsageFold {
     pub(crate) fn push(&mut self, message: &UnifiedMessage) -> Result<(), RemoteUsageError> {
         self.accumulator.add(
             message,
-            &self.query,
+            &self.exact_clients,
             &self.timezone,
             self.start_date,
             self.end_date_exclusive,
@@ -260,7 +269,7 @@ impl RemoteUsageAccumulator {
     fn add(
         &mut self,
         message: &UnifiedMessage,
-        query: &RemoteUsageQueryV1,
+        exact_clients: &Option<HashSet<String>>,
         timezone: &TimeZone,
         start_date: Date,
         end_date_exclusive: Date,
@@ -287,11 +296,7 @@ impl RemoteUsageAccumulator {
         )?;
         let client = validate_client(&message.client)?;
         let numerators = validate_numerators(message)?;
-        let included = query.clients.is_empty()
-            || query
-                .clients
-                .binary_search_by(|candidate| candidate.as_bytes().cmp(client.as_bytes()))
-                .is_ok();
+        let included = report_message_client_passes(exact_clients, message);
         if !included || !(start_date..end_date_exclusive).contains(&local_date) {
             return Ok(());
         }

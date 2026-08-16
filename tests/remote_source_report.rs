@@ -70,6 +70,16 @@ fn write_cc_mirror_fixture(home: &Path) {
     .unwrap();
 }
 
+fn write_synthetic_opencode_fixture(xdg_data: &Path) {
+    let message_dir = xdg_data.join("opencode/storage/message/project-1");
+    fs::create_dir_all(&message_dir).unwrap();
+    fs::write(
+        message_dir.join("msg_synthetic.json"),
+        r#"{"id":"msg-synthetic","sessionID":"session-synthetic","role":"assistant","modelID":"hf:deepseek-ai/DeepSeek-V3-0324","providerID":"unknown","cost":0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":2208988800000}}"#,
+    )
+    .unwrap();
+}
+
 fn write_unrelated_claude_fixture(home: &Path) {
     let project = home.join(".claude/projects/unrelated");
     fs::create_dir_all(&project).unwrap();
@@ -259,6 +269,15 @@ fn source_fold_uses_production_fixture_and_matches_pure_fold() {
         serde_json::to_vec(&streamed).unwrap(),
         serde_json::to_vec(&pure).unwrap()
     );
+
+    let mut all_query = query();
+    all_query.clients.clear();
+    let all_clients =
+        aggregate_remote_usage_from_source_v1(&context, &all_query, &pricing).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&streamed).unwrap(),
+        serde_json::to_vec(&all_clients).unwrap()
+    );
 }
 
 #[test]
@@ -304,6 +323,49 @@ fn source_fold_expands_dynamic_cc_mirror_client_for_scanner() {
         serde_json::to_vec(&streamed).unwrap(),
         serde_json::to_vec(&pure).unwrap()
     );
+}
+
+#[test]
+fn source_fold_synthetic_selector_matches_pure_fold() {
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    let config = roots.path().join("config");
+    let data = roots.path().join("data");
+    let cache = roots.path().join("source-cache");
+    write_synthetic_opencode_fixture(&data);
+    let (context, _) = context(&home, &config, &data, &cache, ScannerSettings::default());
+    let query = query_for_clients(vec!["synthetic".to_owned()]);
+    let pricing = RemotePricingSnapshot::from_cache_root(roots.path().join("pricing"));
+    let streamed = aggregate_remote_usage_from_source_v1(&context, &query, &pricing).unwrap();
+    assert_eq!(streamed.graph.len(), 1);
+    assert_eq!(streamed.graph[0].client, "opencode");
+    assert_eq!(streamed.graph[0].input_tokens, 10);
+
+    let pure_roots = TempDir::new().unwrap();
+    let pure_home = pure_roots.path().join("home");
+    write_synthetic_opencode_fixture(&pure_home.join(".local/share"));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let rows = runtime
+        .block_on(tokscale_core::parse_local_unified_messages_with_pricing(
+            LocalParseOptions {
+                home_dir: Some(pure_home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                clients: Some(vec!["synthetic".to_owned()]),
+                ..Default::default()
+            },
+            None,
+        ))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let pure = aggregate_remote_usage_v1(&rows, &query).unwrap();
+    assert_eq!(pure.graph.len(), 1);
+    assert_eq!(streamed.graph[0].client, pure.graph[0].client);
+    assert_eq!(streamed.graph[0].input_tokens, pure.graph[0].input_tokens);
+    assert_eq!(streamed.graph[0].output_tokens, pure.graph[0].output_tokens);
+    assert_eq!(streamed.graph[0].message_count, pure.graph[0].message_count);
 }
 
 #[test]
