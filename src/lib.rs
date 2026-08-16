@@ -5215,17 +5215,28 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
 /// deleting, or rewriting a non-max source still invalidates cached graphs and
 /// the live tail.
 pub fn local_source_change_token(options: &LocalParseOptions) -> Result<u64, String> {
-    local_source_change_token_inner(scan_local_sources(options)?)
+    let scan_result = scan_local_sources(options)?;
+    local_source_change_token_inner(&scan_result)
 }
 
 pub fn local_source_change_token_with_source_context(
     context: &ResolvedLocalSourceContext,
     options: &LocalParseOptions,
 ) -> Result<u64, String> {
-    local_source_change_token_inner(scan_local_sources_with_context(context, options)?)
+    let scan_result = scan_local_sources_with_context(context, options)?;
+    let scanner_token = local_source_change_token_inner(&scan_result)?;
+    let retained_token = message_cache::retained_state_change_token(
+        context.source_cache_dir(),
+        scan_result.get(ClientId::Claude),
+    );
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scanner_token.hash(&mut hasher);
+    retained_token.hash(&mut hasher);
+    Ok(hasher.finish())
 }
 
-fn local_source_change_token_inner(scan_result: scanner::ScanResult) -> Result<u64, String> {
+fn local_source_change_token_inner(scan_result: &scanner::ScanResult) -> Result<u64, String> {
     use std::hash::{Hash, Hasher};
 
     let mut paths: Vec<PathBuf> = scan_result.files.iter().flatten().cloned().collect();
@@ -6315,8 +6326,9 @@ mod tests {
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
         canonical_model_id, clear_model_aliases, coverage_for_messages,
         dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
-        get_model_report, get_monthly_report, latest_source_mtime_ms,
-        load_pricing_for_local_parse_with_context, local_source_change_token, message_cache,
+        get_model_report, get_model_report_with_source_context, get_monthly_report,
+        latest_source_mtime_ms, load_pricing_for_local_parse_with_context,
+        local_source_change_token, local_source_change_token_with_source_context, message_cache,
         model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
         opencode_authoritative_sources, opencode_identity_group,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
@@ -7012,6 +7024,205 @@ mod tests {
         assert_eq!(
             third.iter().map(|m| m.tokens.output).sum::<i64>(),
             expected_output
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_context_token_tracks_claude_retained_shard_changes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("conversation.jsonl");
+        let filler = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_filler","message":{"id":"msg_filler","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let target = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_target","message":{"id":"msg_target","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let original = format!("{filler}\n{target}\n");
+        let compacted = format!("{filler}\n");
+        std::fs::write(&transcript, &original).unwrap();
+
+        let context = ResolvedLocalSourceContext::capture(
+            Some(source_home.path().to_path_buf()),
+            false,
+            scanner::ScannerSettings::default(),
+        )
+        .unwrap();
+        let local_options = || LocalParseOptions {
+            home_dir: None,
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        };
+        let report_options = || ReportOptions {
+            clients: Some(vec!["claude".to_string()]),
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let token_before =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+        let seeded = runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        assert_eq!(seeded.total_messages, 2);
+        assert_eq!(seeded.total_output, 60);
+        assert_eq!(
+            token_before,
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap(),
+            "creating a live-only cache entry must not change the context token"
+        );
+
+        std::fs::write(&transcript, &compacted).unwrap();
+        let retained = runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        assert_eq!(retained.total_messages, 2);
+        assert_eq!(retained.total_output, 60);
+        let retained_token =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+        assert_ne!(retained_token, token_before);
+        assert_eq!(
+            retained_token,
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap(),
+            "unchanged retained state must keep both the token and report stable"
+        );
+
+        let cache_root = context.source_cache_dir().unwrap();
+        let claude_shard_dir = cache_root.join("source-message-cache-v2").join("claude");
+        let shard_path = std::fs::read_dir(&claude_shard_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("shard-") && name.ends_with(".bin"))
+            })
+            .expect("the retained Claude entry must have a canonical shard");
+
+        std::fs::remove_file(&shard_path).unwrap();
+        let deleted_probe =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+        assert_ne!(deleted_probe, retained_token);
+        let deleted = runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        assert_eq!(deleted.total_messages, 1);
+        assert_eq!(deleted.total_output, 10);
+        let deleted_token =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+        assert_eq!(deleted_token, deleted_probe);
+
+        std::fs::write(&transcript, &original).unwrap();
+        runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        std::fs::write(&transcript, &compacted).unwrap();
+        runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        let retained_before_corrupt =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+
+        std::fs::write(&shard_path, b"corrupt").unwrap();
+        let corrupt_probe =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+        assert_ne!(corrupt_probe, retained_before_corrupt);
+        let corrupt = runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        assert_eq!(corrupt.total_messages, 1);
+        assert_eq!(corrupt.total_output, 10);
+        let corrupt_token =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+        assert_eq!(corrupt_token, corrupt_probe);
+
+        std::fs::write(&transcript, &original).unwrap();
+        runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        std::fs::write(&transcript, &compacted).unwrap();
+        runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        let source_metadata = std::fs::metadata(&transcript).unwrap();
+        let retained_before_replacement =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+
+        let mut cache = message_cache::SourceMessageCache::load_from_root(Some(cache_root));
+        let mut replacement = cache
+            .entries
+            .values()
+            .find(|entry| entry.retained_keys.contains("msg_target:req_target"))
+            .expect("the compacted report must persist the retained target")
+            .clone();
+        replacement
+            .messages
+            .iter_mut()
+            .find(|message| message.dedup_key.as_deref() == Some("msg_target:req_target"))
+            .expect("the retained target message must be present")
+            .tokens
+            .output = 999;
+        cache.insert(replacement);
+        cache.save_if_dirty();
+
+        let replacement_token =
+            local_source_change_token_with_source_context(&context, &local_options()).unwrap();
+        assert_ne!(replacement_token, retained_before_replacement);
+        let changed = runtime
+            .block_on(get_model_report_with_source_context(
+                &context,
+                report_options(),
+            ))
+            .unwrap();
+        assert_eq!(changed.total_messages, 2);
+        assert_eq!(changed.total_output, 1009);
+        let source_metadata_after = std::fs::metadata(&transcript).unwrap();
+        assert_eq!(source_metadata.len(), source_metadata_after.len());
+        assert_eq!(
+            source_metadata.modified().unwrap(),
+            source_metadata_after.modified().unwrap()
         );
     }
 
