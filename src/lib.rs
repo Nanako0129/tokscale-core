@@ -114,7 +114,10 @@ pub(crate) fn normalize_syntactic(model_id: &str) -> String {
         name = base_model.to_string();
     }
     if let Some((base, potential_date)) = name.rsplit_once('-') {
-        if potential_date.len() == 8 && potential_date.bytes().all(|byte| byte.is_ascii_digit()) {
+        if !base.is_empty()
+            && potential_date.len() == 8
+            && potential_date.bytes().all(|byte| byte.is_ascii_digit())
+        {
             name = base.to_string();
         }
     }

@@ -479,6 +479,7 @@ fn is_nfc(value: &str) -> bool {
 }
 
 fn normalize_model(value: &str) -> Result<Option<String>, RemoteUsageError> {
+    validate_text(value, true)?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -490,6 +491,7 @@ fn normalize_model(value: &str) -> Result<Option<String>, RemoteUsageError> {
 }
 
 fn normalize_provider(value: &str) -> Result<Option<String>, RemoteUsageError> {
+    validate_text(value, true)?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -502,9 +504,7 @@ fn normalize_agent(client: &str, value: Option<&str>) -> Result<String, RemoteUs
     let Some(value) = value else {
         return Ok("Main".to_owned());
     };
-    if value.len() > MAX_TEXT_BYTES {
-        return Err(RemoteUsageError::InvalidText);
-    }
+    validate_text(value, true)?;
     let normalized = if client == "copilot" {
         normalize_copilot_agent_name(value)
     } else {

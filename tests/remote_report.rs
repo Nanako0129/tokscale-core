@@ -370,3 +370,39 @@ fn remote_report_rejects_oversized_raw_agent_before_normalization() {
         Err(RemoteUsageError::InvalidText)
     );
 }
+
+#[test]
+fn remote_report_keeps_date_only_model_identifier() {
+    let bundle = aggregate_remote_usage_v1(
+        &[message("alpha", "-20260101", "provider", 1_730_613_600_000)],
+        &query("UTC"),
+    )
+    .expect("date-only model remains nonempty");
+
+    assert_eq!(bundle.models[0].model.as_deref(), Some("-20260101"));
+}
+
+#[test]
+fn remote_report_rejects_oversized_raw_model_and_provider_before_trimming() {
+    let oversized_model = message(
+        "alpha",
+        &format!("{}model", " ".repeat(251)),
+        "provider",
+        1_730_613_600_000,
+    );
+    assert_eq!(
+        aggregate_remote_usage_v1(&[oversized_model], &query("UTC")),
+        Err(RemoteUsageError::InvalidText)
+    );
+
+    let oversized_provider = message(
+        "alpha",
+        "model",
+        &format!("{}provider", " ".repeat(248)),
+        1_730_613_600_000,
+    );
+    assert_eq!(
+        aggregate_remote_usage_v1(&[oversized_provider], &query("UTC")),
+        Err(RemoteUsageError::InvalidText)
+    );
+}
