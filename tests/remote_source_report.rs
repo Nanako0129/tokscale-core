@@ -94,6 +94,36 @@ fn write_unrelated_claude_fixture(home: &Path) {
     fs::write(project.join("conversation.jsonl"), content).unwrap();
 }
 
+/// A selected client whose lifetime history dwarfs the requested interval:
+/// `MAX_MESSAGES + 1` rows a day *before* the window, one ancient row the fold
+/// rejects outright, and a single row actually inside the window.
+fn write_out_of_range_claude_history(home: &Path) {
+    let project = home.join(".claude/projects/history");
+    fs::create_dir_all(&project).unwrap();
+    let mut content = String::new();
+    for index in 0..=262_144 {
+        writeln!(
+            content,
+            r#"{{"type":"assistant","timestamp":"2039-12-31T11:01:00.000Z","requestId":"req_old_{index}","message":{{"id":"msg_old_{index}","model":"claude-3-5-sonnet","usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+        )
+        .unwrap();
+    }
+    // Epoch zero is outside the fold's accepted timestamp range, so before the
+    // producer gate existed this single ancient row was enough to fail a query
+    // whose result could never have contained it.
+    writeln!(
+        content,
+        r#"{{"type":"assistant","timestamp":"1970-01-01T00:00:00.000Z","requestId":"req_ancient","message":{{"id":"msg_ancient","model":"claude-3-5-sonnet","usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        content,
+        r#"{{"type":"assistant","timestamp":"2040-01-01T11:00:00.000Z","requestId":"req_in_range","message":{{"id":"msg_in_range","model":"claude-3-5-sonnet","usage":{{"input_tokens":300,"output_tokens":70}}}}}}"#
+    )
+    .unwrap();
+    fs::write(project.join("conversation.jsonl"), content).unwrap();
+}
+
 fn fresh_pricing(path: &Path, input: f64) {
     fs::create_dir_all(path).unwrap();
     let now = SystemTime::now()
@@ -203,20 +233,55 @@ fn remote_scope_token_rejects_every_effective_input_change() {
 
 #[test]
 fn remote_context_rejects_relative_roots_and_settings() {
-    let settings = ScannerSettings {
+    // Absolute roots, so that the scanner-settings rejection below is the one
+    // being observed. A literal `/home` is *not* absolute on Windows — it has
+    // no drive prefix — so the roots must come from a real temp directory.
+    let roots = TempDir::new().unwrap();
+    let (home, config, data, cache) = (
+        roots.path().join("home"),
+        roots.path().join("config"),
+        roots.path().join("data"),
+        roots.path().join("cache"),
+    );
+
+    let relative_settings = ScannerSettings {
         opencode_db_paths: vec![PathBuf::from("relative.db")],
         ..Default::default()
     };
     assert_eq!(
         RemoteSourceContextV1::preview_fingerprint(
-            Path::new("/home"),
-            Path::new("/config"),
-            Path::new("/data"),
-            Path::new("/cache"),
-            &settings,
+            &home,
+            &config,
+            &data,
+            &cache,
+            &relative_settings,
         ),
         Err(RemoteSourceContextError::InvalidScannerSettings)
     );
+
+    let (home, config, data, cache) = (
+        home.as_path(),
+        config.as_path(),
+        data.as_path(),
+        cache.as_path(),
+    );
+    for (home, config, data, cache) in [
+        (Path::new("relative-home"), config, data, cache),
+        (home, Path::new("relative-config"), data, cache),
+        (home, config, Path::new("relative-data"), cache),
+        (home, config, data, Path::new("relative-cache")),
+    ] {
+        assert_eq!(
+            RemoteSourceContextV1::preview_fingerprint(
+                home,
+                config,
+                data,
+                cache,
+                &ScannerSettings::default(),
+            ),
+            Err(RemoteSourceContextError::InvalidRoots)
+        );
+    }
 }
 
 #[test]
@@ -413,6 +478,103 @@ fn source_fold_filters_unrelated_expanded_lane_before_remote_validation() {
     assert_eq!(
         serde_json::to_vec(&streamed).unwrap(),
         serde_json::to_vec(&pure).unwrap()
+    );
+}
+
+#[test]
+fn source_fold_excludes_out_of_range_history_before_remote_validation() {
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    write_out_of_range_claude_history(&home);
+    let (context, _) = context(
+        &home,
+        &roots.path().join("config"),
+        &roots.path().join("data"),
+        &roots.path().join("source-cache"),
+        ScannerSettings::default(),
+    );
+    let query = query_for_clients(vec!["claude".to_owned()]);
+    let pricing = RemotePricingSnapshot::from_cache_root(roots.path().join("pricing"));
+
+    let streamed = aggregate_remote_usage_from_source_v1(&context, &query, &pricing)
+        .expect("history outside the query range must not reach the remote fold");
+    assert_eq!(streamed.graph.len(), 1);
+    assert_eq!(streamed.graph[0].client, "claude");
+    assert_eq!(streamed.graph[0].input_tokens, 300);
+    assert_eq!(streamed.graph[0].output_tokens, 70);
+    assert_eq!(streamed.graph[0].message_count, 1);
+}
+
+/// The other half of the same defect, isolated: without the message flood the
+/// cap is never reached, and a single ancient row that the fold cannot accept
+/// is enough on its own to fail a query whose result could never contain it.
+#[test]
+fn source_fold_ignores_ancient_invalid_rows_outside_the_query_range() {
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    let project = home.join(".claude/projects/ancient");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("conversation.jsonl"),
+        concat!(
+            r#"{"type":"assistant","timestamp":"1970-01-01T00:00:00.000Z","requestId":"req_ancient","message":{"id":"msg_ancient","model":"claude-3-5-sonnet","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2040-01-01T11:00:00.000Z","requestId":"req_in_range","message":{"id":"msg_in_range","model":"claude-3-5-sonnet","usage":{"input_tokens":300,"output_tokens":70}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let (context, _) = context(
+        &home,
+        &roots.path().join("config"),
+        &roots.path().join("data"),
+        &roots.path().join("source-cache"),
+        ScannerSettings::default(),
+    );
+
+    let streamed = aggregate_remote_usage_from_source_v1(
+        &context,
+        &query_for_clients(vec!["claude".to_owned()]),
+        &RemotePricingSnapshot::from_cache_root(roots.path().join("pricing")),
+    )
+    .expect("an ancient row outside the query range must not fail the query");
+    assert_eq!(streamed.graph.len(), 1);
+    assert_eq!(streamed.graph[0].input_tokens, 300);
+    assert_eq!(streamed.graph[0].message_count, 1);
+}
+
+#[test]
+fn source_fold_still_rejects_invalid_rows_inside_the_query_range() {
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    let project = home.join(".claude/projects/invalid");
+    fs::create_dir_all(&project).unwrap();
+    // In range, and its model id exceeds the fold's 255-byte label bound. The
+    // producer gate must not swallow this: only messages that could never be
+    // emitted may be dropped ahead of validation.
+    let oversized_model = "m".repeat(300);
+    fs::write(
+        project.join("conversation.jsonl"),
+        format!(
+            r#"{{"type":"assistant","timestamp":"2040-01-01T11:00:00.000Z","requestId":"req_invalid","message":{{"id":"msg_invalid","model":"{oversized_model}","usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let (context, _) = context(
+        &home,
+        &roots.path().join("config"),
+        &roots.path().join("data"),
+        &roots.path().join("source-cache"),
+        ScannerSettings::default(),
+    );
+
+    assert_eq!(
+        aggregate_remote_usage_from_source_v1(
+            &context,
+            &query_for_clients(vec!["claude".to_owned()]),
+            &RemotePricingSnapshot::from_cache_root(roots.path().join("pricing")),
+        ),
+        Err(RemoteSourceUsageError::InvalidText)
     );
 }
 

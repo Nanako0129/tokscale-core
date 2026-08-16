@@ -441,17 +441,24 @@ pub fn aggregate_remote_usage_from_source_v1(
 ) -> Result<RemoteUsageBundleV1, RemoteSourceUsageError> {
     let mut fold =
         remote_report::RemoteUsageFold::new(query).map_err(RemoteSourceUsageError::from)?;
-    let (clients, exact) = if query.clients.is_empty() {
-        (Vec::new(), None)
+    // A separate gate rather than the fold's own: the accept callback and the
+    // sink are handed to the scan together, so they cannot both borrow the
+    // fold. Both are built from the same query.
+    let gate =
+        remote_report::RemoteMessageGate::new(query).map_err(RemoteSourceUsageError::from)?;
+    // Scan lanes stay expanded — a `cc-mirror/*` id is only produced by the
+    // Claude lane — while the gate admits only what can still be emitted.
+    let clients = if query.clients.is_empty() {
+        Vec::new()
     } else {
         split_report_client_filter(&ReportOptions {
             clients: Some(query.clients.clone()),
             ..Default::default()
         })
+        .0
     };
     let mut source_error = None;
-    let accept_remote_message =
-        |message: &UnifiedMessage| report_message_client_passes(&exact, message);
+    let accept_remote_message = |message: &UnifiedMessage| gate.accepts(message);
     let mut sink = |message: &UnifiedMessage| {
         if source_error.is_none() {
             source_error = fold.push(message).err().map(Into::into);

@@ -2428,12 +2428,25 @@ mod tests {
         assert!(identity.strip_prefix("sc1:").is_some_and(|hex| hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))));
-        #[cfg(unix)]
+        // The identity commits to the resolved client roots, and those are
+        // per-platform by design, so the golden value is per-platform too —
+        // `cfg(unix)` wrongly shared one macOS value with Linux. Pinning it at
+        // all is what makes an accidental change to the fingerprint's inputs,
+        // which is what an approved source-scope token binds to, fail loudly
+        // instead of silently re-scoping a live grant.
+        #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
             "sc1:b3b65ffcb00dacb7c35d9cf0d5221750b4151135ee8d19158cf4061c64cd3406"
         );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            identity,
+            "sc1:f66cefc1a6e0f521ea2eaf790f470d64d2277650d18f4e69b0423a6eef41d761"
+        );
 
+        // The raw-byte path encoding, unlike the identity, is genuinely
+        // uniform across unix.
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;

@@ -20,6 +20,11 @@ the existing streaming scanner, source cache, parser, deduplication, and
 pricing flow into the remote report fold. They do not alter parser semantics,
 the materialized compatibility lane, or the remote wire/report schema.
 
+The producer pre-filters the scan with the same client and timezone-aware date
+range the fold applies, so a client's history outside the requested interval
+never charges the fold's message cap or reaches its per-field validation. The
+fold keeps that gate as its own final authority.
+
 | Crate | Source | Original TokenBar vendor seed |
 |---|---|---|
 | `tokscale-core` | [junhoyeo/tokscale](https://github.com/junhoyeo/tokscale) (`crates/tokscale-core`, MIT) | [Nanako0129/TokenBar](https://github.com/Nanako0129/TokenBar) `vendor/tokscale-core` @ `606cae1` (v0.4.4: backfill missing cache rates from runner-up pricing source) |

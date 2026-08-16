@@ -213,15 +213,23 @@ pub fn aggregate_remote_usage_v1(
     fold.finish()
 }
 
-pub(crate) struct RemoteUsageFold {
+/// The one place that decides whether a message can still reach an emitted
+/// row: the exact client gate plus the timezone-aware query date range.
+///
+/// The fold keeps a gate and re-applies it as its final authority. A streaming
+/// producer builds a second gate and pre-filters with it, because the fold
+/// charges `MAX_MESSAGES` and validates timestamps, buckets, clients, and
+/// numerators *before* it reaches its own range check: without a producer-side
+/// gate, an unbounded lifetime scan lets history outside the requested interval
+/// exhaust the cap or fail validation on a row that could never be emitted.
+pub(crate) struct RemoteMessageGate {
     exact_clients: Option<HashSet<String>>,
     timezone: TimeZone,
     start_date: Date,
     end_date_exclusive: Date,
-    accumulator: RemoteUsageAccumulator,
 }
 
-impl RemoteUsageFold {
+impl RemoteMessageGate {
     pub(crate) fn new(query: &RemoteUsageQueryV1) -> Result<Self, RemoteUsageError> {
         let (start_date, end_date_exclusive) = validate_query(query)?;
         let timezone = bundled_timezone(query)?;
@@ -235,18 +243,44 @@ impl RemoteUsageFold {
             timezone,
             start_date,
             end_date_exclusive,
+        })
+    }
+
+    /// Admit only messages that can survive the fold. Dropping the rest is
+    /// output-preserving: a timestamp that fails validation, or that lands
+    /// outside the range, is discarded by the fold's own range check anyway.
+    pub(crate) fn accepts(&self, message: &UnifiedMessage) -> bool {
+        self.client_passes(message) && self.date_in_range(message.timestamp)
+    }
+
+    fn client_passes(&self, message: &UnifiedMessage) -> bool {
+        report_message_client_passes(&self.exact_clients, message)
+    }
+
+    fn date_in_range(&self, timestamp: i64) -> bool {
+        validate_message_timestamp(timestamp).is_ok()
+            && timestamp_from_millisecond(timestamp).is_ok_and(|timestamp| {
+                (self.start_date..self.end_date_exclusive)
+                    .contains(&self.timezone.to_datetime(timestamp).date())
+            })
+    }
+}
+
+pub(crate) struct RemoteUsageFold {
+    gate: RemoteMessageGate,
+    accumulator: RemoteUsageAccumulator,
+}
+
+impl RemoteUsageFold {
+    pub(crate) fn new(query: &RemoteUsageQueryV1) -> Result<Self, RemoteUsageError> {
+        Ok(Self {
+            gate: RemoteMessageGate::new(query)?,
             accumulator: RemoteUsageAccumulator::default(),
         })
     }
 
     pub(crate) fn push(&mut self, message: &UnifiedMessage) -> Result<(), RemoteUsageError> {
-        self.accumulator.add(
-            message,
-            &self.exact_clients,
-            &self.timezone,
-            self.start_date,
-            self.end_date_exclusive,
-        )
+        self.accumulator.add(message, &self.gate)
     }
 
     pub(crate) fn finish(self) -> Result<RemoteUsageBundleV1, RemoteUsageError> {
@@ -269,11 +303,9 @@ impl RemoteUsageAccumulator {
     fn add(
         &mut self,
         message: &UnifiedMessage,
-        exact_clients: &Option<HashSet<String>>,
-        timezone: &TimeZone,
-        start_date: Date,
-        end_date_exclusive: Date,
+        gate: &RemoteMessageGate,
     ) -> Result<(), RemoteUsageError> {
+        let timezone = &gate.timezone;
         self.messages = self
             .messages
             .checked_add(1)
@@ -296,8 +328,8 @@ impl RemoteUsageAccumulator {
         )?;
         let client = validate_client(&message.client)?;
         let numerators = validate_numerators(message)?;
-        let included = report_message_client_passes(exact_clients, message);
-        if !included || !(start_date..end_date_exclusive).contains(&local_date) {
+        let included = gate.client_passes(message);
+        if !included || !(gate.start_date..gate.end_date_exclusive).contains(&local_date) {
             return Ok(());
         }
         let model = normalize_model(&message.model_id)?;
