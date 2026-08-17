@@ -962,8 +962,11 @@ fn scan_all_clients_resolved_inner(
     let mut tasks: Vec<(ClientId, PathBuf, &'static str)> = Vec::new();
     let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
 
+    // Every glob scan root funnels through here, so one check covers them all
+    // — including roots that come from file *contents*, such as a cc-mirror
+    // variant's `configDir`, which no caller ever gets to approve.
     let mut push = |client_id: ClientId, path: PathBuf, pattern: &'static str| {
-        if path.as_os_str().is_empty() {
+        if path.as_os_str().is_empty() || !context.admits_scan_root(&path) {
             return;
         }
         if seen_scan_roots.insert((client_id, path.clone())) {
@@ -1246,6 +1249,9 @@ fn scan_all_clients_resolved_inner(
     if enabled.contains(&ClientId::Crush) {
         let path = context.resolve_client_path(ClientId::Crush)?;
         let mut dbs = scan_crush_registry(&path, Some(context.capture_cwd()));
+        // Crush databases bypass `push`, and a registry entry's `data_dir` is
+        // file content that may be absolute, so it needs the same check.
+        dbs.retain(|db| context.admits_scan_root(&db.db_path));
         dbs.sort_by(|a, b| a.db_path.cmp(&b.db_path));
         dbs.dedup_by(|a, b| a.db_path == b.db_path);
         result.crush_dbs = dbs;
