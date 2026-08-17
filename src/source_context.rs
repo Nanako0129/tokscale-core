@@ -3,11 +3,159 @@ use crate::scanner::ScannerSettings;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-#[cfg(windows)]
-use std::path::Component;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+/// Opaque digest of the roots and scanner settings used by a remote source
+/// context.  The bytes are intentionally not a path-bearing public value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct RemoteSourceFingerprintV1([u8; 32]);
+
+impl RemoteSourceFingerprintV1 {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Durable owner approval for one exact remote source scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteSourceScopeTokenV1 {
+    fingerprint: RemoteSourceFingerprintV1,
+    generation: u64,
+}
+
+impl RemoteSourceScopeTokenV1 {
+    pub fn new(fingerprint: RemoteSourceFingerprintV1, generation: u64) -> Self {
+        Self {
+            fingerprint,
+            generation,
+        }
+    }
+
+    pub fn fingerprint(&self) -> RemoteSourceFingerprintV1 {
+        self.fingerprint
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteSourceContextError {
+    InvalidRoots,
+    InvalidScannerSettings,
+    ScopeNotApproved,
+}
+
+impl std::fmt::Display for RemoteSourceContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidRoots => "invalid source roots",
+            Self::InvalidScannerSettings => "invalid scanner settings",
+            Self::ScopeNotApproved => "source scope not approved",
+        })
+    }
+}
+
+impl std::error::Error for RemoteSourceContextError {}
+
+/// Environment-independent source context used by remote report producers.
+///
+/// The inner local context is assembled from caller-owned absolute paths.  It
+/// is deliberately not constructible through `capture`, which remains the
+/// compatibility API for local reports.
+#[derive(Clone)]
+pub struct RemoteSourceContextV1 {
+    local: ResolvedLocalSourceContext,
+    fingerprint: RemoteSourceFingerprintV1,
+    generation: u64,
+}
+
+impl std::fmt::Debug for RemoteSourceContextV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteSourceContextV1")
+            .field("fingerprint", &self.fingerprint)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteSourceContextV1 {
+    pub fn preview_fingerprint(
+        home_dir: &Path,
+        platform_config_dir: &Path,
+        platform_data_dir: &Path,
+        source_cache_dir: &Path,
+        scanner_settings: &ScannerSettings,
+    ) -> Result<RemoteSourceFingerprintV1, RemoteSourceContextError> {
+        let local = ResolvedLocalSourceContext::from_remote_explicit(
+            home_dir,
+            platform_config_dir,
+            platform_data_dir,
+            source_cache_dir,
+            scanner_settings,
+        )?;
+        Ok(RemoteSourceFingerprintV1(
+            local
+                .compute_remote_identity()
+                .map_err(|_| RemoteSourceContextError::InvalidRoots)?,
+        ))
+    }
+
+    pub fn new(
+        home_dir: impl AsRef<Path>,
+        platform_config_dir: impl AsRef<Path>,
+        platform_data_dir: impl AsRef<Path>,
+        source_cache_dir: impl AsRef<Path>,
+        scanner_settings: ScannerSettings,
+        approved_scope: RemoteSourceScopeTokenV1,
+    ) -> Result<Self, RemoteSourceContextError> {
+        let home_dir = home_dir.as_ref();
+        let platform_config_dir = platform_config_dir.as_ref();
+        let platform_data_dir = platform_data_dir.as_ref();
+        let source_cache_dir = source_cache_dir.as_ref();
+        let local = ResolvedLocalSourceContext::from_remote_explicit(
+            home_dir,
+            platform_config_dir,
+            platform_data_dir,
+            source_cache_dir,
+            &scanner_settings,
+        )?;
+        let fingerprint = RemoteSourceFingerprintV1(
+            local
+                .compute_remote_identity()
+                .map_err(|_| RemoteSourceContextError::InvalidRoots)?,
+        );
+        if approved_scope.fingerprint != fingerprint {
+            return Err(RemoteSourceContextError::ScopeNotApproved);
+        }
+        Ok(Self {
+            local,
+            fingerprint,
+            generation: approved_scope.generation,
+        })
+    }
+
+    pub fn preview(&self) -> RemoteSourceFingerprintV1 {
+        self.fingerprint
+    }
+
+    pub fn fingerprint(&self) -> RemoteSourceFingerprintV1 {
+        self.fingerprint
+    }
+
+    pub fn source_scope_generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn local(&self) -> &ResolvedLocalSourceContext {
+        &self.local
+    }
+}
 
 const DOMAIN: &[u8] = b"tokenbar-source-context";
+const REMOTE_DOMAIN: &[u8] = b"tokenbar-remote-source-context-v1";
 const RESOLVER_CONTRACT_VERSION: u32 = 1;
 
 const ENV_HOME: &str = "HOME";
@@ -173,6 +321,12 @@ pub struct ResolvedLocalSourceContext {
     source_env_paths: BTreeMap<&'static str, ResolvedPathInput>,
     codex_archive_root: PathBuf,
     extra_scan_paths: Vec<(ClientId, PathBuf)>,
+    /// This context was injected by a remote caller rather than captured from
+    /// the local machine. Two rules follow from it, both of which exist
+    /// because a remote bundle leaves the machine: scanning is confined to the
+    /// approved roots (`admits_scan_root`), and duplicate selection must not
+    /// depend on the report filter (`selection_ignores_report_filter`).
+    injected_remote: bool,
     identity: [u8; 32],
 }
 
@@ -235,6 +389,141 @@ impl ResolvedPathInput {
 }
 
 impl ResolvedLocalSourceContext {
+    fn from_remote_explicit(
+        home_dir: &Path,
+        platform_config_dir: &Path,
+        platform_data_local_dir: &Path,
+        source_cache_dir: &Path,
+        scanner_settings: &ScannerSettings,
+    ) -> Result<Self, RemoteSourceContextError> {
+        for path in [
+            home_dir,
+            platform_config_dir,
+            platform_data_local_dir,
+            source_cache_dir,
+        ] {
+            if !path.is_absolute() || path.as_os_str().is_empty() {
+                return Err(RemoteSourceContextError::InvalidRoots);
+            }
+        }
+        if !scanner_settings
+            .opencode_db_paths
+            .iter()
+            .all(|path| path.is_absolute())
+            || !scanner_settings
+                .extra_scan_paths
+                .values()
+                .flatten()
+                .all(|path| path.is_absolute())
+        {
+            return Err(RemoteSourceContextError::InvalidScannerSettings);
+        }
+
+        let home_dir = home_dir.to_path_buf();
+        let platform_config_dir = platform_config_dir.to_path_buf();
+        let platform_data_local_dir = platform_data_local_dir.to_path_buf();
+        let scanner_settings = scanner_settings.clone();
+        let mut source_env_paths = BTreeMap::new();
+        let mut keys = resolver_environment_keys();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            let path = fallback_source_env_path(key, &home_dir, Some(&platform_config_dir))
+                .map_err(|_| RemoteSourceContextError::InvalidRoots)?;
+            source_env_paths.insert(key, ResolvedPathInput::unavailable(path));
+        }
+        // Explicit platform roots are the only substitutes for platform
+        // environment roots.  They never come from process state.
+        source_env_paths.insert(
+            ENV_XDG_DATA_HOME,
+            ResolvedPathInput::unavailable(platform_data_local_dir.clone()),
+        );
+        source_env_paths.insert(
+            ENV_XDG_CONFIG_HOME,
+            ResolvedPathInput::unavailable(platform_config_dir.clone()),
+        );
+        // On Windows the injected platform roots *are* the roots the Cline and
+        // Hermes lanes reach for, so leaving these two keys derived from
+        // `home_dir` would skip an approved but redirected profile entirely:
+        // `fallback_source_env_path` would hand back `home/AppData/Roaming`
+        // and `home/AppData/Local`, which the scanner already probes directly,
+        // so the caller's roots would never be scanned at all.
+        //
+        // Only Windows, deliberately. Both consumers are guarded by
+        // `cfg!(target_os = "windows")` (`scanner.rs`), so elsewhere these keys
+        // are never read and remapping them would churn the context identity —
+        // what an approved source-scope token binds to — for no effect. Worse,
+        // on macOS it would aim `APPDATA` at a real `Application Support` tree
+        // instead of the inert `home/AppData/Roaming` placeholder it is now.
+        #[cfg(windows)]
+        {
+            source_env_paths.insert(
+                ENV_APPDATA,
+                ResolvedPathInput::unavailable(platform_config_dir.clone()),
+            );
+            source_env_paths.insert(
+                ENV_LOCALAPPDATA,
+                ResolvedPathInput::unavailable(platform_data_local_dir.clone()),
+            );
+        }
+        source_env_paths.insert(
+            ENV_TOKSCALE_CONFIG_DIR,
+            ResolvedPathInput {
+                state: InputState::Unset,
+                resolution: PathResolution::Explicit,
+                path: Some(platform_config_dir.join("tokscale")),
+            },
+        );
+        source_env_paths.insert(ENV_HOME, ResolvedPathInput::unavailable(home_dir.clone()));
+        source_env_paths.insert(
+            ENV_TOKSCALE_EXTRA_DIRS,
+            ResolvedPathInput::unavailable(home_dir.clone()),
+        );
+
+        let codex_archive_root = home_dir.join(".codex/archived_sessions");
+        let mut local = Self {
+            capture_cwd: home_dir.clone(),
+            home_dir,
+            use_env_roots: true,
+            scanner_settings,
+            pricing_cache_only: true,
+            source_cache_dir: Some(source_cache_dir.to_path_buf()),
+            pricing_config_dir: platform_config_dir.join("tokscale"),
+            platform_config_dir: Some(platform_config_dir),
+            platform_data_local_dir: Some(platform_data_local_dir),
+            source_env_paths,
+            codex_archive_root,
+            extra_scan_paths: Vec::new(),
+            injected_remote: true,
+            identity: [0; 32],
+        };
+        // Leaving this zero made every remote context share one identity. It
+        // is unreachable today because `local()` is crate-private, but
+        // `identity_bytes` already namespaces caches elsewhere, so a zero here
+        // is a collision waiting for the first caller that reaches it.
+        local.identity = local
+            .compute_remote_identity()
+            .map_err(|_| RemoteSourceContextError::InvalidRoots)?;
+        Ok(local)
+    }
+
+    /// The approved-scope fingerprint.
+    ///
+    /// This deliberately reuses the local identity descriptor rather than
+    /// listing the remote inputs again. A hand-maintained subset only binds
+    /// the inputs someone remembered to add: it covered the four roots and
+    /// both `ScannerSettings` fields, but not the *rules* that turn those
+    /// roots into scan targets — no contract version, no target-OS tag, and
+    /// none of `source_env_paths`. Routing `APPDATA`/`LOCALAPPDATA` to the
+    /// injected platform roots therefore changed which directories a Windows
+    /// scan visits while leaving the fingerprint identical, so a token
+    /// approved before that change stayed valid for a different scan scope.
+    /// Sharing one descriptor makes that class of drift impossible to
+    /// reintroduce: any input or rule the resolver consults is already in it.
+    fn compute_remote_identity(&self) -> Result<[u8; 32], SourceContextUnavailable> {
+        self.compute_identity_with_domain(REMOTE_DOMAIN)
+    }
+
     pub fn capture(
         home_dir: Option<PathBuf>,
         use_env_roots: bool,
@@ -314,6 +603,7 @@ impl ResolvedLocalSourceContext {
             source_env_paths,
             codex_archive_root,
             extra_scan_paths,
+            injected_remote: false,
             identity: [0; 32],
         };
         context.identity = context.compute_identity()?;
@@ -338,6 +628,61 @@ impl ResolvedLocalSourceContext {
 
     pub fn identity_bytes(&self) -> [u8; 32] {
         self.identity
+    }
+
+    /// Whether a discovered scan root may actually be scanned.
+    ///
+    /// Most roots are pure functions of the approved roots and need no check.
+    /// A few are not: a `cc-mirror` variant's `configDir` and a Crush
+    /// registry's `data_dir` are *file contents* under the home directory, and
+    /// both accept an absolute path, so whatever can write those files chooses
+    /// a scan root. Locally that is only as privileged as the app already is.
+    /// Under an injected remote context it is an escape: the caller never sees
+    /// the root, cannot approve it, and it cannot be fingerprinted because it
+    /// does not exist until the scan reads the file — yet whatever is parsed
+    /// there is folded into a bundle sent to a peer.
+    ///
+    /// So a confined context admits a root only beneath something the
+    /// fingerprint already covers.
+    /// Whether duplicate selection must ignore the report filter.
+    ///
+    /// The OpenCode lane otherwise lets a filtered-out authoritative copy
+    /// leave its deferred twin in place, so the twin is emitted instead. That
+    /// fallback is deliberate for a local report, but it makes selection
+    /// depend on the caller's filter, and a remote producer claims byte-parity
+    /// with the pure fold, which has no such fallback.
+    pub(crate) fn selection_ignores_report_filter(&self) -> bool {
+        self.injected_remote
+    }
+
+    pub(crate) fn admits_scan_root(&self, path: &Path) -> bool {
+        if !self.injected_remote {
+            return true;
+        }
+        // `Path::starts_with` compares components, so `<root>/../outside`
+        // starts with `<root>` while the filesystem resolves it elsewhere.
+        // Both sides are folded first, which needs no filesystem access and so
+        // cannot be raced. Resolving symlinks is deliberately not done here:
+        // that is the caller's job (`SA-2B` secure roots, no-follow), and doing
+        // it would make this a check on state that can change after it runs.
+        let path = lexically_folded(path);
+        [
+            Some(self.home_dir.as_path()),
+            self.platform_config_dir.as_deref(),
+            self.platform_data_local_dir.as_deref(),
+            self.source_cache_dir.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.scanner_settings.opencode_db_paths.iter().map(|p| &**p))
+        .chain(
+            self.scanner_settings
+                .extra_scan_paths
+                .values()
+                .flatten()
+                .map(|p| &**p),
+        )
+        .any(|root| path.starts_with(lexically_folded(root)))
     }
 
     pub fn pricing_cache_only(&self) -> bool {
@@ -439,9 +784,19 @@ impl ResolvedLocalSourceContext {
     }
 
     fn compute_identity(&self) -> Result<[u8; 32], SourceContextUnavailable> {
+        self.compute_identity_with_domain(DOMAIN)
+    }
+
+    /// Every input and resolution rule that can change what a scan visits,
+    /// under a caller-chosen domain separator so a local identity and a remote
+    /// approved-scope fingerprint can never collide.
+    fn compute_identity_with_domain(
+        &self,
+        domain: &[u8],
+    ) -> Result<[u8; 32], SourceContextUnavailable> {
         let mut descriptor = Descriptor::default();
         descriptor.field(1);
-        descriptor.bytes(DOMAIN)?;
+        descriptor.bytes(domain)?;
         descriptor.field(2);
         descriptor.u32(RESOLVER_CONTRACT_VERSION);
         descriptor.field(3);
@@ -875,6 +1230,32 @@ fn fully_qualified(base: &Path, path: &Path) -> Result<PathBuf, SourceContextUna
         }
         _ => Ok(base.join(path)),
     }
+}
+
+/// Fold `.` and `..` away without touching the filesystem, so a containment
+/// test compares what a path denotes rather than how it was spelled. `..` at
+/// the root is dropped, matching how the kernel treats `/..`.
+fn lexically_folded(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !folded.pop() {
+                    // Nothing to pop under a root or prefix; a relative path
+                    // keeps the `..` so it cannot silently become its parent.
+                    if !matches!(
+                        path.components().next(),
+                        Some(Component::RootDir | Component::Prefix(_))
+                    ) {
+                        folded.push(Component::ParentDir);
+                    }
+                }
+            }
+            other => folded.push(other),
+        }
+    }
+    folded
 }
 
 fn target_os_tag() -> u8 {
@@ -2154,12 +2535,25 @@ mod tests {
         assert!(identity.strip_prefix("sc1:").is_some_and(|hex| hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))));
-        #[cfg(unix)]
+        // The identity commits to the resolved client roots, and those are
+        // per-platform by design, so the golden value is per-platform too —
+        // `cfg(unix)` wrongly shared one macOS value with Linux. Pinning it at
+        // all is what makes an accidental change to the fingerprint's inputs,
+        // which is what an approved source-scope token binds to, fail loudly
+        // instead of silently re-scoping a live grant.
+        #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
             "sc1:b3b65ffcb00dacb7c35d9cf0d5221750b4151135ee8d19158cf4061c64cd3406"
         );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            identity,
+            "sc1:f66cefc1a6e0f521ea2eaf790f470d64d2277650d18f4e69b0423a6eef41d761"
+        );
 
+        // The raw-byte path encoding, unlike the identity, is genuinely
+        // uniform across unix.
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
@@ -2169,6 +2563,72 @@ mod tests {
                 .unwrap();
             assert_eq!(descriptor.0, vec![1, 1, 0, 0, 0, 3, b'/', b'x', 0xff]);
         }
+    }
+
+    #[test]
+    fn remote_context_identity_is_distinct_and_root_bound() {
+        let root = fixture_root();
+        let build = |name: &str| {
+            ResolvedLocalSourceContext::from_remote_explicit(
+                &root.join(name).join("home"),
+                &root.join(name).join("config"),
+                &root.join(name).join("data"),
+                &root.join(name).join("cache"),
+                &ScannerSettings::default(),
+            )
+            .unwrap()
+        };
+        let first = build("a");
+        let second = build("b");
+
+        // Was a hard-coded `[0; 32]`, so every remote context shared one
+        // identity — and `identity_bytes` namespaces caches elsewhere.
+        assert_ne!(first.identity_bytes(), [0; 32]);
+        assert_ne!(first.identity_bytes(), second.identity_bytes());
+
+        // Domain separation: the same context must not produce the same digest
+        // for its local identity and its approved-scope fingerprint.
+        assert_ne!(
+            first.compute_identity().unwrap(),
+            first.compute_remote_identity().unwrap()
+        );
+    }
+
+    /// A redirected Windows profile: the approved platform roots are nowhere
+    /// under `home`. The Cline (`APPDATA`) and Hermes (`LOCALAPPDATA`) lanes
+    /// must reach the approved roots, not a guess derived from `home`, which
+    /// the scanner already probes on its own.
+    #[cfg(windows)]
+    #[test]
+    fn remote_explicit_roots_replace_home_derived_appdata() {
+        let root = fixture_root();
+        let home = root.join("profile/home");
+        let config = root.join("redirected/Roaming");
+        let data = root.join("redirected/Local");
+        let context = ResolvedLocalSourceContext::from_remote_explicit(
+            &home,
+            &config,
+            &data,
+            &root.join("syrtis-cache"),
+            &ScannerSettings::default(),
+        )
+        .unwrap();
+
+        assert_eq!(context.source_env_path(ENV_APPDATA), Some(config.as_path()));
+        assert_eq!(
+            context.source_env_path(ENV_LOCALAPPDATA),
+            Some(data.as_path())
+        );
+        // The home-derived fallback is what this replaces; asserting its
+        // absence is what makes the test fail if the mapping is dropped.
+        assert_ne!(
+            context.source_env_path(ENV_APPDATA),
+            Some(home.join("AppData/Roaming").as_path())
+        );
+        assert_ne!(
+            context.source_env_path(ENV_LOCALAPPDATA),
+            Some(home.join("AppData/Local").as_path())
+        );
     }
 
     #[cfg(windows)]
