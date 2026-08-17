@@ -157,6 +157,7 @@ impl RemoteSourceContextV1 {
 }
 
 const DOMAIN: &[u8] = b"tokenbar-source-context";
+const REMOTE_DOMAIN: &[u8] = b"tokenbar-remote-source-context-v1";
 const RESOLVER_CONTRACT_VERSION: u32 = 1;
 
 const ENV_HOME: &str = "HOME";
@@ -322,6 +323,10 @@ pub struct ResolvedLocalSourceContext {
     source_env_paths: BTreeMap<&'static str, ResolvedPathInput>,
     codex_archive_root: PathBuf,
     extra_scan_paths: Vec<(ClientId, PathBuf)>,
+    /// Restrict scanning to roots the caller approved. Set only for an
+    /// injected remote context; a locally captured context scans wherever the
+    /// user configured it to, which is the whole point of the local app.
+    confine_to_approved_roots: bool,
     identity: [u8; 32],
 }
 
@@ -476,7 +481,7 @@ impl ResolvedLocalSourceContext {
         );
 
         let codex_archive_root = home_dir.join(".codex/archived_sessions");
-        let local = Self {
+        let mut local = Self {
             capture_cwd: home_dir.clone(),
             home_dir,
             use_env_roots: true,
@@ -489,48 +494,34 @@ impl ResolvedLocalSourceContext {
             source_env_paths,
             codex_archive_root,
             extra_scan_paths: Vec::new(),
+            confine_to_approved_roots: true,
             identity: [0; 32],
         };
+        // Leaving this zero made every remote context share one identity. It
+        // is unreachable today because `local()` is crate-private, but
+        // `identity_bytes` already namespaces caches elsewhere, so a zero here
+        // is a collision waiting for the first caller that reaches it.
+        local.identity = local
+            .compute_remote_identity()
+            .map_err(|_| RemoteSourceContextError::InvalidRoots)?;
         Ok(local)
     }
 
+    /// The approved-scope fingerprint.
+    ///
+    /// This deliberately reuses the local identity descriptor rather than
+    /// listing the remote inputs again. A hand-maintained subset only binds
+    /// the inputs someone remembered to add: it covered the four roots and
+    /// both `ScannerSettings` fields, but not the *rules* that turn those
+    /// roots into scan targets — no contract version, no target-OS tag, and
+    /// none of `source_env_paths`. Routing `APPDATA`/`LOCALAPPDATA` to the
+    /// injected platform roots therefore changed which directories a Windows
+    /// scan visits while leaving the fingerprint identical, so a token
+    /// approved before that change stayed valid for a different scan scope.
+    /// Sharing one descriptor makes that class of drift impossible to
+    /// reintroduce: any input or rule the resolver consults is already in it.
     fn compute_remote_identity(&self) -> Result<[u8; 32], SourceContextUnavailable> {
-        let mut descriptor = Descriptor::default();
-        descriptor.field(1);
-        descriptor.bytes(b"tokenbar-remote-source-context-v1")?;
-        descriptor.field(2);
-        descriptor.path(&self.home_dir)?;
-        descriptor.field(3);
-        descriptor.optional_path(self.platform_config_dir.as_deref())?;
-        descriptor.field(4);
-        descriptor.optional_path(self.platform_data_local_dir.as_deref())?;
-        descriptor.field(5);
-        descriptor.path(
-            self.source_cache_dir
-                .as_deref()
-                .ok_or(SourceContextUnavailable)?,
-        )?;
-        descriptor.field(6);
-        descriptor.count(self.scanner_settings.opencode_db_paths.len())?;
-        for path in &self.scanner_settings.opencode_db_paths {
-            descriptor.path(path)?;
-        }
-        descriptor.field(7);
-        descriptor.count(self.scanner_settings.extra_scan_paths.len())?;
-        for (client, paths) in &self.scanner_settings.extra_scan_paths {
-            descriptor.text(client)?;
-            descriptor.count(paths.len())?;
-            for path in paths {
-                descriptor.path(path)?;
-            }
-        }
-        descriptor.field(8);
-        descriptor.count(ClientId::COUNT)?;
-        for client in ClientId::iter() {
-            descriptor.u32(client as u32);
-            descriptor.path(&self.resolve_client_path(client)?)?;
-        }
-        Ok(Sha256::digest(descriptor.0).into())
+        self.compute_identity_with_domain(REMOTE_DOMAIN)
     }
 
     pub fn capture(
@@ -612,6 +603,7 @@ impl ResolvedLocalSourceContext {
             source_env_paths,
             codex_archive_root,
             extra_scan_paths,
+            confine_to_approved_roots: false,
             identity: [0; 32],
         };
         context.identity = context.compute_identity()?;
@@ -636,6 +628,46 @@ impl ResolvedLocalSourceContext {
 
     pub fn identity_bytes(&self) -> [u8; 32] {
         self.identity
+    }
+
+    /// Whether a discovered scan root may actually be scanned.
+    ///
+    /// Most roots are pure functions of the approved roots and need no check.
+    /// A few are not: a `cc-mirror` variant's `configDir` and a Crush
+    /// registry's `data_dir` are *file contents* under the home directory, and
+    /// both accept an absolute path, so whatever can write those files chooses
+    /// a scan root. Locally that is only as privileged as the app already is.
+    /// Under an injected remote context it is an escape: the caller never sees
+    /// the root, cannot approve it, and it cannot be fingerprinted because it
+    /// does not exist until the scan reads the file — yet whatever is parsed
+    /// there is folded into a bundle sent to a peer.
+    ///
+    /// So a confined context admits a root only beneath something the
+    /// fingerprint already covers.
+    pub(crate) fn admits_scan_root(&self, path: &Path) -> bool {
+        if !self.confine_to_approved_roots {
+            return true;
+        }
+        [
+            Some(self.home_dir.as_path()),
+            self.platform_config_dir.as_deref(),
+            self.platform_data_local_dir.as_deref(),
+            self.source_cache_dir.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|root| path.starts_with(root))
+            || self
+                .scanner_settings
+                .opencode_db_paths
+                .iter()
+                .any(|approved| path.starts_with(approved))
+            || self
+                .scanner_settings
+                .extra_scan_paths
+                .values()
+                .flatten()
+                .any(|approved| path.starts_with(approved))
     }
 
     pub fn pricing_cache_only(&self) -> bool {
@@ -737,9 +769,19 @@ impl ResolvedLocalSourceContext {
     }
 
     fn compute_identity(&self) -> Result<[u8; 32], SourceContextUnavailable> {
+        self.compute_identity_with_domain(DOMAIN)
+    }
+
+    /// Every input and resolution rule that can change what a scan visits,
+    /// under a caller-chosen domain separator so a local identity and a remote
+    /// approved-scope fingerprint can never collide.
+    fn compute_identity_with_domain(
+        &self,
+        domain: &[u8],
+    ) -> Result<[u8; 32], SourceContextUnavailable> {
         let mut descriptor = Descriptor::default();
         descriptor.field(1);
-        descriptor.bytes(DOMAIN)?;
+        descriptor.bytes(domain)?;
         descriptor.field(2);
         descriptor.u32(RESOLVER_CONTRACT_VERSION);
         descriptor.field(3);
@@ -2480,6 +2522,35 @@ mod tests {
                 .unwrap();
             assert_eq!(descriptor.0, vec![1, 1, 0, 0, 0, 3, b'/', b'x', 0xff]);
         }
+    }
+
+    #[test]
+    fn remote_context_identity_is_distinct_and_root_bound() {
+        let root = fixture_root();
+        let build = |name: &str| {
+            ResolvedLocalSourceContext::from_remote_explicit(
+                &root.join(name).join("home"),
+                &root.join(name).join("config"),
+                &root.join(name).join("data"),
+                &root.join(name).join("cache"),
+                &ScannerSettings::default(),
+            )
+            .unwrap()
+        };
+        let first = build("a");
+        let second = build("b");
+
+        // Was a hard-coded `[0; 32]`, so every remote context shared one
+        // identity — and `identity_bytes` namespaces caches elsewhere.
+        assert_ne!(first.identity_bytes(), [0; 32]);
+        assert_ne!(first.identity_bytes(), second.identity_bytes());
+
+        // Domain separation: the same context must not produce the same digest
+        // for its local identity and its approved-scope fingerprint.
+        assert_ne!(
+            first.compute_identity().unwrap(),
+            first.compute_remote_identity().unwrap()
+        );
     }
 
     /// A redirected Windows profile: the approved platform roots are nowhere

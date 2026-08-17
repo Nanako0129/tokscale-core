@@ -70,6 +70,33 @@ fn write_cc_mirror_fixture(home: &Path) {
     .unwrap();
 }
 
+/// A cc-mirror variant whose `configDir` points wherever `escape_to` says.
+/// The value is file content, so it is chosen by whatever can write this file
+/// — not by the caller who approved the roots.
+fn write_cc_mirror_fixture_at(home: &Path, variant: &str, config: &Path, request_id: &str) {
+    let variant_dir = home.join(".cc-mirror").join(variant);
+    let project = config.join("projects/proj");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&variant_dir).unwrap();
+    fs::write(
+        variant_dir.join("variant.json"),
+        serde_json::json!({
+            "name": variant,
+            "provider": "kimi",
+            "configDir": config,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        project.join("session.jsonl"),
+        format!(
+            r#"{{"type":"assistant","timestamp":"2040-01-01T11:00:00.000Z","requestId":"{request_id}","message":{{"id":"msg_{request_id}","model":"claude-3-5-sonnet","usage":{{"input_tokens":300,"output_tokens":70}}}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
 fn write_synthetic_opencode_fixture(xdg_data: &Path) {
     let message_dir = xdg_data.join("opencode/storage/message/project-1");
     fs::create_dir_all(&message_dir).unwrap();
@@ -576,6 +603,65 @@ fn source_fold_still_rejects_invalid_rows_inside_the_query_range() {
         ),
         Err(RemoteSourceUsageError::InvalidText)
     );
+}
+
+/// A scan root named by *file content* rather than by the caller must not be
+/// reachable from an injected context. Both known vectors put an absolute path
+/// in a file under home: a cc-mirror variant's `configDir` and a Crush
+/// registry entry's `data_dir`. Neither is visible to the caller, and neither
+/// can be fingerprinted, because it does not exist until the scan reads it.
+#[test]
+fn source_scan_ignores_roots_named_by_file_contents() {
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    let outside = roots.path().join("outside-every-approved-root");
+
+    // Same shape twice: one variant inside the approved home, one escaping.
+    write_cc_mirror_fixture_at(
+        &home,
+        "inside",
+        &home.join(".cc-mirror/inside/config"),
+        "req_inside",
+    );
+    write_cc_mirror_fixture_at(&home, "escaped", &outside.join("config"), "req_escaped");
+
+    // A Crush registry whose data_dir is likewise absolute and outside.
+    let crush_dir = home.join(".local/share/crush");
+    fs::create_dir_all(&crush_dir).unwrap();
+    fs::write(
+        crush_dir.join("projects.json"),
+        serde_json::json!({
+            "escaped": { "path": "/", "data_dir": outside.join("crush") }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (context, _) = context(
+        &home,
+        &roots.path().join("config"),
+        &roots.path().join("data"),
+        &roots.path().join("source-cache"),
+        ScannerSettings::default(),
+    );
+    let bundle = aggregate_remote_usage_from_source_v1(
+        &context,
+        // The query contract requires a strictly increasing client list.
+        &query_for_clients(vec![
+            "cc-mirror/escaped".to_owned(),
+            "cc-mirror/inside".to_owned(),
+        ]),
+        &RemotePricingSnapshot::from_cache_root(roots.path().join("pricing")),
+    )
+    .unwrap();
+
+    // The approved variant proves the guard is not simply blocking everything;
+    // the escaped one proves it holds.
+    let clients: BTreeSet<&str> = bundle.graph.iter().map(|row| row.client.as_str()).collect();
+    assert_eq!(clients, BTreeSet::from(["cc-mirror/inside"]));
+    assert!(!serde_json::to_string(&bundle)
+        .unwrap()
+        .contains("outside-every-approved-root"));
 }
 
 #[test]
