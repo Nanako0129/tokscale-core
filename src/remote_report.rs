@@ -246,9 +246,14 @@ impl RemoteMessageGate {
         })
     }
 
-    /// Admit only messages that can survive the fold. Dropping the rest is
-    /// output-preserving: a timestamp that fails validation, or that lands
-    /// outside the range, is discarded by the fold's own range check anyway.
+    /// Admit only messages that can survive the fold.
+    ///
+    /// Dropping the rest preserves the emitted bundle: the fold's own range
+    /// check discards exactly the same messages. It is not, however, error-
+    /// preserving in general — a rejected message never reaches the fold, so a
+    /// malformed row outside the query cannot fail the query. That is the
+    /// intended behaviour, and `RemoteUsageAccumulator::add` now defers its
+    /// field validation past the range check so the pure fold agrees.
     pub(crate) fn accepts(&self, message: &UnifiedMessage) -> bool {
         self.client_passes(message) && self.date_in_range(message.timestamp)
     }
@@ -313,10 +318,21 @@ impl RemoteUsageAccumulator {
         if self.messages > MAX_MESSAGES {
             return Err(RemoteUsageError::LimitExceeded);
         }
+        // The timestamp has to parse before its local date is known, so it is
+        // validated first. Everything after the exclusion below is deferred
+        // until the message is known to be in scope: validating the client,
+        // numerators, or hour bucket of a message that cannot be emitted would
+        // make an unrelated row outside the query fail the whole query, and
+        // would give this API a different error for the same inputs than the
+        // streaming producer, which drops those rows before the fold.
         validate_message_timestamp(message.timestamp)?;
         let timestamp = timestamp_from_millisecond(message.timestamp)?;
         let local_datetime = timezone.to_datetime(timestamp);
         let local_date = local_datetime.date();
+        let included = gate.client_passes(message);
+        if !included || !(gate.start_date..gate.end_date_exclusive).contains(&local_date) {
+            return Ok(());
+        }
         let date_text = local_date.to_string();
         let offset = timezone.to_offset(timestamp).seconds();
         let bucket = bucket_start(
@@ -328,10 +344,6 @@ impl RemoteUsageAccumulator {
         )?;
         let client = validate_client(&message.client)?;
         let numerators = validate_numerators(message)?;
-        let included = gate.client_passes(message);
-        if !included || !(gate.start_date..gate.end_date_exclusive).contains(&local_date) {
-            return Ok(());
-        }
         let model = normalize_model(&message.model_id)?;
         let provider = normalize_provider(&message.provider_id)?;
         let agent = normalize_agent(&message.client, message.agent.as_deref())?;

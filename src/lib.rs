@@ -2791,6 +2791,14 @@ impl OpenCodeSelection {
         Some(message)
     }
 
+    /// `will_emit` reaching the selection is what lets a filtered-out
+    /// authoritative JSON copy leave its deferred SQLite twin in place, so the
+    /// twin is emitted instead — deliberate for a local report (see
+    /// `test_opencode_streaming_selection_keeps_fallback_until_json_is_emitted`),
+    /// but it means selection depends on the caller's filter. A remote
+    /// producer passes `true` here and applies its own gate to the result,
+    /// because it claims byte-parity with the pure fold over the same
+    /// messages, and the pure fold has no such fallback.
     fn select_json(&mut self, message: UnifiedMessage, will_emit: bool) -> Option<UnifiedMessage> {
         let sources = OpenCodeSourceIdentity::all_from_message(&message);
         if sources.is_empty() {
@@ -3714,12 +3722,22 @@ where
             }
         }
     }
+    // A remote producer selects as if nothing were filtered and applies the
+    // filter to the winner, so which duplicate wins cannot depend on the
+    // query. Locally the filter stays in the selection, keeping the deliberate
+    // fallback to a deferred copy when the authoritative one is filtered out.
+    let selection_ignores_filter =
+        context.is_some_and(ResolvedLocalSourceContext::selection_ignores_report_filter);
     for path in scan_result.get(ClientId::OpenCode) {
         if let Some(mut message) = sessions::opencode::parse_opencode_file(path) {
             apply_pricing_if_available(&mut message, pricing);
             let will_emit = passes_client(&message) && filter(&message);
-            if let Some(message) = opencode_selection.select_json(message, will_emit) {
-                sink(&message);
+            if let Some(message) =
+                opencode_selection.select_json(message, selection_ignores_filter || will_emit)
+            {
+                if will_emit {
+                    sink(&message);
+                }
             }
         }
     }
@@ -9453,6 +9471,120 @@ mod tests {
             ))
             .is_none());
         assert_eq!(selection.finish().count(), 0);
+    }
+
+    /// The local fallback above must not follow a bundle off the machine.
+    ///
+    /// Two copies of one OpenCode message: the SQLite copy carries an
+    /// estimated cost on a plain model id, the JSON copy is authoritative on a
+    /// gateway model id. A `synthetic` query matches on model and provider, so
+    /// it selects the JSON copy and not its twin — which means the twin is
+    /// filtered while the authoritative copy is not, the one shape that lets
+    /// selection see a difference. If the report filter can reach the
+    /// selection, the deferred SQLite copy survives and is emitted in place of
+    /// the copy the query actually matched, and the streaming bundle stops
+    /// agreeing with the pure fold over the same messages.
+    #[test]
+    fn test_remote_source_selection_is_independent_of_the_query_filter() {
+        let roots = tempfile::TempDir::new().unwrap();
+        let home = roots.path().join("home");
+        // Both sides must read the same files: the remote context resolves the
+        // XDG data root from the injected platform root, while the local parse
+        // with `use_env_roots: false` uses `home/.local/share`.
+        let xdg_data = home.join(".local/share");
+
+        let session = "session-twin";
+        let message_id = "msg-twin";
+        let db_dir = xdg_data.join("opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let conn = rusqlite::Connection::open(db_dir.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory) VALUES (?1, ?2)",
+            rusqlite::params![session, "/workspace"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                message_id,
+                session,
+                r#"{"role":"assistant","time":{"created":2208988800000},"model":{"id":"hf:deepseek-ai/DeepSeek-V3-0324","providerID":"unknown"},"cost":0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}}}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let message_dir = xdg_data.join("opencode/storage/message/project-1");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        std::fs::write(
+            message_dir.join(format!("{message_id}.json")),
+            format!(
+                r#"{{"id":"{message_id}","sessionID":"{session}","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","cost":0.5,"tokens":{{"input":10,"output":5,"reasoning":0,"cache":{{"read":0,"write":0}}}},"time":{{"created":2208988800000}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let query = crate::RemoteUsageQueryV1 {
+            clients: vec!["synthetic".to_owned()],
+            start_date: "2040-01-01".to_owned(),
+            end_date_exclusive: "2040-01-02".to_owned(),
+            timezone: "UTC".to_owned(),
+            tzdb_revision: "2026c".to_owned(),
+        };
+        let settings = scanner::ScannerSettings::default();
+        let config = roots.path().join("config");
+        let cache = roots.path().join("source-cache");
+        let fingerprint = crate::RemoteSourceContextV1::preview_fingerprint(
+            &home, &config, &xdg_data, &cache, &settings,
+        )
+        .unwrap();
+        let context = crate::RemoteSourceContextV1::new(
+            &home,
+            &config,
+            &xdg_data,
+            &cache,
+            settings,
+            crate::RemoteSourceScopeTokenV1::new(fingerprint, 1),
+        )
+        .unwrap();
+        let pricing = crate::RemotePricingSnapshot::from_cache_root(roots.path().join("pricing"));
+        let streamed =
+            crate::aggregate_remote_usage_from_source_v1(&context, &query, &pricing).unwrap();
+
+        let rows = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::parse_local_unified_messages_with_pricing(
+                crate::LocalParseOptions {
+                    home_dir: Some(home.to_string_lossy().into_owned()),
+                    use_env_roots: false,
+                    clients: Some(vec!["synthetic".to_owned()]),
+                    scanner_settings: scanner::ScannerSettings::default(),
+                    ..Default::default()
+                },
+                None,
+            ))
+            .unwrap();
+        let pure = crate::remote_report::aggregate_remote_usage_v1(&rows, &query).unwrap();
+
+        // The authoritative copy is not synthetic, so the query matches
+        // neither it nor — once selection has consumed it — its twin. Both
+        // bundles are therefore empty, which is also why this compares bytes:
+        // a non-empty synthetic bundle would differ between the streaming and
+        // materialized lanes over gateway label normalization, unrelated to
+        // what this test is about.
+        assert!(streamed.graph.is_empty(), "the deferred twin escaped");
+        assert_eq!(
+            serde_json::to_vec(&streamed).unwrap(),
+            serde_json::to_vec(&pure).unwrap()
+        );
     }
 
     #[test]

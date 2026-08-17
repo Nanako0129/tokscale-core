@@ -323,10 +323,12 @@ pub struct ResolvedLocalSourceContext {
     source_env_paths: BTreeMap<&'static str, ResolvedPathInput>,
     codex_archive_root: PathBuf,
     extra_scan_paths: Vec<(ClientId, PathBuf)>,
-    /// Restrict scanning to roots the caller approved. Set only for an
-    /// injected remote context; a locally captured context scans wherever the
-    /// user configured it to, which is the whole point of the local app.
-    confine_to_approved_roots: bool,
+    /// This context was injected by a remote caller rather than captured from
+    /// the local machine. Two rules follow from it, both of which exist
+    /// because a remote bundle leaves the machine: scanning is confined to the
+    /// approved roots (`admits_scan_root`), and duplicate selection must not
+    /// depend on the report filter (`selection_ignores_report_filter`).
+    injected_remote: bool,
     identity: [u8; 32],
 }
 
@@ -494,7 +496,7 @@ impl ResolvedLocalSourceContext {
             source_env_paths,
             codex_archive_root,
             extra_scan_paths: Vec::new(),
-            confine_to_approved_roots: true,
+            injected_remote: true,
             identity: [0; 32],
         };
         // Leaving this zero made every remote context share one identity. It
@@ -603,7 +605,7 @@ impl ResolvedLocalSourceContext {
             source_env_paths,
             codex_archive_root,
             extra_scan_paths,
-            confine_to_approved_roots: false,
+            injected_remote: false,
             identity: [0; 32],
         };
         context.identity = context.compute_identity()?;
@@ -644,8 +646,19 @@ impl ResolvedLocalSourceContext {
     ///
     /// So a confined context admits a root only beneath something the
     /// fingerprint already covers.
+    /// Whether duplicate selection must ignore the report filter.
+    ///
+    /// The OpenCode lane otherwise lets a filtered-out authoritative copy
+    /// leave its deferred twin in place, so the twin is emitted instead. That
+    /// fallback is deliberate for a local report, but it makes selection
+    /// depend on the caller's filter, and a remote producer claims byte-parity
+    /// with the pure fold, which has no such fallback.
+    pub(crate) fn selection_ignores_report_filter(&self) -> bool {
+        self.injected_remote
+    }
+
     pub(crate) fn admits_scan_root(&self, path: &Path) -> bool {
-        if !self.confine_to_approved_roots {
+        if !self.injected_remote {
             return true;
         }
         [
