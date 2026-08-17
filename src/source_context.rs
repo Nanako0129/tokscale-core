@@ -3,9 +3,7 @@ use crate::scanner::ScannerSettings;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-#[cfg(windows)]
-use std::path::Component;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Opaque digest of the roots and scanner settings used by a remote source
 /// context.  The bytes are intentionally not a path-bearing public value.
@@ -661,6 +659,13 @@ impl ResolvedLocalSourceContext {
         if !self.injected_remote {
             return true;
         }
+        // `Path::starts_with` compares components, so `<root>/../outside`
+        // starts with `<root>` while the filesystem resolves it elsewhere.
+        // Both sides are folded first, which needs no filesystem access and so
+        // cannot be raced. Resolving symlinks is deliberately not done here:
+        // that is the caller's job (`SA-2B` secure roots, no-follow), and doing
+        // it would make this a check on state that can change after it runs.
+        let path = lexically_folded(path);
         [
             Some(self.home_dir.as_path()),
             self.platform_config_dir.as_deref(),
@@ -669,18 +674,15 @@ impl ResolvedLocalSourceContext {
         ]
         .into_iter()
         .flatten()
-        .any(|root| path.starts_with(root))
-            || self
-                .scanner_settings
-                .opencode_db_paths
-                .iter()
-                .any(|approved| path.starts_with(approved))
-            || self
-                .scanner_settings
+        .chain(self.scanner_settings.opencode_db_paths.iter().map(|p| &**p))
+        .chain(
+            self.scanner_settings
                 .extra_scan_paths
                 .values()
                 .flatten()
-                .any(|approved| path.starts_with(approved))
+                .map(|p| &**p),
+        )
+        .any(|root| path.starts_with(lexically_folded(root)))
     }
 
     pub fn pricing_cache_only(&self) -> bool {
@@ -1228,6 +1230,32 @@ fn fully_qualified(base: &Path, path: &Path) -> Result<PathBuf, SourceContextUna
         }
         _ => Ok(base.join(path)),
     }
+}
+
+/// Fold `.` and `..` away without touching the filesystem, so a containment
+/// test compares what a path denotes rather than how it was spelled. `..` at
+/// the root is dropped, matching how the kernel treats `/..`.
+fn lexically_folded(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !folded.pop() {
+                    // Nothing to pop under a root or prefix; a relative path
+                    // keeps the `..` so it cannot silently become its parent.
+                    if !matches!(
+                        path.components().next(),
+                        Some(Component::RootDir | Component::Prefix(_))
+                    ) {
+                        folded.push(Component::ParentDir);
+                    }
+                }
+            }
+            other => folded.push(other),
+        }
+    }
+    folded
 }
 
 fn target_os_tag() -> u8 {

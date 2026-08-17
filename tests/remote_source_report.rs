@@ -733,6 +733,14 @@ fn source_scan_ignores_roots_named_by_file_contents() {
         "req_inside",
     );
     write_cc_mirror_fixture_at(&home, "escaped", &outside.join("config"), "req_escaped");
+    // Spelled to look contained: component-wise this starts with the approved
+    // home, but the filesystem resolves it to a sibling of it.
+    write_cc_mirror_fixture_at(
+        &home,
+        "traversed",
+        &home.join("../outside-every-approved-root/traversed"),
+        "req_traversed",
+    );
 
     // A Crush registry whose data_dir is likewise absolute and outside.
     let crush_dir = home.join(".local/share/crush");
@@ -759,6 +767,7 @@ fn source_scan_ignores_roots_named_by_file_contents() {
         &query_for_clients(vec![
             "cc-mirror/escaped".to_owned(),
             "cc-mirror/inside".to_owned(),
+            "cc-mirror/traversed".to_owned(),
         ]),
         &RemotePricingSnapshot::from_cache_root(roots.path().join("pricing")),
     )
