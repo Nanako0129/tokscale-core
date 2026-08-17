@@ -250,10 +250,13 @@ impl RemoteMessageGate {
     ///
     /// Dropping the rest preserves the emitted bundle: the fold's own range
     /// check discards exactly the same messages. It is not, however, error-
-    /// preserving in general — a rejected message never reaches the fold, so a
-    /// malformed row outside the query cannot fail the query. That is the
-    /// intended behaviour, and `RemoteUsageAccumulator::add` now defers its
-    /// field validation past the range check so the pure fold agrees.
+    /// preserving — a rejected message never reaches the fold, so a malformed
+    /// row outside the query cannot fail the query, whereas handing that same
+    /// row to `aggregate_remote_usage_v1` directly still does. That asymmetry
+    /// is the reason the gate exists: a producer scans a client's whole
+    /// history and must not fail on rows the query could never contain, while
+    /// a caller of the pure API supplies exactly the set it wants folded and
+    /// should hear about anything malformed in it.
     pub(crate) fn accepts(&self, message: &UnifiedMessage) -> bool {
         self.client_passes(message) && self.date_in_range(message.timestamp)
     }
@@ -318,21 +321,22 @@ impl RemoteUsageAccumulator {
         if self.messages > MAX_MESSAGES {
             return Err(RemoteUsageError::LimitExceeded);
         }
-        // The timestamp has to parse before its local date is known, so it is
-        // validated first. Everything after the exclusion below is deferred
-        // until the message is known to be in scope: validating the client,
-        // numerators, or hour bucket of a message that cannot be emitted would
-        // make an unrelated row outside the query fail the whole query, and
-        // would give this API a different error for the same inputs than the
-        // streaming producer, which drops those rows before the fold.
+        // Every supplied row is validated, including one this query excludes.
+        // That is deliberate: the caller of this API hands over exactly the set
+        // it wants folded, so a malformed row in that set is the caller's
+        // error to hear about, whether or not it would have been emitted.
+        //
+        // A streaming producer is not in that position — it hands over a
+        // client's whole history — so it drops out-of-range rows at
+        // `RemoteMessageGate` before they reach here. The two APIs therefore
+        // agree on every emitted byte and differ only on which malformed rows
+        // can raise an error. Do not "reconcile" that by moving the exclusion
+        // earlier: it changes this public API's contract, and the asymmetry is
+        // the point of the gate, not a defect in it.
         validate_message_timestamp(message.timestamp)?;
         let timestamp = timestamp_from_millisecond(message.timestamp)?;
         let local_datetime = timezone.to_datetime(timestamp);
         let local_date = local_datetime.date();
-        let included = gate.client_passes(message);
-        if !included || !(gate.start_date..gate.end_date_exclusive).contains(&local_date) {
-            return Ok(());
-        }
         let date_text = local_date.to_string();
         let offset = timezone.to_offset(timestamp).seconds();
         let bucket = bucket_start(
@@ -344,6 +348,10 @@ impl RemoteUsageAccumulator {
         )?;
         let client = validate_client(&message.client)?;
         let numerators = validate_numerators(message)?;
+        let included = gate.client_passes(message);
+        if !included || !(gate.start_date..gate.end_date_exclusive).contains(&local_date) {
+            return Ok(());
+        }
         let model = normalize_model(&message.model_id)?;
         let provider = normalize_provider(&message.provider_id)?;
         let agent = normalize_agent(&message.client, message.agent.as_deref())?;
