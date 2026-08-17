@@ -151,26 +151,33 @@ fn write_out_of_range_claude_history(home: &Path) {
     fs::write(project.join("conversation.jsonl"), content).unwrap();
 }
 
-fn fresh_pricing(path: &Path, input: f64) {
+/// Both halves, so the snapshot has no outstanding diagnostic. Writing only
+/// the litellm file leaves `Missing` from the openrouter half, which silently
+/// made "loaded" and "changed" snapshots below indistinguishable from absent
+/// ones.
+fn write_pricing(path: &Path, input: f64, age_seconds: u64) {
     fs::create_dir_all(path).unwrap();
-    let now = SystemTime::now()
+    let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs();
+        .as_secs()
+        - age_seconds;
     let mut data = std::collections::HashMap::new();
     data.insert(
-        "codex-test-model".to_owned(),
+        "claude-3-5-sonnet".to_owned(),
         ModelPricing {
             input_cost_per_token: Some(input),
             output_cost_per_token: Some(input),
             ..Default::default()
         },
     );
-    fs::write(
-        path.join("pricing-litellm.json"),
-        serde_json::to_vec(&serde_json::json!({"timestamp": now, "data": data})).unwrap(),
-    )
-    .unwrap();
+    for filename in ["pricing-litellm.json", "pricing-openrouter.json"] {
+        fs::write(
+            path.join(filename),
+            serde_json::to_vec(&serde_json::json!({"timestamp": stamp, "data": data})).unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -205,6 +212,7 @@ fn remote_context_ignores_environment_and_cwd() {
 }
 
 #[test]
+#[serial]
 fn remote_scope_token_rejects_every_effective_input_change() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -248,17 +256,30 @@ fn remote_scope_token_rejects_every_effective_input_change() {
             Err(RemoteSourceContextError::ScopeNotApproved)
         ));
     }
-    let settings = ScannerSettings {
-        opencode_db_paths: vec![roots.path().join("opencode.db")],
-        ..Default::default()
-    };
-    assert!(matches!(
-        RemoteSourceContextV1::new(home, config, data, cache, settings, token),
-        Err(RemoteSourceContextError::ScopeNotApproved)
-    ));
+    // Both `ScannerSettings` fields, so the claim in the name holds for the
+    // whole struct rather than for the one field that was varied.
+    for settings in [
+        ScannerSettings {
+            opencode_db_paths: vec![roots.path().join("opencode.db")],
+            ..Default::default()
+        },
+        ScannerSettings {
+            extra_scan_paths: std::collections::BTreeMap::from([(
+                "codex".to_owned(),
+                vec![roots.path().join("extra")],
+            )]),
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            RemoteSourceContextV1::new(&home, &config, &data, &cache, settings, token),
+            Err(RemoteSourceContextError::ScopeNotApproved)
+        ));
+    }
 }
 
 #[test]
+#[serial]
 fn remote_context_rejects_relative_roots_and_settings() {
     // Absolute roots, so that the scanner-settings rejection below is the one
     // being observed. A literal `/home` is *not* absolute on Windows — it has
@@ -312,20 +333,99 @@ fn remote_context_rejects_relative_roots_and_settings() {
 }
 
 #[test]
+#[serial]
 fn pricing_snapshot_is_injected_deterministic_and_fail_soft() {
     let roots = TempDir::new().unwrap();
     let missing = RemotePricingSnapshot::from_cache_root(roots.path().join("missing"));
     assert_eq!(missing.diagnostic(), Some(RemotePricingDiagnostic::Missing));
     let first = missing.content_digest();
-    fresh_pricing(roots.path(), 0.000001);
-    let loaded = RemotePricingSnapshot::from_cache_root(roots.path());
+
+    let loaded_root = roots.path().join("loaded");
+    write_pricing(&loaded_root, 0.000001, 0);
+    let loaded = RemotePricingSnapshot::from_cache_root(&loaded_root);
+    assert_eq!(loaded.diagnostic(), None);
     assert_ne!(first, loaded.content_digest());
-    fresh_pricing(roots.path(), 0.000002);
-    let changed = RemotePricingSnapshot::from_cache_root(roots.path());
+    write_pricing(&loaded_root, 0.000002, 0);
+    let changed = RemotePricingSnapshot::from_cache_root(&loaded_root);
+    assert_eq!(changed.diagnostic(), None);
     assert_ne!(loaded.content_digest(), changed.content_digest());
+
+    // The degraded shapes the name has always claimed to cover.
+    let stale_root = roots.path().join("stale");
+    write_pricing(&stale_root, 0.000001, 60 * 60 * 24 * 30);
+    assert_eq!(
+        RemotePricingSnapshot::from_cache_root(&stale_root).diagnostic(),
+        Some(RemotePricingDiagnostic::Stale)
+    );
+
+    let corrupt_root = roots.path().join("corrupt");
+    fs::create_dir_all(&corrupt_root).unwrap();
+    fs::write(corrupt_root.join("pricing-litellm.json"), b"not json").unwrap();
+    fs::write(corrupt_root.join("pricing-openrouter.json"), b"not json").unwrap();
+    assert_eq!(
+        RemotePricingSnapshot::from_cache_root(&corrupt_root).diagnostic(),
+        Some(RemotePricingDiagnostic::Corrupt)
+    );
+}
+
+/// Fail-soft, observed on the bundle rather than on a diagnostic: a usable
+/// snapshot prices the fold, and taking it away leaves the cost at zero while
+/// every other number stays exactly where it was.
+#[test]
+#[serial]
+fn pricing_snapshot_absence_zeroes_cost_and_changes_nothing_else() {
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    write_cc_mirror_fixture(&home);
+    let (context, _) = context(
+        &home,
+        &roots.path().join("config"),
+        &roots.path().join("data"),
+        &roots.path().join("source-cache"),
+        ScannerSettings::default(),
+    );
+    let query = query_for_clients(vec!["cc-mirror/kimi-code".to_owned()]);
+
+    let priced_root = roots.path().join("priced");
+    write_pricing(&priced_root, 0.000_01, 0);
+    let priced = aggregate_remote_usage_from_source_v1(
+        &context,
+        &query,
+        &RemotePricingSnapshot::from_cache_root(&priced_root),
+    )
+    .unwrap();
+    assert_eq!(priced.graph.len(), 1);
+    assert!(
+        priced.graph[0].cost_nano_usd > 0,
+        "the snapshot must actually reach the fold"
+    );
+
+    let unpriced = aggregate_remote_usage_from_source_v1(
+        &context,
+        &query,
+        &RemotePricingSnapshot::from_cache_root(roots.path().join("absent")),
+    )
+    .unwrap();
+    assert_eq!(unpriced.graph.len(), 1);
+    assert_eq!(unpriced.graph[0].cost_nano_usd, 0);
+    assert_eq!(
+        (
+            unpriced.graph[0].input_tokens,
+            unpriced.graph[0].output_tokens,
+            unpriced.graph[0].total_tokens,
+            unpriced.graph[0].message_count
+        ),
+        (
+            priced.graph[0].input_tokens,
+            priced.graph[0].output_tokens,
+            priced.graph[0].total_tokens,
+            priced.graph[0].message_count
+        )
+    );
 }
 
 #[test]
+#[serial]
 fn source_fold_uses_production_fixture_and_matches_pure_fold() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -338,9 +438,11 @@ fn source_fold_uses_production_fixture_and_matches_pure_fold() {
     let streamed = aggregate_remote_usage_from_source_v1(&context, &query(), &pricing).unwrap();
     assert!(!streamed.graph.is_empty());
     assert!(streamed.graph.iter().all(|row| row.client == "codex"));
-    assert!(!serde_json::to_string(&streamed)
-        .unwrap()
-        .contains("remote.jsonl"));
+    // Pinning the fixture filename would miss every other path fragment; the
+    // temp root covers the home, config, data, and cache roots at once.
+    let encoded = serde_json::to_string(&streamed).unwrap();
+    assert!(!encoded.contains(&*roots.path().to_string_lossy()));
+    assert!(!encoded.contains("remote.jsonl"));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -373,6 +475,7 @@ fn source_fold_uses_production_fixture_and_matches_pure_fold() {
 }
 
 #[test]
+#[serial]
 fn source_fold_expands_dynamic_cc_mirror_client_for_scanner() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -418,6 +521,7 @@ fn source_fold_expands_dynamic_cc_mirror_client_for_scanner() {
 }
 
 #[test]
+#[serial]
 fn source_fold_synthetic_selector_matches_pure_fold() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -461,6 +565,7 @@ fn source_fold_synthetic_selector_matches_pure_fold() {
 }
 
 #[test]
+#[serial]
 fn source_fold_filters_unrelated_expanded_lane_before_remote_validation() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -509,6 +614,7 @@ fn source_fold_filters_unrelated_expanded_lane_before_remote_validation() {
 }
 
 #[test]
+#[serial]
 fn source_fold_excludes_out_of_range_history_before_remote_validation() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -536,6 +642,7 @@ fn source_fold_excludes_out_of_range_history_before_remote_validation() {
 /// cap is never reached, and a single ancient row that the fold cannot accept
 /// is enough on its own to fail a query whose result could never contain it.
 #[test]
+#[serial]
 fn source_fold_ignores_ancient_invalid_rows_outside_the_query_range() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -571,6 +678,7 @@ fn source_fold_ignores_ancient_invalid_rows_outside_the_query_range() {
 }
 
 #[test]
+#[serial]
 fn source_fold_still_rejects_invalid_rows_inside_the_query_range() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -611,6 +719,7 @@ fn source_fold_still_rejects_invalid_rows_inside_the_query_range() {
 /// registry entry's `data_dir`. Neither is visible to the caller, and neither
 /// can be fingerprinted, because it does not exist until the scan reads it.
 #[test]
+#[serial]
 fn source_scan_ignores_roots_named_by_file_contents() {
     let roots = TempDir::new().unwrap();
     let home = roots.path().join("home");
@@ -665,6 +774,7 @@ fn source_scan_ignores_roots_named_by_file_contents() {
 }
 
 #[test]
+#[serial]
 fn source_errors_are_stable_and_payload_free() {
     let roots = TempDir::new().unwrap();
     let (context, _) = context(
@@ -683,41 +793,126 @@ fn source_errors_are_stable_and_payload_free() {
     )
     .unwrap_err();
     assert_eq!(error, RemoteSourceUsageError::InvalidTimeZone);
-    assert!(!error.to_string().contains("private-path"));
-    assert!(!format!("{error:?}").contains("private-path"));
+
+    // Every variant, against the real root this context was built from. The
+    // enum is field-less today, so this holds by construction — which is
+    // exactly why it is worth pinning: adding a `String` payload to any
+    // variant, the one change that would leak, breaks this test.
+    let root = roots.path().to_string_lossy().into_owned();
+    for error in [
+        RemoteSourceUsageError::SourceUnavailable,
+        RemoteSourceUsageError::InvalidQuery,
+        RemoteSourceUsageError::IncompatibleTzdb,
+        RemoteSourceUsageError::InvalidTimeZone,
+        RemoteSourceUsageError::InvalidTimestamp,
+        RemoteSourceUsageError::InvalidText,
+        RemoteSourceUsageError::InvalidNumerator,
+        RemoteSourceUsageError::LimitExceeded,
+    ] {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private-path"), "{rendered}");
+            assert!(!rendered.contains(&root), "{rendered}");
+            assert!(!rendered.contains(std::path::MAIN_SEPARATOR), "{rendered}");
+        }
+    }
 }
 
 #[test]
+#[serial]
 fn public_bundle_schema_remains_allowlisted() {
-    let encoded = serde_json::to_value(
-        aggregate_remote_usage_v1(
-            &[],
-            &RemoteUsageQueryV1 {
-                clients: vec![],
-                start_date: "2040-01-01".into(),
-                end_date_exclusive: "2040-01-02".into(),
-                timezone: "UTC".into(),
-                tzdb_revision: "2026c".into(),
-            },
-        )
-        .unwrap(),
+    // Built from a real message rather than an empty slice: with empty arrays
+    // the four record types serialize to nothing, so adding a field to any of
+    // them — the change this guard exists to catch — left it green.
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    write_cc_mirror_fixture(&home);
+    let (context, _) = context(
+        &home,
+        &roots.path().join("config"),
+        &roots.path().join("data"),
+        &roots.path().join("source-cache"),
+        ScannerSettings::default(),
+    );
+    let bundle = aggregate_remote_usage_from_source_v1(
+        &context,
+        &query_for_clients(vec!["cc-mirror/kimi-code".to_owned()]),
+        &RemotePricingSnapshot::from_cache_root(roots.path().join("pricing")),
     )
     .unwrap();
-    let keys: BTreeSet<&str> = encoded
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
+    let encoded = serde_json::to_value(&bundle).unwrap();
+
+    let keys = |value: &serde_json::Value| -> BTreeSet<String> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
     assert_eq!(
-        keys,
-        BTreeSet::from([
-            "tzdbRevision",
-            "graph",
-            "models",
-            "hourly",
-            "agents",
-            "saturated"
-        ])
+        keys(&encoded),
+        BTreeSet::from(
+            [
+                "tzdbRevision",
+                "graph",
+                "models",
+                "hourly",
+                "agents",
+                "saturated"
+            ]
+            .map(str::to_owned)
+        )
     );
+
+    let common = [
+        "client",
+        "model",
+        "provider",
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "reasoningTokens",
+        "totalTokens",
+        "messageCount",
+        "turnCount",
+        "costNanoUsd",
+    ];
+    let expected_records = [
+        (
+            "graph",
+            BTreeSet::from_iter(common.iter().copied().chain(["date"]).map(str::to_owned)),
+        ),
+        (
+            "models",
+            BTreeSet::from_iter(
+                common
+                    .iter()
+                    .copied()
+                    .chain(["durationMillis", "timedTokens", "sampleCount"])
+                    .map(str::to_owned),
+            ),
+        ),
+        (
+            "hourly",
+            BTreeSet::from_iter(
+                common
+                    .iter()
+                    .copied()
+                    .chain(["bucketStartUnixMs", "utcOffsetSeconds"])
+                    .map(str::to_owned),
+            ),
+        ),
+        (
+            "agents",
+            BTreeSet::from_iter(common.iter().copied().chain(["agent"]).map(str::to_owned)),
+        ),
+    ];
+    for (page, expected) in expected_records {
+        let records = encoded[page].as_array().unwrap();
+        assert!(!records.is_empty(), "{page} must carry a record to check");
+        for record in records {
+            assert_eq!(keys(record), expected, "{page}");
+        }
+    }
 }
