@@ -12419,10 +12419,10 @@ mod tests {
                 performance.total_duration_ms, 7_000,
                 "{phase} total duration"
             );
-            assert_eq!(performance.timed_tokens, 170, "{phase} timed tokens");
+            assert_eq!(performance.timed_tokens, 160, "{phase} timed tokens");
             assert_eq!(performance.sample_count, 3, "{phase} samples");
             assert_eq!(performance.token_coverage, 1.0, "{phase} coverage");
-            let expected_ms_per_1k = 7_000.0 * 1_000.0 / 170.0;
+            let expected_ms_per_1k = 7_000.0 * 1_000.0 / 160.0;
             assert!(
                 (performance.ms_per_1k_tokens.unwrap() - expected_ms_per_1k).abs() < f64::EPSILON,
                 "{phase} milliseconds per 1K tokens"
