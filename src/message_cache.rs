@@ -825,7 +825,14 @@ fn parser_version(client: ClientId) -> u32 {
         // These clients accumulated parser-only invalidations under the old
         // global schema. Their independent counters start from those histories
         // so future changes have an obvious local version to increment.
-        ClientId::Codex => 4,
+        // 5: Codex's `reasoning_output_tokens` is a subset of `output_tokens`
+        // and is now split out of the `output` bucket instead of being carried
+        // in both (see `CodexTotals::into_tokens`). Without this bump, an
+        // unchanged transcript that already has a format-4 shard would keep
+        // returning the pre-split `UnifiedMessage`, so historical rows would
+        // stay double-priced. Codex has no retention path, so the bump only
+        // makes the cache cold — everything is recoverable by re-parsing.
+        ClientId::Codex => 5,
         ClientId::Jcode => 4,
         ClientId::Copilot => 4,
         ClientId::Grok => 3,
@@ -4488,7 +4495,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_parser_versions_are_identity_scoped() {
-        assert_eq!(parser_version(ClientId::Codex), 4);
+        assert_eq!(parser_version(ClientId::Codex), 5);
         assert_eq!(parser_version(ClientId::Jcode), 4);
         assert_eq!(parser_version(ClientId::Copilot), 4);
         assert_eq!(parser_version(ClientId::Grok), 3);
