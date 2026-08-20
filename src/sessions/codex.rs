@@ -1852,6 +1852,25 @@ mod tests {
     }
 
     #[test]
+    fn test_into_tokens_clamps_reasoning_to_output() {
+        // A row claiming more reasoning than output must not push the output
+        // bucket negative — and, the part that actually bites, must not
+        // inflate the total either. Without the `.min(self.output)` clamp the
+        // reasoning bucket keeps the bogus 999 while output floors at 0, so
+        // `total()` reports 1099 for a row whose own output was 10.
+        let totals = CodexTotals {
+            input: 100,
+            output: 10,
+            cached: 0,
+            reasoning: 999,
+        };
+        let tokens = totals.into_tokens();
+        assert_eq!(tokens.output, 0);
+        assert_eq!(tokens.reasoning, 10);
+        assert_eq!(tokens.total(), 110);
+    }
+
+    #[test]
     fn test_token_count_ignores_negative_fallback_usage_in_baseline() {
         let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
         let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":5},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":5}}}}"#;
