@@ -647,6 +647,44 @@ pub struct HourlyReport {
     pub processing_time_ms: u32,
 }
 
+/// One raw message inside a `get_window_usage` window. No bucketing: the
+/// consumer folds it however it needs (see `tb_core_ffi::window_usage`),
+/// which is why this carries every field a fold might want rather than the
+/// pre-aggregated shape `HourlyUsage` uses.
+#[derive(Debug, Clone)]
+pub struct WindowUsageMessage {
+    pub timestamp: i64,
+    pub client: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub cost: f64,
+    pub is_turn_start: bool,
+}
+
+/// Local addition, not an upstream port (see `vendor/tokscale-core/UPSTREAM.md`
+/// for the ledger this repo otherwise tracks against). Windows has no
+/// historical per-message export; this local function fills that gap using
+/// the same `scan_messages_streaming` driver `get_hourly_report_inner` already
+/// uses, so it inherits that driver's cross-file dedup for free instead of
+/// going through the plain `parse_local_unified_messages_with_pricing` path,
+/// which explicitly warns new report consumers off it.
+pub struct WindowUsage {
+    pub messages: Vec<WindowUsageMessage>,
+    /// Messages with no usable timestamp (`timestamp <= 0`). These cannot be
+    /// placed inside `[from_ms, until_ms)` at all, so they are counted here
+    /// instead of silently dropped — matching `HourlyUsage`'s convention that
+    /// `timestamp > 0` gates the "has a real timestamp" case elsewhere in
+    /// this file. Scoped to the whole corpus, not to the window, since an
+    /// undated message's membership in the window is unknowable.
+    pub undated_count: u32,
+    pub processing_time_ms: u32,
+}
+
 pub fn get_home_dir_string(home_dir_option: &Option<String>) -> Result<String, String> {
     home_dir_option
         .as_ref()
@@ -3288,6 +3326,126 @@ async fn get_hourly_report_inner(
     Ok(HourlyReport {
         entries,
         total_cost,
+        processing_time_ms: start.elapsed().as_millis() as u32,
+    })
+}
+
+/// Raw per-message rows inside `[from_ms, until_ms)`. See `WindowUsage` for
+/// why this is a local addition rather than an upstream port.
+///
+/// No `modified_after` pruning: unlike the live tail (`UsageTailer::tick`),
+/// the window here is caller-chosen and can reach arbitrarily far back, so
+/// every source file has to be considered. This is the expensive path the
+/// `tb_window_usage` doc comment and its cache exist for.
+pub async fn get_window_usage(
+    options: ReportOptions,
+    from_ms: i64,
+    until_ms: i64,
+) -> Result<WindowUsage, String> {
+    get_window_usage_inner(None, options, from_ms, until_ms).await
+}
+
+pub async fn get_window_usage_with_source_context(
+    context: &ResolvedLocalSourceContext,
+    options: ReportOptions,
+    from_ms: i64,
+    until_ms: i64,
+) -> Result<WindowUsage, String> {
+    get_window_usage_inner(Some(context), options, from_ms, until_ms).await
+}
+
+async fn get_window_usage_inner(
+    context: Option<&ResolvedLocalSourceContext>,
+    options: ReportOptions,
+    from_ms: i64,
+    until_ms: i64,
+) -> Result<WindowUsage, String> {
+    let start = Instant::now();
+
+    let home_dir = context
+        .map(|context| context.home_dir().to_string_lossy().into_owned())
+        .map(Ok)
+        .unwrap_or_else(|| get_home_dir_string(&options.home_dir))?;
+    let (clients, exact) = split_report_client_filter(&options);
+
+    let pricing = load_pricing_for_local_parse_with_context(context).await;
+    let year_prefix = options.year.as_ref().map(|y| format!("{}-", y));
+    let since_s = options.since.clone();
+    let until_s = options.until.clone();
+    // Same date-string prefilter `get_hourly_report_inner` applies, plus the
+    // window/undated split: a message either lands in the window, is counted
+    // as undated, or (outside both) is dropped by the filter before it ever
+    // reaches the fold below — same shape as msg_filter elsewhere in this file.
+    let msg_filter = |m: &UnifiedMessage| -> bool {
+        if !report_message_client_passes(&exact, m) {
+            return false;
+        }
+        if let Some(ref yp) = year_prefix {
+            if !m.date.starts_with(yp.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref s) = since_s {
+            if m.date.as_str() < s.as_str() {
+                return false;
+            }
+        }
+        if let Some(ref u) = until_s {
+            if m.date.as_str() > u.as_str() {
+                return false;
+            }
+        }
+        m.timestamp <= 0 || (m.timestamp >= from_ms && m.timestamp < until_ms)
+    };
+
+    let mut messages: Vec<WindowUsageMessage> = Vec::new();
+    let mut undated_count: u32 = 0;
+    let mut fold = |msg: &UnifiedMessage| {
+        if msg.timestamp <= 0 {
+            undated_count = undated_count.saturating_add(1);
+            return;
+        }
+        messages.push(WindowUsageMessage {
+            timestamp: msg.timestamp,
+            client: msg.client.clone(),
+            provider_id: msg.provider_id.clone(),
+            model_id: msg.model_id.clone(),
+            input: msg.tokens.input,
+            output: msg.tokens.output,
+            cache_read: msg.tokens.cache_read,
+            cache_write: msg.tokens.cache_write,
+            reasoning: msg.tokens.reasoning,
+            cost: msg.cost,
+            is_turn_start: msg.is_turn_start,
+        });
+    };
+    if let Some(context) = context {
+        scan_messages_streaming_with_context(
+            context,
+            &clients,
+            pricing.as_deref(),
+            None,
+            &msg_filter,
+            &mut fold,
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        scan_messages_streaming(
+            &home_dir,
+            &clients,
+            pricing.as_deref(),
+            options.use_env_roots,
+            &options.scanner_settings,
+            &msg_filter,
+            &mut fold,
+        );
+    }
+
+    messages.sort_by_key(|m| m.timestamp);
+
+    Ok(WindowUsage {
+        messages,
+        undated_count,
         processing_time_ms: start.elapsed().as_millis() as u32,
     })
 }
