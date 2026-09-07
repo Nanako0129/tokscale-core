@@ -18,6 +18,12 @@ cargo test --locked --offline
 cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 ```
 
+## Contributing
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers what this repository owns, the
+verification gates, the two cache-invalidation counters and when each applies,
+the `UPSTREAM.md` ledger requirement, and the test conventions.
+
 ## Upstream and license
 
 The upstream implementation is [junhoyeo/tokscale](https://github.com/junhoyeo/tokscale).
