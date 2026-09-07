@@ -57,6 +57,7 @@ So the question is not "which counter", it is **whose payload can no longer be d
 | What changed | Counter | Why |
 |---|---|---|
 | One client's parse semantics or its own serialized state (e.g. `CodexParseState` under `codex_incremental`) | `parser_version(client)` | The namespace check rejects that client's shards before its payload is decoded; every other namespace keeps its cache |
+| The synthetic namespace's parse output (Octofriend SQLite) | the `parser_version` inside `CacheIdentity::synthetic()` | Synthetic is not a `ClientId`, so it is absent from `parser_version(client)` and carries its own hard-coded version instead. Same scoping, different place to edit |
 | The envelope itself, or a type shared by every namespace's payload (`CachedSourceEntry`, `UnifiedMessage`, `TokenBreakdown`) | `CACHE_FORMAT_VERSION` | No per-client check can help — every payload would be decoded against the new struct |
 
 Reach for `parser_version` first and justify the global bump, not the other way round. `CACHE_FORMAT_VERSION` is the wider blast radius and, for one namespace, it is not recoverable.
