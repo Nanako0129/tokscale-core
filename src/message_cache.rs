@@ -859,9 +859,9 @@ fn parser_version(client: ClientId) -> u32 {
         // serialized entries gained the field, not just Claude's.
         //
         // 3: tool_result input tokens are no longer char-estimated. A bump
-        // here used to discard retained-only turns that no re-parse can
-        // rebuild; `into_retained_history` now carries them across, which is
-        // what makes this bump and any future one safe.
+        // here used to discard retained-only turns; an entry behind the
+        // current version is now kept and read through `retainable_history`.
+        // A `CACHE_FORMAT_VERSION` bump alongside one still discards them.
         ClientId::Claude => 3,
         _ => 1,
     }
@@ -971,12 +971,7 @@ impl CachedSourceEntry {
     /// Behind the current parser version, in a namespace whose history is
     /// worth carrying across the gap.
     fn is_migratable(&self) -> bool {
-        !self.identity_is_current()
-            && CacheIdentity::current_for_namespace(&self.parser_namespace).is_some_and(|current| {
-                self.parser_version < current.parser_version
-                    && oldest_migratable_parser_version(&self.parser_namespace)
-                        .is_some_and(|oldest| self.parser_version >= oldest)
-            })
+        parser_version_is_migratable(&self.parser_namespace, self.parser_version)
     }
 
     /// Carry forward keyed messages an entry already on disk holds for this
@@ -1188,13 +1183,28 @@ fn retained_history_key_filter(namespace: &str) -> Option<fn(&str) -> bool> {
 /// 2 -> 3 layout change: its payload has one field fewer than the current
 /// struct, whatever the format gate says.
 fn oldest_migratable_parser_version(namespace: &str) -> Option<u32> {
-    (namespace == ClientId::Claude.as_str()).then_some(2)
+    // 2 is Claude's: version 1 predates `retained_keys` and the format 2 -> 3
+    // layout change, so its payload is a field short. Others bring their own.
+    retained_history_key_filter(namespace).map(|_| 2)
+}
+
+/// Whether an entry on `parser_version` can be carried across to the current
+/// one. A downgrade cannot: this build cannot know what a newer one wrote.
+fn parser_version_is_migratable(namespace: &str, parser_version: u32) -> bool {
+    CacheIdentity::current_for_namespace(namespace)
+        .is_some_and(|current| parser_version < current.parser_version)
+        && oldest_migratable_parser_version(namespace)
+            .is_some_and(|oldest| parser_version >= oldest)
 }
 
 /// The envelope is deliberately independent from CachedSourceEntry's binary
 /// layout. A parser version can therefore be checked before its payload is
 /// deserialized, so (for example) a CodexParseState layout change cannot make
 /// Claude's independently sharded cache unreadable.
+///
+/// For a retaining namespace the version here is the writer's, not a claim
+/// about the contents: a rewrite carries migratable entries forward at their
+/// own version. Readers judge `CachedSourceEntry::parser_version` instead.
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedShardEnvelope {
     format_version: u32,
@@ -1320,25 +1330,17 @@ impl SourceMessageCache {
                     ShardReadStatus::Loaded(entries) => {
                         for entry in entries {
                             let key = CacheKey::from_entry(&entry);
-                            if key.shard() != shard_key {
+                            // A migratable entry is kept: `get` hides it from
+                            // readers that want a whole source, and it holds
+                            // the only copy of turns compaction took out of
+                            // the file. Keeping it leaves the shard clean.
+                            if key.shard() == shard_key
+                                && (entry.identity_is_current() || entry.is_migratable())
+                            {
+                                cache.entries.insert(key, entry);
+                            } else {
                                 cache.rewrite_shards.insert(shard_key.clone());
-                                continue;
                             }
-                            if entry.identity_is_current() {
-                                cache.entries.insert(key, entry);
-                                continue;
-                            }
-                            // Kept, not dropped: `get` already hides it from
-                            // every reader that wants a whole source, and it
-                            // holds the only copy of turns a compacting
-                            // rewrite took out of the file. No rewrite is
-                            // queued, or the shard would be re-serialized on
-                            // every run with nothing to change.
-                            if entry.is_migratable() {
-                                cache.entries.insert(key, entry);
-                                continue;
-                            }
-                            cache.rewrite_shards.insert(shard_key.clone());
                         }
                     }
                     ShardReadStatus::Missing => {}
@@ -1386,12 +1388,10 @@ impl SourceMessageCache {
         identity: CacheIdentity,
         path: &Path,
     ) -> &[UnifiedMessage] {
+        // No version filter: `load` admits only current-or-migratable entries
+        // and `insert` builds current ones.
         self.entries
             .get(&CacheKey::new(identity, path))
-            .filter(|entry| {
-                entry.parser_namespace == identity.namespace
-                    && (entry.identity_is_current() || entry.is_migratable())
-            })
             .map_or(&[][..], |entry| entry.messages.as_slice())
     }
 
@@ -1682,6 +1682,8 @@ pub(crate) fn retained_state_change_token(
                             let mut records: HashMap<CacheKey, Vec<[u8; 32]>> = HashMap::new();
                             for entry in entries {
                                 let entry_key = CacheKey::from_entry(&entry);
+                                // Current only: a pre-bump entry reaches no
+                                // report until a re-parse moves this token.
                                 if !entry.identity_is_current() || entry_key.shard() != shard_key {
                                     continue;
                                 }
@@ -1867,12 +1869,10 @@ fn read_shard_with_limit(
     }
     // An older version of a retaining namespace is decoded rather than
     // dropped; each entry carries its own version, so the caller judges them
-    // one at a time. A downgrade stays stale.
-    let readable = envelope.parser_version == identity.parser_version
-        || (envelope.parser_version < identity.parser_version
-            && oldest_migratable_parser_version(&envelope.parser_namespace)
-                .is_some_and(|oldest| envelope.parser_version >= oldest));
-    if !readable {
+    // one at a time.
+    if envelope.parser_version != identity.parser_version
+        && !parser_version_is_migratable(&envelope.parser_namespace, envelope.parser_version)
+    {
         return ShardReadStatus::Stale;
     }
 
@@ -3983,11 +3983,11 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
-    /// With no retained history there is nothing a re-parse cannot produce, so
-    /// the entry goes rather than lingering under a matching fingerprint.
+    /// A pre-bump entry is hidden from `get`, so every reader re-parses, while
+    /// its messages stay reachable for retention to draw on.
     #[test]
     #[serial_test::serial]
-    fn test_a_claude_entry_with_no_retained_history_migrates_to_nothing() {
+    fn test_a_pre_bump_entry_is_hidden_from_get_but_its_history_is_not() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
         let source = write_temp_file(b"claude transcript\n");
@@ -5254,7 +5254,7 @@ mod tests {
         assert_eq!(parser_version(ClientId::Hermes), 1);
         assert_eq!(parser_version(ClientId::Trae), 1);
         // 2 was RET-CLAUDE-001 retention; 3 dropped the tool_result char
-        // estimate, which `into_retained_history` makes non-lossy.
+        // estimate, which keeping migratable entries makes non-lossy.
         assert_eq!(parser_version(ClientId::Claude), 3);
         assert_eq!(CacheIdentity::synthetic().parser_version, 1);
         for client in ClientId::iter() {
