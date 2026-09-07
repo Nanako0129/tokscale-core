@@ -1360,18 +1360,20 @@ impl SourceMessageCache {
                                 cache.entries.insert(key, entry);
                                 continue;
                             }
+                            // A migrated entry stays on its old version, so it
+                            // arrives here on every load. Queuing a rewrite
+                            // for it would re-serialize the shard every run
+                            // with nothing to change; the save merge strips
+                            // the on-disk copy the same way whenever a real
+                            // dirty key touches this shard.
+                            if entry.is_migratable() {
+                                if let Some(entry) = entry.into_retained_history() {
+                                    cache.migrated_keys.insert(key.clone());
+                                    cache.entries.insert(key, entry);
+                                    continue;
+                                }
+                            }
                             cache.rewrite_shards.insert(shard_key.clone());
-                            if !entry.is_migratable() {
-                                continue;
-                            }
-                            // Not marked dirty: the save merge migrates the
-                            // on-disk copy anyway, and forcing a write here
-                            // would let this stripped entry overwrite a
-                            // complete one another process just stored.
-                            if let Some(entry) = entry.into_retained_history() {
-                                cache.migrated_keys.insert(key.clone());
-                                cache.entries.insert(key, entry);
-                            }
                         }
                     }
                     ShardReadStatus::Missing => {}
@@ -4076,6 +4078,10 @@ mod tests {
         // A scan that never reaches this path: load, then save.
         let mut cache = SourceMessageCache::load();
         assert!(cache.is_migrated(claude, source.path()));
+        assert!(
+            !cache.dirty,
+            "migration is idempotent, so it must not queue a rewrite on every run"
+        );
         cache.save_if_dirty();
 
         let reloaded = SourceMessageCache::load();
