@@ -1033,11 +1033,9 @@ struct ClaudeToolResultContext<'a> {
     workspace_label: Option<String>,
     sidechain_agent: Option<String>,
     /// Whether char-based token estimation may be used as a fallback when no
-    /// explicit tool-result token count is present. Always `false` in
-    /// production: a tool result goes into the next request's prompt, so the
-    /// following assistant turn's API-reported usage already covers the same
-    /// text and an estimate counts it twice. Explicit tool-result token
-    /// counts, which third-party clients do write, are still honored.
+    /// explicit tool-result token count is present. Nothing sets it true: the
+    /// next assistant turn's usage already covers the same text, so an
+    /// estimate counts it twice. The flag stays to match upstream's shape.
     allow_char_estimate: bool,
 }
 
@@ -2329,6 +2327,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].provider_id, "anthropic");
         assert_eq!(messages[0].tokens.input, 8);
         assert_eq!(messages[0].timestamp, 1_779_876_000_100);
     }
@@ -2620,9 +2619,8 @@ mod tests {
 
     #[test]
     fn test_reported_input_is_not_inflated_by_tool_result_text() {
-        // The shape a real transcript has: no token metadata on the tool
-        // result, and the following turn reporting that same text under
-        // cache_creation_input_tokens.
+        // A real transcript's shape: no metadata on the tool result, and the
+        // next turn reporting that text under cache_creation_input_tokens.
         let content = r#"{"type":"user","timestamp":"2026-04-01T10:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_001","content":"fn main() { println!(\"hello\"); }"}]}}
 {"type":"assistant","timestamp":"2026-04-01T10:00:01.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"cache_creation_input_tokens":1551,"cache_read_input_tokens":88518,"output_tokens":367}}}"#;
         let (_dir, path) = create_project_file(content, "myproject", "ses_inflation1122.jsonl");
@@ -2638,8 +2636,7 @@ mod tests {
 
     #[test]
     fn test_bare_transcript_with_explicit_tool_result_tokens_is_counted() {
-        // Nothing is char-estimated, but explicit tool-result token counts
-        // (e.g. reported by the originating client) are still honored.
+        // Nothing is char-estimated, but an explicit count is still honored.
         let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","input_tokens":42,"tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}"#;
         let (_dir, path) = create_transcript_file(content, "ses_explicit112233445566778899.jsonl");
 
@@ -2655,8 +2652,6 @@ mod tests {
 
     #[test]
     fn test_transcripts_dir_under_project_keeps_its_workspace() {
-        // A `transcripts/` directory nested under a resolvable `projects/<key>/`
-        // path still attributes its workspace.
         let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","input_tokens":42,"tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}"#;
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir
