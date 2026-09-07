@@ -96,7 +96,9 @@ A fixture that several test lanes must agree on belongs in [`tests/fixtures/`](t
 
 For tests that need an isolated environment, [`tests/filter_parity.rs`](tests/filter_parity.rs) is the reference: an `EnvGuard` that restores every variable on drop, two temporary homes, `TOKSCALE_PRICING_CACHE_ONLY=1` so a network pricing fetch cannot make the run non-deterministic, and `#[serial_test::serial]` because process environment is shared.
 
-A parser-output change also wants a **same-fingerprint stale-cache regression** — a test proving an entry already in the cache picks up the new behaviour. Cold-parse tests cannot show that, and it is the case real users are in.
+A parser-output change that **does** invalidate wants a **same-fingerprint stale-cache regression** — a test proving an entry already in the cache picks up the new behaviour. Cold-parse tests cannot show that, and it is the case real users are in.
+
+A change that deliberately does not invalidate — the default for Claude, step 1 above — cannot pass that test and must not be pushed into a lossy bump to satisfy it. A same-fingerprint lookup returns the cached messages without running the parser at all, which is the whole point of deferring. Pin the decision instead: assert that a cached entry keeps its old value at an unchanged fingerprint, and that the new behaviour appears once the fingerprint changes.
 
 Prefer an assertion on observed behaviour over a scan of source text. A property that can be moved to another line or another function will be moved around a text scan, and the scan will keep passing.
 
