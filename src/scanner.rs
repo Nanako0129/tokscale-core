@@ -71,6 +71,19 @@ pub struct ScannerSettings {
     /// so the JSON stays stable and human-editable.
     #[serde(default)]
     pub extra_scan_paths: BTreeMap<String, Vec<PathBuf>>,
+    /// Per-client scan roots to drop, matched as path prefixes after every
+    /// other root has been discovered.
+    ///
+    /// Exists because a root reaches the scan by several independent routes —
+    /// the client's declared path, this settings file's `extra_scan_paths`,
+    /// the built-in extras, a `.cc-mirror` variant naming an absolute config
+    /// directory, a cowork session tree — and a caller that owns only one of
+    /// those registries cannot keep a directory out of the scan by editing it.
+    /// A prefix here removes the directory whichever route found it.
+    ///
+    /// Keys use the same public client ids as [`Self::extra_scan_paths`].
+    #[serde(default)]
+    pub excluded_scan_paths: BTreeMap<String, Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,6 +801,53 @@ fn grok_unified_log_path_from_updates(updates_path: &Path) -> Option<PathBuf> {
         .find(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("sessions"))
         .and_then(Path::parent)
         .map(|grok_home| grok_home.join("logs/unified.jsonl"))
+}
+
+/// Drop every scan task at or under a caller-excluded prefix for its client.
+///
+/// Applied to the assembled task list rather than inside
+/// [`push_unique_scan_task_with_pattern`], because that is the only place every
+/// discovery route has finished contributing: the declared root, the settings
+/// file's extra paths, the built-in extras, the `.cc-mirror` variants and the
+/// cowork trees all push through the helper at different points, and a guard
+/// placed at any one of them would let the others past.
+///
+/// Both sides are canonicalized, for the same reason the helper canonicalizes
+/// its dedup key at the call below: a symlinked directory would otherwise walk
+/// straight past a string comparison.
+fn retain_unexcluded_scan_tasks(
+    tasks: &mut Vec<(ClientId, String, &'static str)>,
+    scanner_settings: &ScannerSettings,
+) {
+    if scanner_settings.excluded_scan_paths.is_empty() {
+        return;
+    }
+    let excluded: Vec<(ClientId, PathBuf)> = scanner_settings
+        .excluded_scan_paths
+        .iter()
+        .filter_map(|(client_str, paths)| ClientId::from_str(client_str).map(|id| (id, paths)))
+        .flat_map(|(client_id, paths)| {
+            paths
+                .iter()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(move |path| {
+                    (
+                        client_id,
+                        std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()),
+                    )
+                })
+        })
+        .collect();
+    if excluded.is_empty() {
+        return;
+    }
+    tasks.retain(|(client_id, path, _)| {
+        let path = PathBuf::from(path);
+        let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+        !excluded
+            .iter()
+            .any(|(excluded_id, prefix)| excluded_id == client_id && resolved.starts_with(prefix))
+    });
 }
 
 fn push_unique_scan_task(
@@ -1831,6 +1891,8 @@ fn scan_all_clients_with_env_strategy_inner(
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Codebuff, root);
         }
     }
+
+    retain_unexcluded_scan_tasks(&mut tasks, scanner_settings);
 
     // Execute scans in parallel
     let scan_results: Vec<(ClientId, Vec<PathBuf>)> = tasks
@@ -2885,6 +2947,149 @@ mod tests {
         assert_eq!(
             serialized["extraScanPaths"]["gemini"][0],
             serde_json::json!("/tmp/imports/gemini/tmp")
+        );
+    }
+
+    /// Build a Claude fixture whose transcripts arrive by the three routes an
+    /// excluded directory can be reached through, and return the home plus the
+    /// two configured directories.
+    ///
+    /// - `work-d` is in `extra_scan_paths` *and* named by a `.cc-mirror` variant
+    /// - `work-e` is in `extra_scan_paths` only
+    /// - `work-d/sub` is named by its own variant, so it sits under `work-d`
+    ///   but below no registry entry
+    fn claude_exclusion_fixture(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let dir_d = home.join("work-d");
+        let dir_e = home.join("work-e");
+        let dir_sub = dir_d.join("sub");
+        for root in [&home.join(".claude"), &dir_d, &dir_e, &dir_sub] {
+            let projects = root.join("projects").join("proj");
+            fs::create_dir_all(&projects).unwrap();
+            File::create(projects.join("session.jsonl")).unwrap();
+        }
+        for (name, config_dir) in [("v1", &dir_d), ("v2", &dir_sub)] {
+            let variant = home.join(".cc-mirror").join(name);
+            fs::create_dir_all(&variant).unwrap();
+            // Build the JSON rather than formatting it, matching every other
+            // variant fixture in this crate. A Windows `configDir` is full of
+            // backslashes and each one introduces a JSON escape: written into
+            // a string literal by hand, `C:\Users\...` parses as the invalid
+            // escapes `\U`, `\A`, ... the variant is skipped, and the fixture
+            // goes inert on Windows while staying green everywhere else.
+            fs::write(
+                variant.join("variant.json"),
+                serde_json::json!({ "configDir": config_dir }).to_string(),
+            )
+            .unwrap();
+        }
+        (dir_d, dir_e, dir_sub)
+    }
+
+    fn claude_scan_roots(home: &Path, settings: &ScannerSettings) -> Vec<PathBuf> {
+        scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+            settings,
+        )
+        .get(ClientId::Claude)
+        .to_vec()
+    }
+
+    fn registry_for(dirs: [&Path; 2]) -> BTreeMap<String, Vec<PathBuf>> {
+        BTreeMap::from([(
+            "claude".to_string(),
+            dirs.iter()
+                .flat_map(|dir| [dir.join("projects"), dir.join("transcripts")])
+                .collect(),
+        )])
+    }
+
+    /// The exclusion has to drop a directory whichever route found it: through
+    /// `extra_scan_paths`, through a `.cc-mirror` variant naming it, and
+    /// through a variant naming a directory *below* it.
+    ///
+    /// Three routes and two directories rather than one of each, because a
+    /// directory reachable two ways dedups into a single task at
+    /// `push_unique_scan_task_with_pattern` and cannot tell the routes apart —
+    /// `work-e` is registry-only, so a leak through the registry is visible on
+    /// its own.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_drop_every_route_to_a_claude_directory() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (dir_d, dir_e, dir_sub) = claude_exclusion_fixture(home);
+        let extra_scan_paths = registry_for([&dir_d, &dir_e]);
+
+        let without = claude_scan_roots(
+            home,
+            &ScannerSettings {
+                extra_scan_paths: extra_scan_paths.clone(),
+                ..Default::default()
+            },
+        );
+        for expected in [&dir_d, &dir_e, &dir_sub] {
+            assert!(
+                without.iter().any(|path| path.starts_with(expected)),
+                "fixture is inert: nothing scanned under {expected:?}, got {without:?}"
+            );
+        }
+
+        let with = claude_scan_roots(
+            home,
+            &ScannerSettings {
+                extra_scan_paths,
+                excluded_scan_paths: BTreeMap::from([(
+                    "claude".to_string(),
+                    vec![dir_d.clone(), dir_e.clone()],
+                )]),
+                ..Default::default()
+            },
+        );
+        for excluded in [&dir_d, &dir_e, &dir_sub] {
+            assert!(
+                !with.iter().any(|path| path.starts_with(excluded)),
+                "excluded directory still scanned: {excluded:?} in {with:?}"
+            );
+        }
+        assert!(
+            with.iter().any(|path| path.starts_with(home.join(".claude"))),
+            "the exclusion removed the primary root too: {with:?}"
+        );
+    }
+
+    /// An exclusion naming only the registered roots misses a `.cc-mirror`
+    /// variant that resolves below a configured directory but below no registry
+    /// entry — which is why the caller excludes config directories and
+    /// registered roots both, rather than picking one registry to trust.
+    #[test]
+    #[serial]
+    fn test_excluding_registered_roots_alone_misses_a_nested_mirror_root() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (dir_d, dir_e, dir_sub) = claude_exclusion_fixture(home);
+        let extra_scan_paths = registry_for([&dir_d, &dir_e]);
+
+        let roots = claude_scan_roots(
+            home,
+            &ScannerSettings {
+                excluded_scan_paths: BTreeMap::from([(
+                    "claude".to_string(),
+                    extra_scan_paths["claude"].clone(),
+                )]),
+                extra_scan_paths,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            roots.iter().any(|path| path.starts_with(&dir_sub)),
+            "expected the nested mirror root to survive a registry-only exclusion, got {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|path| path.starts_with(&dir_e)),
+            "the registered root should still have been excluded: {roots:?}"
         );
     }
 
