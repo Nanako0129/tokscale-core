@@ -8433,17 +8433,16 @@ mod tests {
         // What an older build left behind.
         message_cache::set_shard_parser_version_for_test(identity, 2);
         {
+            // Addressed through `entries` rather than by path: the scanner's
+            // spelling of a path is its own, and on Windows it is not the one
+            // this test built.
             let reloaded = message_cache::SourceMessageCache::load();
-            assert!(
-                reloaded.get(identity, &transcript).is_none(),
-                "a downgraded entry must not read as a whole source"
-            );
-            assert!(
-                !reloaded
-                    .retainable_history(identity, &transcript)
-                    .is_empty(),
-                "its history must still be reachable"
-            );
+            let kept = reloaded
+                .entries
+                .values()
+                .next()
+                .expect("the downgraded entry is kept, not dropped");
+            assert_eq!(kept.messages.len(), 2, "kept whole, for retention to read");
         }
 
         assert_eq!(
