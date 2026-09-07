@@ -157,13 +157,6 @@ fn is_workflow_journal(path: &Path) -> bool {
         .any(|ancestor| ancestor.file_name().and_then(|n| n.to_str()) == Some("subagents"))
 }
 
-fn is_in_transcripts_dir(path: &Path) -> bool {
-    path.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        == Some("transcripts")
-}
-
 /// Locate the parent main-session JSONL for a sidechain transcript.
 ///
 /// Nested layout: `.../projects/<key>/<session>/subagents/agent-X.jsonl`
@@ -466,15 +459,6 @@ pub fn parse_claude_file_with_cache_and_home(
         .unwrap_or("unknown")
         .to_string();
 
-    // Bare transcripts (files under ~/.claude/transcripts/ with no workspace/project
-    // context) must not use char-based token estimation. These files may be written by
-    // third-party tools (e.g. OpenCode) that log tool outputs without Claude API usage
-    // metadata. Estimating tokens from their content would double-count usage already
-    // tracked by the originating client's own parser. Explicit tool-result token counts
-    // are still honored — only the char-based fallback estimate is suppressed.
-    let is_bare_transcript =
-        is_in_transcripts_dir(path) && cc_mirror_metadata.is_none() && workspace_key.is_none();
-
     let fallback_timestamp = file_modified_timestamp_ms(path);
 
     if path.extension().and_then(|s| s.to_str()) == Some("json") {
@@ -565,7 +549,7 @@ pub fn parse_claude_file_with_cache_and_home(
                         workspace_key: workspace_key.clone(),
                         workspace_label: workspace_label.clone(),
                         sidechain_agent: sidechain_agent.clone(),
-                        allow_char_estimate: !is_bare_transcript,
+                        allow_char_estimate: false,
                     },
                 );
 
@@ -1049,10 +1033,11 @@ struct ClaudeToolResultContext<'a> {
     workspace_label: Option<String>,
     sidechain_agent: Option<String>,
     /// Whether char-based token estimation may be used as a fallback when no
-    /// explicit tool-result token count is present. Bare transcripts (see
-    /// `is_bare_transcript`) set this to `false` to avoid double-counting
-    /// usage already tracked by the originating client's own parser, while
-    /// still honoring any explicit tool-result token counts.
+    /// explicit tool-result token count is present. Always `false` in
+    /// production: a tool result goes into the next request's prompt, so the
+    /// following assistant turn's API-reported usage already covers the same
+    /// text and an estimate counts it twice. Explicit tool-result token
+    /// counts, which third-party clients do write, are still honored.
     allow_char_estimate: bool,
 }
 
@@ -2054,8 +2039,9 @@ mod tests {
         // every key this classifier calls stable across an in-place rewrite,
         // so a future parser change that introduces another file-scoped shape
         // has to trip here rather than silently widening what is retained.
+        // The tool result needs an explicit count to reach the parser at all.
         let content = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}
-{"type":"user","timestamp":"2024-12-01T10:00:01.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"tu_001","content":"file contents here"}]}}
+{"type":"user","timestamp":"2024-12-01T10:00:01.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"tu_001","content":"file contents here","input_tokens":5}]}}
 {"type":"assistant","timestamp":"2024-12-01T10:00:02.000Z","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":80}}}"#;
 
         let file = create_test_file(content);
@@ -2212,8 +2198,8 @@ mod tests {
 
         assert_eq!(
             messages.len(),
-            4,
-            "Should include 3 assistant messages plus 1 tool-result input message"
+            3,
+            "Should include 3 assistant messages; the tool_result carries no explicit tokens"
         );
         let assistant_messages: Vec<_> = messages
             .iter()
@@ -2300,28 +2286,16 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_output_counts_as_input() {
+    fn test_tool_result_without_explicit_tokens_is_not_counted() {
         let content = r#"{"type":"user","timestamp":"2026-05-27T10:00:00.000Z","message":{"model":"anthropic/claude-4-6-sonnet","content":[{"type":"tool_result","tool_use_id":"toolu_input","tool_output":{"output":"abcdefghijklmnop"}}]}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
-        assert_eq!(messages[0].provider_id, "anthropic");
-        assert_eq!(messages[0].tokens.input, 4);
-        assert_eq!(messages[0].tokens.output, 0);
-        assert_eq!(messages[0].tokens.cache_read, 0);
-        assert_eq!(messages[0].tokens.cache_write, 0);
-        let expected_dedup_key = format!(
-            "claude:tool_result:{}:tool_result:toolu_input",
-            messages[0].session_id
+        assert!(
+            messages.is_empty(),
+            "the next assistant turn's usage already covers this text"
         );
-        assert_eq!(
-            messages[0].dedup_key.as_deref(),
-            Some(expected_dedup_key.as_str())
-        );
-        assert_eq!(messages[0].message_count, 0);
     }
 
     #[test]
@@ -2347,8 +2321,8 @@ mod tests {
 
     #[test]
     fn test_tool_result_duplicate_uses_max_input_tokens() {
-        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnop"}}}
-{"type":"tool_result","timestamp":"2026-05-27T10:00:00.100Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd"}}}"#;
+        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}}}
+{"type":"tool_result","timestamp":"2026-05-27T10:00:00.100Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_stream","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd","input_tokens":8}}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
@@ -2361,7 +2335,7 @@ mod tests {
 
     #[test]
     fn test_tool_result_repeated_in_same_record_is_not_counted_twice() {
-        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop"}},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop"}}]}}"#;
+        let content = r#"{"type":"tool_result","timestamp":"2026-05-27T10:00:00.000Z","model":"anthropic/claude-4-6-sonnet","tool_result":{"tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_same","tool_output":{"output":"abcdefghijklmnop","input_tokens":4}}]}}"#;
 
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
@@ -2371,7 +2345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_prefers_input_token_metadata_over_char_estimate() {
+    fn test_tool_result_with_explicit_token_metadata_is_counted() {
         let content = r#"{"type":"user","timestamp":"2026-05-27T10:00:00.000Z","message":{"model":"claude-sonnet-4-6","content":[{"type":"tool_result","tool_use_id":"toolu_metadata","tool_output":{"output":"abcdefghijklmnopqrstuvwxyzabcd","input_tokens":3}}]}}"#;
 
         let file = create_test_file(content);
@@ -2379,6 +2353,16 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.input, 3);
+        assert_eq!(messages[0].tokens.output, 0);
+        let expected_dedup_key = format!(
+            "claude:tool_result:{}:tool_result:toolu_metadata",
+            messages[0].session_id
+        );
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some(expected_dedup_key.as_str())
+        );
+        assert_eq!(messages[0].message_count, 0);
     }
 
     #[test]
@@ -2614,7 +2598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_project_transcript_with_tool_outputs_is_estimated() {
+    fn test_project_transcript_with_tool_outputs_is_not_estimated() {
         let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_001","content":[{"type":"text","text":"fn main() { println!(\"hello\"); }"}]}]}}"#;
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir
@@ -2629,15 +2613,33 @@ mod tests {
         let messages = parse_claude_file(&path);
 
         assert!(
-            !messages.is_empty(),
-            "project transcripts with tool results should still estimate tokens"
+            messages.is_empty(),
+            "the assistant turn that follows already bills this content"
         );
     }
 
     #[test]
+    fn test_reported_input_is_not_inflated_by_tool_result_text() {
+        // The shape a real transcript has: no token metadata on the tool
+        // result, and the following turn reporting that same text under
+        // cache_creation_input_tokens.
+        let content = r#"{"type":"user","timestamp":"2026-04-01T10:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_001","content":"fn main() { println!(\"hello\"); }"}]}}
+{"type":"assistant","timestamp":"2026-04-01T10:00:01.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"cache_creation_input_tokens":1551,"cache_read_input_tokens":88518,"output_tokens":367}}}"#;
+        let (_dir, path) = create_project_file(content, "myproject", "ses_inflation1122.jsonl");
+
+        let messages = parse_claude_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 2);
+        assert_eq!(messages[0].tokens.cache_write, 1551);
+        assert_eq!(messages[0].tokens.cache_read, 88518);
+        assert_eq!(messages[0].tokens.output, 367);
+    }
+
+    #[test]
     fn test_bare_transcript_with_explicit_tool_result_tokens_is_counted() {
-        // Bare transcripts must not char-estimate tokens, but explicit tool-result
-        // token counts (e.g. reported by the originating client) should still be honored.
+        // Nothing is char-estimated, but explicit tool-result token counts
+        // (e.g. reported by the originating client) are still honored.
         let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","input_tokens":42,"tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}"#;
         let (_dir, path) = create_transcript_file(content, "ses_explicit112233445566778899.jsonl");
 
@@ -2652,11 +2654,10 @@ mod tests {
     }
 
     #[test]
-    fn test_transcripts_dir_under_project_is_not_treated_as_bare() {
-        // A `transcripts/` directory nested under a resolvable `projects/<key>/` path
-        // must not be treated as a bare transcript, since its workspace can still be
-        // attributed. Char-based estimation should proceed normally.
-        let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}"#;
+    fn test_transcripts_dir_under_project_keeps_its_workspace() {
+        // A `transcripts/` directory nested under a resolvable `projects/<key>/`
+        // path still attributes its workspace.
+        let content = r#"{"type":"tool_result","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","input_tokens":42,"tool_output":{"output":"fn main() {\n    println!(\"Hello, world!\");\n}\n"}}"#;
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir
             .path()
@@ -2669,10 +2670,7 @@ mod tests {
 
         let messages = parse_claude_file(&path);
 
-        assert!(
-            !messages.is_empty(),
-            "transcripts nested under a resolvable projects/<key>/ path should still be estimated"
-        );
+        assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].workspace_key, Some("myproject".to_string()));
     }
 
