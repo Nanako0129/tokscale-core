@@ -2970,12 +2970,15 @@ mod tests {
         for (name, config_dir) in [("v1", &dir_d), ("v2", &dir_sub)] {
             let variant = home.join(".cc-mirror").join(name);
             fs::create_dir_all(&variant).unwrap();
+            // Build the JSON rather than formatting it, matching every other
+            // variant fixture in this crate. A Windows `configDir` is full of
+            // backslashes and each one introduces a JSON escape: written into
+            // a string literal by hand, `C:\Users\...` parses as the invalid
+            // escapes `\U`, `\A`, ... the variant is skipped, and the fixture
+            // goes inert on Windows while staying green everywhere else.
             fs::write(
                 variant.join("variant.json"),
-                format!(
-                    "{{\"configDir\":\"{}\"}}",
-                    config_dir.to_string_lossy()
-                ),
+                serde_json::json!({ "configDir": config_dir }).to_string(),
             )
             .unwrap();
         }
