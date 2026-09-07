@@ -1820,38 +1820,46 @@ fn read_shard(path: &Path, identity: CacheIdentity) -> ShardReadStatus {
     read_shard_with_limit(path, identity, MAX_CACHE_SHARD_BYTES)
 }
 
-/// Rewrite the shard holding `source` to an older parser version, envelope and
-/// entries alike. Stands in for what an older build left behind.
+/// Rewrite every shard of `identity`'s namespace to an older parser version,
+/// envelope and entries alike. Stands in for what an older build left behind.
+///
+/// Sweeps the namespace directory rather than deriving one shard from a source
+/// path: the caller's spelling of that path need not match the one the scanner
+/// stored, and on Windows it does not.
 #[cfg(test)]
-pub(crate) fn set_shard_parser_version_for_test(
-    identity: CacheIdentity,
-    source: &Path,
-    parser_version: u32,
-) {
-    let shard_key = CacheKey::new(identity, source).shard();
-    let path = shard_path(
-        &cache_shard_dir().expect("a sandboxed cache root"),
-        &shard_key,
-    );
-    let file = File::open(&path).expect("the shard the caller just wrote");
-    let mut envelope: CachedShardEnvelope = bincode::options()
-        .with_limit(MAX_CACHE_SHARD_BYTES)
-        .deserialize_from(BufReader::new(file))
-        .expect("a shard this build wrote");
-    let mut entries: Vec<CachedSourceEntry> = bincode::options()
-        .with_limit(MAX_CACHE_SHARD_BYTES)
-        .deserialize(&envelope.payload)
-        .expect("a payload this build wrote");
-    for entry in entries.iter_mut() {
-        entry.parser_version = parser_version;
+pub(crate) fn set_shard_parser_version_for_test(identity: CacheIdentity, parser_version: u32) {
+    let dir = cache_shard_dir()
+        .expect("a sandboxed cache root")
+        .join(identity.namespace);
+    let shards: Vec<PathBuf> = fs::read_dir(&dir)
+        .expect("the namespace directory the caller just populated")
+        .filter_map(Result::ok)
+        .filter(|entry| parse_shard_filename(&entry.file_name()).is_some())
+        .map(|entry| entry.path())
+        .collect();
+    assert!(!shards.is_empty(), "no shard was written under {dir:?}");
+
+    for path in shards {
+        let file = File::open(&path).unwrap();
+        let mut envelope: CachedShardEnvelope = bincode::options()
+            .with_limit(MAX_CACHE_SHARD_BYTES)
+            .deserialize_from(BufReader::new(file))
+            .expect("a shard this build wrote");
+        let mut entries: Vec<CachedSourceEntry> = bincode::options()
+            .with_limit(MAX_CACHE_SHARD_BYTES)
+            .deserialize(&envelope.payload)
+            .expect("a payload this build wrote");
+        for entry in entries.iter_mut() {
+            entry.parser_version = parser_version;
+        }
+        envelope.payload = bincode::options().serialize(&entries).unwrap();
+        envelope.parser_version = parser_version;
+        let mut writer = BufWriter::new(File::create(&path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &envelope)
+            .unwrap();
+        writer.flush().unwrap();
     }
-    envelope.payload = bincode::options().serialize(&entries).unwrap();
-    envelope.parser_version = parser_version;
-    let mut writer = BufWriter::new(File::create(&path).unwrap());
-    bincode::options()
-        .serialize_into(&mut writer, &envelope)
-        .unwrap();
-    writer.flush().unwrap();
 }
 
 fn read_shard_with_limit(

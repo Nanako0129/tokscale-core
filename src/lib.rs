@@ -8443,7 +8443,7 @@ mod tests {
         );
 
         // What an older build left behind.
-        message_cache::set_shard_parser_version_for_test(identity, &transcript, 2);
+        message_cache::set_shard_parser_version_for_test(identity, 2);
         {
             let reloaded = message_cache::SourceMessageCache::load();
             assert!(
@@ -8514,7 +8514,7 @@ mod tests {
         assert_eq!(total_output(None), 10 + 50);
 
         let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
-        message_cache::set_shard_parser_version_for_test(identity, &transcript, 2);
+        message_cache::set_shard_parser_version_for_test(identity, 2);
 
         let future_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
