@@ -1103,12 +1103,15 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             };
         };
 
+        // A migrated entry is history, not a whole source; its fingerprint
+        // proves nothing about the live half.
+        let migrated = source_cache.is_migrated(identity, path);
         let fingerprint = match fingerprint_status {
             message_cache::FingerprintStatus::Unchanged => {
                 let Some(cached) = cached else {
                     unreachable!("an uncached source always builds a complete fingerprint")
                 };
-                if !cached.messages.is_empty() {
+                if !migrated && !cached.messages.is_empty() {
                     return CachedParseOutcome {
                         messages: cached_messages(cached, pricing),
                         cache_entry: None,
@@ -1125,7 +1128,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         };
 
         if let Some(cached) = cached {
-            if cached.fingerprint == fingerprint && !cached.messages.is_empty() {
+            if !migrated && cached.fingerprint == fingerprint && !cached.messages.is_empty() {
                 return CachedParseOutcome {
                     messages: cached_messages(cached, pricing),
                     cache_entry: None,
@@ -3441,20 +3444,24 @@ fn claude_stage_a(
             cached.map(|entry| &entry.fingerprint),
             Some(claude_home),
         );
+    // A migrated entry holds history only. Re-parse, and retention puts it
+    // back from the cached copy.
+    let migrated = source_cache.is_migrated(identity, path);
     let (cache_hit, fingerprint) = match fingerprint_status {
         Some(message_cache::FingerprintStatus::Unchanged) => {
             let cached =
                 cached.expect("an uncached Claude source always builds a complete fingerprint");
-            if cached.messages.is_empty() {
+            if migrated || cached.messages.is_empty() {
                 (false, Some(cached.fingerprint.clone()))
             } else {
                 (true, None)
             }
         }
         Some(message_cache::FingerprintStatus::Changed(fingerprint)) => {
-            let cache_hit = cached.is_some_and(|entry| {
-                entry.fingerprint == fingerprint && !entry.messages.is_empty()
-            });
+            let cache_hit = !migrated
+                && cached.is_some_and(|entry| {
+                    entry.fingerprint == fingerprint && !entry.messages.is_empty()
+                });
             (cache_hit, Some(fingerprint))
         }
         None => (false, None),
@@ -8361,6 +8368,169 @@ mod tests {
             local_after.messages.iter().map(|m| m.output).sum::<i64>(),
             model_report.total_output,
             "parse_local_clients and get_model_report must agree on the same source tree"
+        );
+    }
+
+    /// A bump has to reach a transcript that no longer changes without
+    /// discarding the turns only the cache holds (RET-CLAUDE-001). Both halves
+    /// are asserted; the retained one alone would pass an implementation that
+    /// dropped the live side.
+    #[test]
+    #[serial_test::serial]
+    fn test_a_parser_version_bump_rebuilds_live_messages_and_keeps_retained_ones() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("session.jsonl");
+
+        let live = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_live","message":{"id":"msg_live","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let dropped = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_dropped","message":{"id":"msg_dropped","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+
+        let local_options = || LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        };
+        let total_output = || {
+            parse_local_clients(local_options())
+                .unwrap()
+                .messages
+                .iter()
+                .map(|m| m.output)
+                .sum::<i64>()
+        };
+
+        std::fs::write(&transcript, format!("{live}\n{dropped}\n")).unwrap();
+        assert_eq!(total_output(), 10 + 50);
+
+        // From here the cache is the only copy of the second turn.
+        std::fs::write(&transcript, format!("{live}\n")).unwrap();
+        assert_eq!(total_output(), 10 + 50, "retention keeps the dropped turn");
+
+        // Corrupt the live half in the cache: a hit replays 999, a re-parse
+        // reads 10 off the transcript. That gap is what the last assertion
+        // measures.
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        let mut cache = message_cache::SourceMessageCache::load();
+        assert_eq!(cache.entries.len(), 1);
+        let mut entry = cache.entries.values().next().unwrap().clone();
+        for message in entry.messages.iter_mut() {
+            if message.dedup_key.as_deref() == Some("msg_live:req_live") {
+                message.tokens.output = 999;
+            }
+        }
+        cache.insert(entry);
+        cache.save_if_dirty();
+        assert_eq!(
+            total_output(),
+            999 + 50,
+            "an unchanged transcript is served from cache, corruption and all"
+        );
+
+        // What an older build left behind.
+        message_cache::set_shard_parser_version_for_test(identity, &transcript, 2);
+        {
+            let reloaded = message_cache::SourceMessageCache::load();
+            assert!(
+                reloaded.is_migrated(identity, &transcript),
+                "the downgraded shard must load as history to carry across"
+            );
+            assert_eq!(
+                reloaded.get(identity, &transcript).unwrap().messages.len(),
+                1,
+                "only the retained turn survives the migration"
+            );
+        }
+
+        assert_eq!(
+            total_output(),
+            10 + 50,
+            "the live turn is re-parsed from source and the retained one survives"
+        );
+    }
+
+    /// The migrated entry has to outlive a scan that never reaches its source:
+    /// the load queues the shard for rewrite either way, and the history is
+    /// gone if the rewrite does not carry it. `modified_after` prunes the file
+    /// before the parse, so nothing re-parses it and nothing marks it dirty.
+    #[test]
+    #[serial_test::serial]
+    fn test_a_scan_that_skips_the_source_does_not_erase_its_migrated_history() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let claude_dir = source_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("session.jsonl");
+
+        let live = r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_live","message":{"id":"msg_live","model":"claude-3-5-sonnet","usage":{"input_tokens":9,"output_tokens":10}}}"#;
+        let dropped = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_dropped","message":{"id":"msg_dropped","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+
+        let local_options = |modified_after| LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after,
+        };
+        let total_output = |modified_after| {
+            parse_local_clients(local_options(modified_after))
+                .unwrap()
+                .messages
+                .iter()
+                .map(|m| m.output)
+                .sum::<i64>()
+        };
+
+        std::fs::write(&transcript, format!("{live}\n{dropped}\n")).unwrap();
+        assert_eq!(total_output(None), 10 + 50);
+        std::fs::write(&transcript, format!("{live}\n")).unwrap();
+        assert_eq!(total_output(None), 10 + 50);
+
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        message_cache::set_shard_parser_version_for_test(identity, &transcript, 2);
+
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        assert_eq!(
+            total_output(Some(future_ms)),
+            0,
+            "sanity: the threshold really does prune the transcript"
+        );
+
+        assert_eq!(
+            total_output(None),
+            10 + 50,
+            "the skipped scan must not have taken the history with it"
         );
     }
 
