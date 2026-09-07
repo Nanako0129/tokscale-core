@@ -48,28 +48,34 @@ Do not skip the Windows leg on the grounds that the change looks platform-neutra
 
 Parsed messages are cached on disk. **A change to parser output that does not invalidate the cache reaches nobody**: existing users keep the old numbers until each source file happens to change on its own. A test that parses a fresh source proves nothing about this.
 
-There are two version counters in [`src/message_cache.rs`](src/message_cache.rs), differing in how much they invalidate.
+A shard on disk is a `CachedShardEnvelope`: `format_version`, `parser_namespace`, `parser_version`, and `payload` — the entries as an opaque byte vector. `read_shard_with_limit` decodes the envelope, then checks those three fields in order, and only decodes the payload if all three pass.
 
-| Counter | Use it when | Scope |
+That ordering is a deliberate design, stated at the envelope's definition: the envelope is independent of the payload's binary layout **so that a parser version can be checked before the payload is deserialized**. One client's serialized layout change therefore cannot make another client's shards unreadable.
+
+So the question is not "which counter", it is **whose payload can no longer be decoded**:
+
+| What changed | Counter | Why |
 |---|---|---|
-| `parser_version(client)` | One client's parse semantics changed | That client's shards; others keep their cache |
-| `CACHE_FORMAT_VERSION` | The serialized layout or a cross-client type changed | Every namespace's shards |
+| One client's parse semantics or its own serialized state (e.g. `CodexParseState` under `codex_incremental`) | `parser_version(client)` | The namespace check rejects that client's shards before its payload is decoded; every other namespace keeps its cache |
+| The envelope itself, or a type shared by every namespace's payload (`CachedSourceEntry`, `UnifiedMessage`, `TokenBreakdown`) | `CACHE_FORMAT_VERSION` | No per-client check can help — every payload would be decoded against the new struct |
 
-For most clients an invalidation is merely cold: the shard is rejected, the source is re-parsed, and the same messages come back.
+Reach for `parser_version` first and justify the global bump, not the other way round. `CACHE_FORMAT_VERSION` is the wider blast radius and, for one namespace, it is not recoverable.
 
 ### Claude is not merely cold
 
-For a namespace covered by `retained_history_key_filter` — Claude — the cache holds turns the live file **no longer contains**. Claude Code rewrites transcripts in place on compact, and retention carries the dropped turns forward. The comment on `CachedSourceEntry::messages` states the consequence directly: re-parsing will not reproduce them, the cache is the only copy.
+For most clients an invalidation is cold: the shard is rejected, the source is re-parsed, the same messages come back.
 
-So for Claude, "invalidate" means "delete". This applies to **both** counters, and the reason is the order of the checks on the shard read path (`read_shard` into `read_shard_with_limit`): the format-version gate rejects the shard before namespace or parser version is even looked at. A `CACHE_FORMAT_VERSION` bump is therefore strictly wider than a Claude `parser_version` bump — it rejects Claude's shards too, plus everyone else's. It is not a way around the trap; it is the same trap with a larger blast radius. The test `test_non_claude_legacy_shard_is_rejected_by_the_format_bump_before_its_payload_is_decoded` exists to pin exactly that ordering.
+Not for Claude. For a namespace covered by `retained_history_key_filter` — only Claude — the cache holds turns the live file **no longer contains**. Claude Code rewrites transcripts in place on compact, and retention carries the dropped turns forward. The comment on `CachedSourceEntry::messages` says it outright: re-parsing will not reproduce them, the cache is the only copy.
+
+So for Claude, "invalidate" means "delete", and that applies to **both** counters. The format-version gate runs before the namespace is even looked at, so a global bump rejects Claude's shards along with everyone else's — it is not a way around a Claude `parser_version` bump, it is the same loss with a larger radius. The test `test_non_claude_legacy_shard_is_rejected_by_the_format_bump_before_its_payload_is_decoded` pins that ordering.
+
+The practical consequence: a change to a shared payload type has no scoped option. The retained-history cost is forced, and the pull request should say so plainly rather than let it be discovered afterwards.
 
 What to do with a Claude parser change that needs to reach existing users:
 
 1. **Ask whether it does.** A fix that applies as each transcript next changes may be acceptable; active files converge on their own, and nothing is lost. This is the default and it needs no counter bump at all.
 2. **If it must reach stale entries, that is an explicit data-loss decision.** Say so in the pull request, in those words, and let the maintainer weigh the correction against the retained history it costs.
 3. **Or write a migration** that decodes the old shard, preserves the entries named by `retained_keys`, and rewrites them in the new format. That is real code, not a version bump, and it is the only option that gets both.
-
-A layout change to a shared type leaves no choice — the format bump is mandatory, because the old bytes cannot be decoded against the new struct. Note that this makes the retained-history cost unavoidable for that change, which is worth saying out loud in the pull request rather than discovering later.
 
 Also note that `parser_version` values are local state. They diverged from upstream long ago, so during any re-vendor they are re-applied, never copied across. `UPSTREAM.md` carries the comparison table and the reason.
 
