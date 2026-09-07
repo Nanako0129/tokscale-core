@@ -90,7 +90,9 @@ This is not bookkeeping for its own sake. A patch missing from the ledger is a p
 
 ## Tests
 
-Fixtures are built inline as raw strings against a `TempDir`, not stored as files — see the `#[cfg(test)]` modules in [`src/sessions/`](src/sessions) for the established shape. Build JSON with `serde_json::json!` rather than formatting it by hand, for the reason in [Verification](#verification).
+Most fixtures are built inline as raw strings against a `TempDir` — see the `#[cfg(test)]` modules in [`src/sessions/`](src/sessions) for the established shape. Build JSON with `serde_json::json!` rather than formatting it by hand, for the reason in [Verification](#verification).
+
+A fixture that several test lanes must agree on belongs in [`tests/fixtures/`](tests/fixtures) and is pulled in with `include_str!`. `codex_duration_timing.jsonl` is the example: three consumers share it (`src/sessions/codex.rs`, `src/lib.rs`, `tests/remote_source_report.rs`), and inlining a copy per lane would let them drift apart silently.
 
 For tests that need an isolated environment, [`tests/filter_parity.rs`](tests/filter_parity.rs) is the reference: an `EnvGuard` that restores every variable on drop, two temporary homes, `TOKSCALE_PRICING_CACHE_ONLY=1` so a network pricing fetch cannot make the run non-deterministic, and `#[serial_test::serial]` because process environment is shared.
 
