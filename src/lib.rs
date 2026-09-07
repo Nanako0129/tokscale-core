@@ -1103,15 +1103,12 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             };
         };
 
-        // A migrated entry is history, not a whole source; its fingerprint
-        // proves nothing about the live half.
-        let migrated = source_cache.is_migrated(identity, path);
         let fingerprint = match fingerprint_status {
             message_cache::FingerprintStatus::Unchanged => {
                 let Some(cached) = cached else {
                     unreachable!("an uncached source always builds a complete fingerprint")
                 };
-                if !migrated && !cached.messages.is_empty() {
+                if !cached.messages.is_empty() {
                     return CachedParseOutcome {
                         messages: cached_messages(cached, pricing),
                         cache_entry: None,
@@ -1128,7 +1125,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         };
 
         if let Some(cached) = cached {
-            if !migrated && cached.fingerprint == fingerprint && !cached.messages.is_empty() {
+            if cached.fingerprint == fingerprint && !cached.messages.is_empty() {
                 return CachedParseOutcome {
                     messages: cached_messages(cached, pricing),
                     cache_entry: None,
@@ -1150,14 +1147,12 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         } = history
         {
             if cacheable {
-                if let Some(cached) = cached {
-                    retained_keys = retain_observed_messages(
-                        &mut messages,
-                        &cached.messages,
-                        key_is_globally_stable,
-                        refresh_retained,
-                    );
-                }
+                retained_keys = retain_observed_messages(
+                    &mut messages,
+                    source_cache.retainable_history(identity, path),
+                    key_is_globally_stable,
+                    refresh_retained,
+                );
             }
         }
         let cache_entry = if messages.is_empty() || !cacheable {
@@ -3444,24 +3439,20 @@ fn claude_stage_a(
             cached.map(|entry| &entry.fingerprint),
             Some(claude_home),
         );
-    // A migrated entry holds history only. Re-parse, and retention puts it
-    // back from the cached copy.
-    let migrated = source_cache.is_migrated(identity, path);
     let (cache_hit, fingerprint) = match fingerprint_status {
         Some(message_cache::FingerprintStatus::Unchanged) => {
             let cached =
                 cached.expect("an uncached Claude source always builds a complete fingerprint");
-            if migrated || cached.messages.is_empty() {
+            if cached.messages.is_empty() {
                 (false, Some(cached.fingerprint.clone()))
             } else {
                 (true, None)
             }
         }
         Some(message_cache::FingerprintStatus::Changed(fingerprint)) => {
-            let cache_hit = !migrated
-                && cached.is_some_and(|entry| {
-                    entry.fingerprint == fingerprint && !entry.messages.is_empty()
-                });
+            let cache_hit = cached.is_some_and(|entry| {
+                entry.fingerprint == fingerprint && !entry.messages.is_empty()
+            });
             (cache_hit, Some(fingerprint))
         }
         None => (false, None),
@@ -3816,10 +3807,7 @@ where
                     if let Some(fingerprint) = fingerprint {
                         retained_keys = retain_observed_messages(
                             &mut msgs,
-                            source_cache
-                                .get(claude_identity, path)
-                                .map(|entry| entry.messages.as_slice())
-                                .unwrap_or(&[]),
+                            source_cache.retainable_history(claude_identity, path),
                             sessions::claudecode::dedup_key_is_globally_stable,
                             &mut |message, live_agent| {
                                 sessions::claudecode::refresh_retained_message_context(
@@ -8447,13 +8435,14 @@ mod tests {
         {
             let reloaded = message_cache::SourceMessageCache::load();
             assert!(
-                reloaded.is_migrated(identity, &transcript),
-                "the downgraded shard must load as history to carry across"
+                reloaded.get(identity, &transcript).is_none(),
+                "a downgraded entry must not read as a whole source"
             );
-            assert_eq!(
-                reloaded.get(identity, &transcript).unwrap().messages.len(),
-                1,
-                "only the retained turn survives the migration"
+            assert!(
+                !reloaded
+                    .retainable_history(identity, &transcript)
+                    .is_empty(),
+                "its history must still be reachable"
             );
         }
 

@@ -968,33 +968,6 @@ impl CachedSourceEntry {
             .is_some_and(|identity| identity.parser_version == self.parser_version)
     }
 
-    /// Strip an older entry down to the messages re-parsing cannot rebuild;
-    /// the rest comes back from source under the new parser's rules.
-    ///
-    /// `parser_version` is left behind on purpose. It is the only record that
-    /// survives a save, and without it a later load would serve these messages
-    /// as the whole source. Idempotent.
-    fn into_retained_history(mut self) -> Option<Self> {
-        self.messages.retain(|message| {
-            message
-                .dedup_key
-                .as_ref()
-                .is_some_and(|key| self.retained_keys.contains(key))
-        });
-        if self.messages.is_empty() {
-            return None;
-        }
-        self.retained_keys = self
-            .messages
-            .iter()
-            .filter_map(|message| message.dedup_key.clone())
-            .collect();
-        // Indices into `messages`, so filtering invalidates them. Only codex
-        // populates them and it has no retention, so these are already empty.
-        self.fallback_timestamp_indices = Vec::new();
-        Some(self)
-    }
-
     /// Behind the current parser version, in a namespace whose history is
     /// worth carrying across the gap.
     fn is_migratable(&self) -> bool {
@@ -1243,11 +1216,6 @@ pub(crate) struct SourceMessageCache {
     dirty_keys: HashSet<CacheKey>,
     deleted_keys: HashMap<CacheKey, DeletionReason>,
     rewrite_shards: HashSet<CacheShardKey>,
-    /// Entries stripped to history by `into_retained_history`, so a reader
-    /// must re-parse rather than trust the fingerprint. Process-local because
-    /// a field on `CachedSourceEntry` would force `CACHE_FORMAT_VERSION`,
-    /// whose gate deletes the history this carries across.
-    migrated_keys: HashSet<CacheKey>,
     cache_root: Option<PathBuf>,
     cache_root_is_resolved: bool,
 }
@@ -1360,18 +1328,15 @@ impl SourceMessageCache {
                                 cache.entries.insert(key, entry);
                                 continue;
                             }
-                            // A migrated entry stays on its old version, so it
-                            // arrives here on every load. Queuing a rewrite
-                            // for it would re-serialize the shard every run
-                            // with nothing to change; the save merge strips
-                            // the on-disk copy the same way whenever a real
-                            // dirty key touches this shard.
+                            // Kept, not dropped: `get` already hides it from
+                            // every reader that wants a whole source, and it
+                            // holds the only copy of turns a compacting
+                            // rewrite took out of the file. No rewrite is
+                            // queued, or the shard would be re-serialized on
+                            // every run with nothing to change.
                             if entry.is_migratable() {
-                                if let Some(entry) = entry.into_retained_history() {
-                                    cache.migrated_keys.insert(key.clone());
-                                    cache.entries.insert(key, entry);
-                                    continue;
-                                }
+                                cache.entries.insert(key, entry);
+                                continue;
                             }
                             cache.rewrite_shards.insert(shard_key.clone());
                         }
@@ -1400,25 +1365,34 @@ impl SourceMessageCache {
         let key = CacheKey::from_entry(&entry);
         self.entries.insert(key.clone(), entry);
         self.deleted_keys.remove(&key);
-        self.migrated_keys.remove(&key);
         self.dirty_keys.insert(key);
         self.dirty = true;
     }
 
-    /// Whether this entry holds only history, so a reader must re-parse.
-    pub(crate) fn is_migrated(&self, identity: CacheIdentity, path: &Path) -> bool {
-        self.migrated_keys.contains(&CacheKey::new(identity, path))
-    }
-
     pub(crate) fn get(&self, identity: CacheIdentity, path: &Path) -> Option<&CachedSourceEntry> {
         let key = CacheKey::new(identity, path);
-        let migrated = self.migrated_keys.contains(&key);
         self.entries.get(&key).filter(|entry| {
             entry.parser_namespace == identity.namespace
-                // A migrated entry is still on its old version by design, and
-                // retention reads its messages through here.
-                && (entry.parser_version == identity.parser_version || migrated)
+                && entry.parser_version == identity.parser_version
         })
+    }
+
+    /// What retention may carry forward for `path`, including from an entry an
+    /// older parser version wrote. `get` hides those, since they are not a
+    /// source this build would produce, but their history is still the only
+    /// copy of turns a compacting rewrite took out of the file.
+    pub(crate) fn retainable_history(
+        &self,
+        identity: CacheIdentity,
+        path: &Path,
+    ) -> &[UnifiedMessage] {
+        self.entries
+            .get(&CacheKey::new(identity, path))
+            .filter(|entry| {
+                entry.parser_namespace == identity.namespace
+                    && (entry.identity_is_current() || entry.is_migratable())
+            })
+            .map_or(&[][..], |entry| entry.messages.as_slice())
     }
 
     pub(crate) fn remove(&mut self, identity: CacheIdentity, path: &Path) {
@@ -1542,17 +1516,9 @@ impl SourceMessageCache {
                 match read_shard_with_limit(&final_path, identity, max_shard_bytes) {
                     ShardReadStatus::Loaded(entries) => entries
                         .into_iter()
-                        // A pre-bump entry on disk keeps its history here too,
-                        // or a path this scan never reached loses it.
-                        .filter_map(|entry| {
-                            if entry.identity_is_current() {
-                                Some(entry)
-                            } else if entry.is_migratable() {
-                                entry.into_retained_history()
-                            } else {
-                                None
-                            }
-                        })
+                        // A pre-bump entry on disk is kept here too, or a path
+                        // this scan never reached loses its history.
+                        .filter(|entry| entry.identity_is_current() || entry.is_migratable())
                         .map(|entry| (CacheKey::from_entry(&entry), entry))
                         .filter(|(key, _)| key.shard() == shard_key)
                         .collect(),
@@ -4043,14 +4009,18 @@ mod tests {
 
         assert!(
             matches!(read_shard(&path, claude), ShardReadStatus::Loaded(_)),
-            "the shard decodes; the entry inside is what has nothing to carry"
+            "the shard decodes even though its entries are behind"
         );
         let loaded = SourceMessageCache::load();
         assert!(
             loaded.get(claude, source.path()).is_none(),
-            "nothing to retain means nothing to keep"
+            "a pre-bump entry is not a source this build would produce"
         );
-        assert!(!loaded.is_migrated(claude, source.path()));
+        assert_eq!(
+            loaded.retainable_history(claude, source.path()).len(),
+            1,
+            "its messages are still the only copy retention could draw on"
+        );
 
         restore_cache_env(prev_env);
     }
@@ -4085,28 +4055,20 @@ mod tests {
 
         // A scan that never reaches this path: load, then save.
         let mut cache = SourceMessageCache::load();
-        assert!(cache.is_migrated(claude, source.path()));
         assert!(
             !cache.dirty,
-            "migration is idempotent, so it must not queue a rewrite on every run"
+            "a pre-bump entry is kept as it is, so there is nothing to rewrite"
         );
         cache.save_if_dirty();
 
         let reloaded = SourceMessageCache::load();
-        let entry = reloaded
-            .get(claude, source.path())
-            .expect("history that only the cache holds must outlive the save");
         assert_eq!(
-            entry.messages.len(),
-            1,
-            "the live half is dropped to be re-parsed"
-        );
-        assert_eq!(
-            entry.messages[0].dedup_key.as_deref(),
-            Some("msg_kept:req_kept")
+            reloaded.retainable_history(claude, source.path()).len(),
+            2,
+            "history that only the cache holds must outlive the save"
         );
         assert!(
-            reloaded.is_migrated(claude, source.path()),
+            reloaded.get(claude, source.path()).is_none(),
             "still behind the current version, so a reader still re-parses"
         );
 
