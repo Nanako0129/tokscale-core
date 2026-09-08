@@ -445,6 +445,7 @@ impl DayAccumulator {
             cache_read: self.token_breakdown.cache_read.max(0),
             cache_write: self.token_breakdown.cache_write.max(0),
             reasoning: self.token_breakdown.reasoning.max(0),
+            cache_write_1h: 0,
         };
 
         let clients: Vec<ClientContribution> = self
@@ -684,6 +685,7 @@ impl SessionAccumulator {
             cache_read: self.token_breakdown.cache_read.max(0),
             cache_write: self.token_breakdown.cache_write.max(0),
             reasoning: self.token_breakdown.reasoning.max(0),
+            cache_write_1h: 0,
         };
 
         let mut clients: Vec<ClientContribution> = self
@@ -1033,6 +1035,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             cost_source: crate::CostSource::Unknown,
@@ -1118,6 +1121,7 @@ mod tests {
             cache_read: 50,
             cache_write: 40,
             reasoning: 10,
+            cache_write_1h: 0,
         };
 
         let result = aggregate_by_date(vec![msg]);
@@ -1751,6 +1755,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         // 10 rows across 3 sessions.
         let messages = vec![
@@ -1896,6 +1901,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let big = TokenBreakdown {
             input: 1000,
@@ -1903,6 +1909,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let messages = vec![
             session_message(
@@ -1956,6 +1963,7 @@ mod tests {
                 cache_read: 1_920,
                 cache_write: 0,
                 reasoning: 40,
+                cache_write_1h: 0,
             },
             clients: vec![ClientContribution {
                 client: "codex".to_string(),
@@ -1967,6 +1975,7 @@ mod tests {
                     cache_read: 1_920,
                     cache_write: 0,
                     reasoning: 40,
+                    cache_write_1h: 0,
                 },
                 cost: 0.0123,
                 messages: 12,
@@ -2015,6 +2024,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             cost_source: crate::CostSource::Unknown,

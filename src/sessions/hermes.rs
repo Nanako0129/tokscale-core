@@ -166,6 +166,7 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                     cache_read: cache_read.max(0),
                     cache_write: cache_write.max(0),
                     reasoning: reasoning.max(0),
+                    cache_write_1h: 0,
                 },
                 cost,
                 Some(HERMES_AGENT_NAME.to_string()),

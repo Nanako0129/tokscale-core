@@ -169,6 +169,7 @@ fn parse_amp_ledger_records(
                     cache_read: tokens.cache_read_input_tokens.unwrap_or(0).max(0),
                     cache_write: tokens.cache_creation_input_tokens.unwrap_or(0).max(0),
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 cost: valid_amp_cost(event.credits),
             })
@@ -215,6 +216,7 @@ fn parse_amp_message_records(
                     cache_read: usage.cache_read_input_tokens.unwrap_or(0).max(0),
                     cache_write: usage.cache_creation_input_tokens.unwrap_or(0).max(0),
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 cost: valid_amp_cost(usage.credits),
             })

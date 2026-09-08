@@ -449,6 +449,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost: 0.01,
             cost_source: crate::CostSource::Unknown,
@@ -754,7 +755,7 @@ mod tests {
             workspace_label: None,
             timestamp,
             date: "2024-01-01".to_string(),
-            tokens: TokenBreakdown { input, output, cache_read: 0, cache_write: 0, reasoning: 0 },
+            tokens: TokenBreakdown { input, output, cache_read: 0, cache_write: 0, reasoning: 0, cache_write_1h: 0 },
             cost,
             cost_source: crate::CostSource::Unknown,
             message_count,
@@ -913,6 +914,7 @@ mod tests {
                 cache_read: i64::MAX,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             };
             message
         };

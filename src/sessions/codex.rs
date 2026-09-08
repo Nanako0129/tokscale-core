@@ -203,6 +203,7 @@ impl CodexTotals {
             cache_read: clamped_cached,
             cache_write: 0,
             reasoning: clamped_reasoning,
+            cache_write_1h: 0,
         }
     }
 }
@@ -1171,6 +1172,7 @@ fn parse_codex_headless_line(
                 cache_read: usage.cached.max(0),
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
             agent,

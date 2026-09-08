@@ -249,6 +249,11 @@ pub struct TokenBreakdown {
     pub cache_read: i64,
     pub cache_write: i64,
     pub reasoning: i64,
+    /// The 1-hour-TTL portion of `cache_write`, which Anthropic bills at 2x
+    /// base input where a 5-minute write is 1.25x. Always <= `cache_write`,
+    /// which stays the total. Not yet populated or priced -- this change
+    /// carries the layout only.
+    pub cache_write_1h: i64,
 }
 
 impl TokenBreakdown {
@@ -6424,6 +6429,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
             cache_read: msg.cache_read,
             cache_write: msg.cache_write,
             reasoning: msg.reasoning,
+            cache_write_1h: 0,
         },
         cost,
         cost_source: CostSource::Unknown,
@@ -9725,6 +9731,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             Some(key.to_string()),
@@ -10178,6 +10185,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
         );
@@ -10206,6 +10214,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             dedup_key.map(str::to_string),
@@ -10519,6 +10528,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let raw_cost = service.calculate_cost_with_provider("claude-opus-4-8-cc", None, &tokens);
         let group_label_cost =
@@ -10587,6 +10597,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.25,
         )]);
@@ -10686,6 +10697,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let msg_a = UnifiedMessage::new(
             "claude",
@@ -10825,6 +10837,7 @@ mod tests {
             cache_read: 25,
             cache_write: 0,
             reasoning: 25,
+            cache_write_1h: 0,
         };
         timed.duration_ms = Some(400);
 
@@ -10843,6 +10856,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
 
         let entries = aggregate_model_usage_entries(vec![timed, untimed], &GroupBy::ClientModel);
@@ -11031,6 +11045,7 @@ mod tests {
                 cache_read: 2,
                 cache_write: 0,
                 reasoning: 1,
+                cache_write_1h: 0,
             },
             1.25,
         );
@@ -12084,6 +12099,7 @@ mod tests {
                     cache_read: 2,
                     cache_write: 1,
                     reasoning: 3,
+                    cache_write_1h: 0,
                 },
                 0.5,
                 agent.map(|a| a.to_string()),
@@ -12133,6 +12149,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )
@@ -12216,6 +12233,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             );
@@ -12254,6 +12272,7 @@ mod tests {
                         cache_read: 0,
                         cache_write: 0,
                         reasoning: 0,
+                        cache_write_1h: 0,
                     },
                     0.0,
                 )
@@ -12670,6 +12689,7 @@ mod tests {
                 cache_read: 5,
                 cache_write: 2,
                 reasoning: 1,
+                cache_write_1h: 0,
             },
             0.0,
             Some("message-v1".to_string()),
@@ -15000,6 +15020,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.42,
             Some("planner".to_string()),
@@ -15035,6 +15056,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15104,6 +15126,7 @@ mod tests {
                 cache_read: 3,
                 cache_write: 7,
                 reasoning: 2,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15170,6 +15193,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.42,
         );
@@ -15340,6 +15364,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15376,6 +15401,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15414,6 +15440,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15448,6 +15475,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 7,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15483,6 +15511,7 @@ mod tests {
                 cache_read: 7,
                 cache_write: 0,
                 reasoning: 3,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15517,6 +15546,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15559,6 +15589,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15601,6 +15632,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15645,6 +15677,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.123,
         );
@@ -15692,6 +15725,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 3,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15734,6 +15768,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15759,6 +15794,7 @@ mod tests {
                 cache_read: 50_000,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15794,6 +15830,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15828,6 +15865,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15866,6 +15904,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -16983,6 +17022,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 embedded_cost,
             )
@@ -18610,6 +18650,7 @@ mod tests {
                 cache_read: 60,
                 cache_write: 0,
                 reasoning: 5,
+                cache_write_1h: 0,
             }
         );
         assert!(selected.iter().any(|message| {
@@ -19410,6 +19451,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             cost_source: crate::CostSource::Unknown,
@@ -19924,6 +19966,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )
@@ -19954,6 +19997,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )

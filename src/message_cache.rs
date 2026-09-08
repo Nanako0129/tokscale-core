@@ -30,7 +30,13 @@ use std::time::UNIX_EPOCH;
 // namespace's pre-bump shard by version before any of them are decoded
 // against the new 8-field layout. This invalidates every namespace's cached
 // shards once.
-const CACHE_FORMAT_VERSION: u32 = 3;
+// 4: TokenBreakdown gained `cache_write_1h`, appended to a type every
+// namespace's payload embeds. Unlike 2 and 3 this bump does not discard the
+// old shards: a retaining namespace's format-3 payload is decoded through
+// `mod format3` and carried forward, so the turns a compacting rewrite took
+// out of a Claude transcript survive it. Everything else still goes cold,
+// which costs those namespaces nothing.
+const CACHE_FORMAT_VERSION: u32 = 4;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -907,6 +913,132 @@ struct CacheShardKey {
     index: usize,
 }
 
+/// The payload shape of `CACHE_FORMAT_VERSION` 3, kept so its shards can be
+/// read after a bump rather than discarded.
+///
+/// Only `TokenBreakdown` differs from the current types -- format 4 appends
+/// `cache_write_1h` to it -- but bincode is positional, so the whole chain
+/// down to the field has to be spelled out to decode the old bytes.
+///
+/// A namespace with no retention loses nothing by going cold, so this exists
+/// for the one that does: for Claude the cache is the only copy of turns a
+/// compacting rewrite removed from the file, and a format bump would delete
+/// them exactly as a parser_version bump does.
+mod format3 {
+    use super::{CachedPath, CodexIncrementalCache, SourceFingerprint};
+    use crate::sessions::CostSource;
+    use serde::Deserialize;
+    use std::collections::HashSet;
+
+    #[derive(Deserialize)]
+    pub(super) struct TokenBreakdown {
+        pub input: i64,
+        pub output: i64,
+        pub cache_read: i64,
+        pub cache_write: i64,
+        pub reasoning: i64,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct UnifiedMessage {
+        pub client: String,
+        pub model_id: String,
+        pub provider_id: String,
+        pub session_id: String,
+        pub workspace_key: Option<String>,
+        pub workspace_label: Option<String>,
+        pub timestamp: i64,
+        pub date: String,
+        pub tokens: TokenBreakdown,
+        pub cost: f64,
+        pub cost_source: CostSource,
+        pub duration_ms: Option<i64>,
+        pub message_count: i32,
+        pub agent: Option<String>,
+        pub dedup_key: Option<String>,
+        pub dedup_aliases: Vec<String>,
+        pub is_turn_start: bool,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct CachedSourceEntry {
+        pub parser_namespace: String,
+        pub parser_version: u32,
+        pub path: CachedPath,
+        pub fingerprint: SourceFingerprint,
+        pub messages: Vec<UnifiedMessage>,
+        pub fallback_timestamp_indices: Vec<usize>,
+        pub codex_incremental: Option<CodexIncrementalCache>,
+        pub retained_keys: HashSet<String>,
+    }
+}
+
+impl From<format3::TokenBreakdown> for crate::TokenBreakdown {
+    fn from(old: format3::TokenBreakdown) -> Self {
+        Self {
+            input: old.input,
+            output: old.output,
+            cache_read: old.cache_read,
+            cache_write: old.cache_write,
+            reasoning: old.reasoning,
+            // Format 3 predates the split; the whole write is 5-minute as far
+            // as anything that read those bytes was concerned.
+            cache_write_1h: 0,
+        }
+    }
+}
+
+impl From<format3::UnifiedMessage> for UnifiedMessage {
+    fn from(old: format3::UnifiedMessage) -> Self {
+        Self {
+            client: old.client,
+            model_id: old.model_id,
+            provider_id: old.provider_id,
+            session_id: old.session_id,
+            workspace_key: old.workspace_key,
+            workspace_label: old.workspace_label,
+            timestamp: old.timestamp,
+            date: old.date,
+            tokens: old.tokens.into(),
+            cost: old.cost,
+            cost_source: old.cost_source,
+            duration_ms: old.duration_ms,
+            message_count: old.message_count,
+            agent: old.agent,
+            dedup_key: old.dedup_key,
+            dedup_aliases: old.dedup_aliases,
+            is_turn_start: old.is_turn_start,
+        }
+    }
+}
+
+impl From<format3::CachedSourceEntry> for CachedSourceEntry {
+    fn from(old: format3::CachedSourceEntry) -> Self {
+        Self {
+            // The entry keeps the version that wrote it. `get` filters on that
+            // and so hides it from cache hits -- this build did not produce
+            // these messages -- while `retainable_history` does not filter and
+            // still reaches the turns only this copy holds.
+            parser_namespace: old.parser_namespace,
+            parser_version: old.parser_version,
+            path: old.path,
+            fingerprint: old.fingerprint,
+            messages: old.messages.into_iter().map(Into::into).collect(),
+            fallback_timestamp_indices: old.fallback_timestamp_indices,
+            codex_incremental: old.codex_incremental,
+            retained_keys: old.retained_keys,
+        }
+    }
+}
+
+/// Whether a shard written under `format_version` can be carried forward.
+///
+/// Only for a namespace that retains history; everything else is cheaper to
+/// re-parse than to migrate, and going cold costs it nothing.
+fn format_version_is_migratable(namespace: &str, format_version: u32) -> bool {
+    format_version == 3 && retained_history_key_filter(namespace).is_some()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedSourceEntry {
     parser_namespace: String,
@@ -1115,6 +1247,14 @@ impl CachedSourceEntry {
                         existing.tokens.cache_read.max(stored_tokens.cache_read);
                     existing.tokens.cache_write =
                         existing.tokens.cache_write.max(stored_tokens.cache_write);
+                    // Taken with `cache_write` rather than derived from it: the
+                    // 1h portion is reported separately by the API, so a merge
+                    // that kept only the total would zero the split on every
+                    // cache hit and quietly return the pricing to a flat 5m rate.
+                    existing.tokens.cache_write_1h = existing
+                        .tokens
+                        .cache_write_1h
+                        .max(stored_tokens.cache_write_1h);
                     existing.tokens.reasoning =
                         existing.tokens.reasoning.max(stored_tokens.reasoning);
                     // `duration_ms` grows the same way in
@@ -1861,7 +2001,13 @@ fn read_shard_with_limit(
         Ok(envelope) => envelope,
         Err(error) => return ShardReadStatus::Invalid(error.to_string()),
     };
-    if envelope.format_version != CACHE_FORMAT_VERSION {
+    // A retaining namespace's older shard is decoded through its own layout
+    // rather than dropped. Rejecting it here is what makes a format bump lose
+    // the turns a compacting rewrite already took out of the source file.
+    let migrating_format = envelope.format_version != CACHE_FORMAT_VERSION;
+    if migrating_format
+        && !format_version_is_migratable(&envelope.parser_namespace, envelope.format_version)
+    {
         return ShardReadStatus::Stale;
     }
     if envelope.parser_namespace != identity.namespace {
@@ -1874,6 +2020,18 @@ fn read_shard_with_limit(
         && !parser_version_is_migratable(&envelope.parser_namespace, envelope.parser_version)
     {
         return ShardReadStatus::Stale;
+    }
+
+    if migrating_format {
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<format3::CachedSourceEntry>>(&envelope.payload)
+        {
+            Ok(entries) => {
+                ShardReadStatus::Loaded(entries.into_iter().map(Into::into).collect())
+            }
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
     }
 
     match bincode::options()
@@ -2279,6 +2437,7 @@ mod tests {
                     cache_read: 3,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )],
@@ -3863,6 +4022,191 @@ mod tests {
     /// the pre-bump layout rather than reusing the current
     /// `CachedSourceEntry`, so the test fails if `CACHE_FORMAT_VERSION` is
     /// reverted to 2.
+    /// Writes a format-3 shard by hand and returns its path.
+    ///
+    /// Hand-rolled rather than built from the current types, because the point
+    /// is the old positional layout: `TokenBreakdown` gained `cache_write_1h`
+    /// in format 4, so a shard serialized from today's structs would not be
+    /// the bytes this is meant to read.
+    fn seed_format3_shard(
+        identity: CacheIdentity,
+        source: &Path,
+        dedup_key: &str,
+        retained: &[&str],
+    ) -> PathBuf {
+        #[derive(Serialize)]
+        struct Format3TokenBreakdown {
+            input: i64,
+            output: i64,
+            cache_read: i64,
+            cache_write: i64,
+            reasoning: i64,
+        }
+        #[derive(Serialize)]
+        struct Format3UnifiedMessage {
+            client: String,
+            model_id: String,
+            provider_id: String,
+            session_id: String,
+            workspace_key: Option<String>,
+            workspace_label: Option<String>,
+            timestamp: i64,
+            date: String,
+            tokens: Format3TokenBreakdown,
+            cost: f64,
+            cost_source: crate::sessions::CostSource,
+            duration_ms: Option<i64>,
+            message_count: i32,
+            agent: Option<String>,
+            dedup_key: Option<String>,
+            dedup_aliases: Vec<String>,
+            is_turn_start: bool,
+        }
+        #[derive(Serialize)]
+        struct Format3CachedSourceEntry {
+            parser_namespace: String,
+            parser_version: u32,
+            path: CachedPath,
+            fingerprint: SourceFingerprint,
+            messages: Vec<Format3UnifiedMessage>,
+            fallback_timestamp_indices: Vec<usize>,
+            codex_incremental: Option<CodexIncrementalCache>,
+            retained_keys: HashSet<String>,
+        }
+
+        let entry = Format3CachedSourceEntry {
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            path: CachedPath::from_path(source),
+            fingerprint: SourceFingerprint::from_path(source).unwrap(),
+            messages: vec![Format3UnifiedMessage {
+                client: identity.namespace.to_string(),
+                model_id: "claude-3-5-sonnet".to_string(),
+                provider_id: "anthropic".to_string(),
+                session_id: "session".to_string(),
+                workspace_key: None,
+                workspace_label: None,
+                timestamp: 1,
+                date: "2026-01-01".to_string(),
+                tokens: Format3TokenBreakdown {
+                    input: 11,
+                    output: 22,
+                    cache_read: 33,
+                    cache_write: 44,
+                    reasoning: 0,
+                },
+                cost: 0.5,
+                cost_source: crate::sessions::CostSource::default(),
+                duration_ms: None,
+                message_count: 1,
+                agent: None,
+                dedup_key: Some(dedup_key.to_string()),
+                dedup_aliases: Vec::new(),
+                is_turn_start: false,
+            }],
+            fallback_timestamp_indices: Vec::new(),
+            codex_incremental: None,
+            retained_keys: retained.iter().map(|k| (*k).to_string()).collect(),
+        };
+
+        let payload = bincode::options().serialize(&vec![entry]).unwrap();
+        let path = shard_path(
+            &cache_shard_dir().unwrap(),
+            &CacheKey::new(identity, source).shard(),
+        );
+        ensure_cache_dir(path.parent().unwrap()).unwrap();
+        let envelope = CachedShardEnvelope {
+            format_version: 3,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload,
+        };
+        let mut writer = BufWriter::new(File::create(&path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        path
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_a_format3_claude_shard_is_migrated_rather_than_discarded() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"claude transcript\n");
+        let claude = CacheIdentity::for_client(ClientId::Claude);
+
+        let path = seed_format3_shard(claude, source.path(), "msg_old:req_old", &[]);
+
+        match read_shard(&path, claude) {
+            ShardReadStatus::Loaded(entries) => {
+                assert_eq!(entries.len(), 1, "the format-3 payload must decode");
+                let tokens = &entries[0].messages[0].tokens;
+                assert_eq!(
+                    (tokens.input, tokens.output, tokens.cache_read, tokens.cache_write),
+                    (11, 22, 33, 44),
+                    "every pre-existing lane must survive the layout change"
+                );
+                assert_eq!(
+                    tokens.cache_write_1h, 0,
+                    "format 3 predates the split, so the whole write reads as 5-minute"
+                );
+            }
+            ShardReadStatus::Stale => {
+                panic!("a format-3 Claude shard was rejected instead of migrated")
+            }
+            ShardReadStatus::Missing => panic!("the seeded shard was not found"),
+            ShardReadStatus::Invalid(error) => {
+                panic!("the format-3 payload failed to decode: {error}")
+            }
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_a_format3_shard_keeps_the_history_only_its_copy_holds() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"compacted claude transcript\n");
+        let claude = CacheIdentity::for_client(ClientId::Claude);
+
+        seed_format3_shard(claude, source.path(), "msg_kept:req_kept", &["msg_kept:req_kept"]);
+
+        let loaded = SourceMessageCache::load();
+        let history = loaded.retainable_history(claude, source.path());
+        assert_eq!(
+            history.len(),
+            1,
+            "a retained turn is the only copy left once a rewrite drops it from the file, \
+             so a format bump that cannot read it deletes it"
+        );
+        assert_eq!(history[0].dedup_key.as_deref(), Some("msg_kept:req_kept"));
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_a_format3_shard_without_retention_still_goes_cold() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"codex transcript\n");
+        let codex = CacheIdentity::for_client(ClientId::Codex);
+
+        let path = seed_format3_shard(codex, source.path(), "msg_codex:req_codex", &[]);
+
+        assert!(
+            matches!(read_shard(&path, codex), ShardReadStatus::Stale),
+            "migration is for the namespace whose cache is the only copy; everything else \
+             is cheaper to re-parse, and going cold costs it nothing"
+        );
+
+        restore_cache_env(prev_env);
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_non_claude_legacy_shard_is_rejected_by_the_format_bump_before_its_payload_is_decoded() {
@@ -4880,6 +5224,7 @@ mod tests {
                     cache_read: 10,
                     cache_write: 5,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
                 Some(key.to_string()),
@@ -4905,6 +5250,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
                 Some(key.to_string()),

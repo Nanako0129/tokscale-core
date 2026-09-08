@@ -289,6 +289,7 @@ fn token_usage_from_value(value: &Value) -> Option<TokenBreakdown> {
         cache_read: usage_field(value, "cache_read_input_tokens"),
         cache_write: usage_field(value, "cache_creation_input_tokens"),
         reasoning: 0,
+        cache_write_1h: 0,
     })
 }
 

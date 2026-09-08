@@ -467,6 +467,7 @@ impl PricingService {
             cache_read,
             cache_write,
             reasoning,
+            cache_write_1h: 0,
         };
         self.calculate_cost_with_provider(model_id, None, &usage)
     }

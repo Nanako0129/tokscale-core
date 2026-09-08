@@ -105,6 +105,7 @@ fn parse_session(client: &str, session: &serde_json::Value) -> Option<UnifiedMes
             cache_read,
             cache_write,
             reasoning: 0,
+            cache_write_1h: 0,
         },
         provider_cost.unwrap_or(0.0),
         dedup_key,

@@ -148,6 +148,7 @@ fn parse_gen_metadata(
             cache_read,
             cache_write: 0,
             reasoning,
+            cache_write_1h: 0,
         },
         0.0,
         dedup_key,

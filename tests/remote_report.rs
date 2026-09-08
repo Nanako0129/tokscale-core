@@ -28,6 +28,7 @@ fn message(client: &str, model: &str, provider: &str, timestamp: i64) -> Unified
             cache_read: 5,
             cache_write: 7,
             reasoning: 11,
+            cache_write_1h: 0,
         },
         0.0000000015,
     )
