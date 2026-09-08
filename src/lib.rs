@@ -253,6 +253,12 @@ pub struct TokenBreakdown {
     /// base input where a 5-minute write is 1.25x. Always <= `cache_write`,
     /// which stays the total. Not yet populated or priced -- this change
     /// carries the layout only.
+    ///
+    /// `default` because this type is also read from JSON, where a payload
+    /// written before the split simply lacks the key and must still decode.
+    /// It does nothing for bincode, whose positional layout is what
+    /// `CACHE_FORMAT_VERSION` 4 and `mod format3` exist to handle.
+    #[serde(default)]
     pub cache_write_1h: i64,
 }
 
@@ -6472,6 +6478,27 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// A payload written before the 1h/5m split lacks the key entirely, and a
+    /// reader that rejects it would break every stored snapshot at once. This
+    /// is separate from the bincode path, which `CACHE_FORMAT_VERSION` 4 and
+    /// `mod format3` handle by decoding the old layout rather than defaulting.
+    #[test]
+    fn token_breakdown_decodes_json_written_before_the_1h_split() {
+        let before = r#"{"input":1,"output":2,"cache_read":3,"cache_write":4,"reasoning":5}"#;
+        let decoded: TokenBreakdown =
+            serde_json::from_str(before).expect("pre-split JSON must still decode");
+        assert_eq!(decoded.cache_write, 4, "existing lanes must survive");
+        assert_eq!(
+            decoded.cache_write_1h, 0,
+            "a payload that predates the split reports no 1h portion"
+        );
+        assert_eq!(
+            decoded.total(),
+            15,
+            "total is unchanged: cache_write is still the whole write"
+        );
+    }
 
     struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
 

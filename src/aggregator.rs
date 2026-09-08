@@ -290,6 +290,10 @@ impl DayAccumulator {
             .token_breakdown
             .cache_write
             .saturating_add(msg.tokens.cache_write);
+        self.token_breakdown.cache_write_1h = self
+            .token_breakdown
+            .cache_write_1h
+            .saturating_add(msg.tokens.cache_write_1h);
         self.token_breakdown.reasoning = self
             .token_breakdown
             .reasoning
@@ -336,6 +340,10 @@ impl DayAccumulator {
             .tokens
             .cache_write
             .saturating_add(msg.tokens.cache_write);
+        client_entry.tokens.cache_write_1h = client_entry
+            .tokens
+            .cache_write_1h
+            .saturating_add(msg.tokens.cache_write_1h);
         client_entry.tokens.reasoning = client_entry
             .tokens
             .reasoning
@@ -380,6 +388,10 @@ impl DayAccumulator {
             .token_breakdown
             .cache_write
             .saturating_add(other.token_breakdown.cache_write);
+        self.token_breakdown.cache_write_1h = self
+            .token_breakdown
+            .cache_write_1h
+            .saturating_add(other.token_breakdown.cache_write_1h);
         self.token_breakdown.reasoning = self
             .token_breakdown
             .reasoning
@@ -421,6 +433,10 @@ impl DayAccumulator {
                 .tokens
                 .cache_write
                 .saturating_add(client_contrib.tokens.cache_write);
+            entry.tokens.cache_write_1h = entry
+                .tokens
+                .cache_write_1h
+                .saturating_add(client_contrib.tokens.cache_write_1h);
             entry.tokens.reasoning = entry
                 .tokens
                 .reasoning
@@ -445,7 +461,7 @@ impl DayAccumulator {
             cache_read: self.token_breakdown.cache_read.max(0),
             cache_write: self.token_breakdown.cache_write.max(0),
             reasoning: self.token_breakdown.reasoning.max(0),
-            cache_write_1h: 0,
+            cache_write_1h: self.token_breakdown.cache_write_1h.max(0),
         };
 
         let clients: Vec<ClientContribution> = self
@@ -456,6 +472,7 @@ impl DayAccumulator {
                 s.tokens.output = s.tokens.output.max(0);
                 s.tokens.cache_read = s.tokens.cache_read.max(0);
                 s.tokens.cache_write = s.tokens.cache_write.max(0);
+                s.tokens.cache_write_1h = s.tokens.cache_write_1h.max(0);
                 s.tokens.reasoning = s.tokens.reasoning.max(0);
                 s.cost = s.cost.max(0.0);
                 s
@@ -545,6 +562,10 @@ impl SessionAccumulator {
             .token_breakdown
             .cache_write
             .saturating_add(msg.tokens.cache_write);
+        self.token_breakdown.cache_write_1h = self
+            .token_breakdown
+            .cache_write_1h
+            .saturating_add(msg.tokens.cache_write_1h);
         self.token_breakdown.reasoning = self
             .token_breakdown
             .reasoning
@@ -576,6 +597,10 @@ impl SessionAccumulator {
             .tokens
             .cache_write
             .saturating_add(msg.tokens.cache_write);
+        client_entry.tokens.cache_write_1h = client_entry
+            .tokens
+            .cache_write_1h
+            .saturating_add(msg.tokens.cache_write_1h);
         client_entry.tokens.reasoning = client_entry
             .tokens
             .reasoning
@@ -628,6 +653,10 @@ impl SessionAccumulator {
             .token_breakdown
             .cache_write
             .saturating_add(other.token_breakdown.cache_write);
+        self.token_breakdown.cache_write_1h = self
+            .token_breakdown
+            .cache_write_1h
+            .saturating_add(other.token_breakdown.cache_write_1h);
         self.token_breakdown.reasoning = self
             .token_breakdown
             .reasoning
@@ -655,6 +684,10 @@ impl SessionAccumulator {
                 .tokens
                 .cache_write
                 .saturating_add(contrib.tokens.cache_write);
+            entry.tokens.cache_write_1h = entry
+                .tokens
+                .cache_write_1h
+                .saturating_add(contrib.tokens.cache_write_1h);
             entry.tokens.reasoning = entry
                 .tokens
                 .reasoning
@@ -685,7 +718,7 @@ impl SessionAccumulator {
             cache_read: self.token_breakdown.cache_read.max(0),
             cache_write: self.token_breakdown.cache_write.max(0),
             reasoning: self.token_breakdown.reasoning.max(0),
-            cache_write_1h: 0,
+            cache_write_1h: self.token_breakdown.cache_write_1h.max(0),
         };
 
         let mut clients: Vec<ClientContribution> = self
@@ -696,6 +729,7 @@ impl SessionAccumulator {
                 c.tokens.output = c.tokens.output.max(0);
                 c.tokens.cache_read = c.tokens.cache_read.max(0);
                 c.tokens.cache_write = c.tokens.cache_write.max(0);
+                c.tokens.cache_write_1h = c.tokens.cache_write_1h.max(0);
                 c.tokens.reasoning = c.tokens.reasoning.max(0);
                 c.cost = c.cost.max(0.0);
                 c
@@ -1005,6 +1039,75 @@ mod tests {
         );
         assert_eq!(merged.turns_by_client.get("claude"), Some(&2));
         assert_eq!(merged.turns_by_client.get("codex"), Some(&1));
+    }
+
+    /// `TokenBreakdown` is public, so a caller can populate `cache_write_1h`
+    /// before this crate's own parsers do. Every fold must carry it like the
+    /// other buckets; a fold that drops it, or a finalization that rebuilds the
+    /// breakdown with a hardcoded zero, would swallow that value with a green
+    /// build. Asserting a distinct number per bucket is what makes a fold that
+    /// copies the wrong field fail rather than coincide.
+    ///
+    /// `cache_write_1h` is a subset of `cache_write`, not a sibling bucket, so
+    /// the day total is unchanged by it -- 30 + 20 + 0 + 200 + 0 per message.
+    #[test]
+    fn every_fold_carries_the_one_hour_cache_write_subset() {
+        let msg = |client: &str| {
+            let mut m = mock_unified_message("2026-03-04", 50, 0.1, "model-a", client);
+            m.tokens.cache_write = 200;
+            m.tokens.cache_write_1h = 120;
+            m
+        };
+        let messages = vec![msg("claude"), msg("codex"), msg("claude")];
+
+        let materialized = aggregate_by_date(messages.clone());
+
+        let mut streaming = StreamingAggregator::new();
+        for m in &messages {
+            streaming.feed_pre_deduped(m);
+        }
+        let streamed = streaming.finalize();
+
+        let mut left = DayAccumulator::default();
+        let mut right = DayAccumulator::default();
+        for (index, m) in messages.iter().enumerate() {
+            if index % 2 == 0 {
+                left.add_message(m)
+            } else {
+                right.add_message(m)
+            }
+        }
+        left.merge(right);
+        let merged = left.into_contribution("2026-03-04".to_string());
+
+        for (label, day) in [
+            ("materialized", &materialized[0]),
+            ("streaming", &streamed[0]),
+            ("merged", &merged),
+        ] {
+            assert_eq!(
+                day.token_breakdown.cache_write_1h, 360,
+                "{label}: the 1h subset must survive the fold"
+            );
+            assert_eq!(
+                day.token_breakdown.cache_write, 600,
+                "{label}: the total cache write is unchanged by the split"
+            );
+            assert_eq!(
+                day.totals.tokens, 750,
+                "{label}: the 1h subset is already inside cache_write and must \
+                 not be added to the day total a second time"
+            );
+            let claude = day
+                .clients
+                .iter()
+                .find(|c| c.client == "claude")
+                .unwrap_or_else(|| panic!("{label}: claude entry missing"));
+            assert_eq!(
+                claude.tokens.cache_write_1h, 240,
+                "{label}: the per-client fold must carry it too"
+            );
+        }
     }
 
     fn mock_unified_message(
