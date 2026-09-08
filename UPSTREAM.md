@@ -12,6 +12,18 @@ patch ledger from TokenBar.
 The selective-port method and streaming adaptation rules are documented in
 TokenBar's [`vendor-tokscale.md`](https://github.com/Nanako0129/TokenBar/blob/729dc3adf21cc31e16ef0b8b742f0244197d7058/docs/knowledge/vendor-tokscale.md).
 
+## Deterministic pricing fallback ties
+
+`PricingLookup` orders LiteLLM and OpenRouter keys by descending length, then
+lexicographically for equal lengths. Previously equal-length candidates kept
+`HashMap` iteration order, so rebuilding an unchanged catalog could select a
+different fallback rate and reprice identical historical usage. The secondary
+ordering makes ties reproducible without changing exact-match, provider, or
+different-length precedence. It does not imply that a dated fallback is the
+current provider rate. `tests/pricing_determinism.rs` covers both catalogs with
+fixed usage and independently rebuilt maps. This is a report-time lookup change;
+parser versions and cache format are unchanged.
+
 ## SA-1B remote source seam
 
 The local `RemoteSourceContextV1` and cache-only `RemotePricingSnapshot` are
