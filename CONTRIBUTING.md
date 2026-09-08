@@ -68,15 +68,16 @@ For most clients an invalidation is cold: the shard is rejected, the source is r
 
 Not for Claude. For a namespace covered by `retained_history_key_filter` — only Claude — the cache holds turns the live file **no longer contains**. Claude Code rewrites transcripts in place on compact, and retention carries the dropped turns forward. The comment on `CachedSourceEntry::messages` says it outright: re-parsing will not reproduce them, the cache is the only copy.
 
-So for Claude, "invalidate" means "delete", and that applies to **both** counters. The format-version gate runs before the namespace is even looked at, so a global bump rejects Claude's shards along with everyone else's — it is not a way around a Claude `parser_version` bump, it is the same loss with a larger radius. The test `test_non_claude_legacy_shard_is_rejected_by_the_format_bump_before_its_payload_is_decoded` pins that ordering.
+A `parser_version` bump no longer deletes them. A Claude entry behind the current version is kept rather than dropped. `get` still filters it out by version, so every reader re-parses; retention reads it through `retainable_history`, and its own filter takes only the keys the live parse did not produce. `oldest_migratable_parser_version` is the floor: version 1 predates `retained_keys` and its payload has one field fewer than the current struct, so it stays stale. Raise that floor if a future bump makes an older payload uninterpretable the same way.
+
+`CACHE_FORMAT_VERSION` still does delete them. Its gate runs before the namespace is looked at and before the payload is decoded, so nothing is left to migrate. The test `test_non_claude_legacy_shard_is_rejected_by_the_format_bump_before_its_payload_is_decoded` pins that ordering.
 
 The practical consequence: a change to a shared payload type has no scoped option. The retained-history cost is forced, and the pull request should say so plainly rather than let it be discovered afterwards.
 
 What to do with a Claude parser change that needs to reach existing users:
 
 1. **Ask whether it does.** A fix that applies as each transcript next changes may be acceptable; active files converge on their own, and nothing is lost. This is the default and it needs no counter bump at all.
-2. **If it must reach stale entries, that is an explicit data-loss decision.** Say so in the pull request, in those words, and let the maintainer weigh the correction against the retained history it costs.
-3. **Or write a migration** that decodes the old shard, preserves the entries named by `retained_keys`, and rewrites them in the new format. That is real code, not a version bump, and it is the only option that gets both.
+2. **Otherwise bump `parser_version`.** The migration carries the retained history across, so the cost is a cold rescan like any other namespace. Check that the version you are bumping from is at or above `oldest_migratable_parser_version`; below it, the bump is still a data-loss decision and the pull request should say so in those words.
 
 Also note that `parser_version` values are local state. They diverged from upstream long ago, so during any re-vendor they are re-applied, never copied across. `UPSTREAM.md` carries the comparison table and the reason.
 
