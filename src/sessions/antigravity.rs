@@ -98,6 +98,7 @@ fn parse_usage_row(value: &Value, fallback_model: Option<&str>) -> Option<Unifie
             cache_read,
             cache_write,
             reasoning,
+            cache_write_1h: 0,
         },
         0.0,
         dedup_key,

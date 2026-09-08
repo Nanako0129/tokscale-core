@@ -242,6 +242,7 @@ fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedM
                             cache_read: usage.cache_read.unwrap_or(0).max(0),
                             cache_write: usage.cache_write.unwrap_or(0).max(0),
                             reasoning: 0,
+                            cache_write_1h: 0,
                         },
                         provider_cost.unwrap_or(0.0),
                     );

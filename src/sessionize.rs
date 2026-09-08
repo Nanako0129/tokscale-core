@@ -96,6 +96,9 @@ pub fn sessionize(messages: &[UnifiedMessage], idle_gap_ms: i64) -> Vec<SessionI
             tokens.output = tokens.output.saturating_add(msg.tokens.output);
             tokens.cache_read = tokens.cache_read.saturating_add(msg.tokens.cache_read);
             tokens.cache_write = tokens.cache_write.saturating_add(msg.tokens.cache_write);
+            tokens.cache_write_1h = tokens
+                .cache_write_1h
+                .saturating_add(msg.tokens.cache_write_1h);
             tokens.reasoning = tokens.reasoning.saturating_add(msg.tokens.reasoning);
             cost += msg.cost;
             message_count = message_count.saturating_add(msg.message_count.max(0));
@@ -381,6 +384,10 @@ impl SessionizeAccumulator {
         acc.tokens.output = acc.tokens.output.saturating_add(msg.tokens.output);
         acc.tokens.cache_read = acc.tokens.cache_read.saturating_add(msg.tokens.cache_read);
         acc.tokens.cache_write = acc.tokens.cache_write.saturating_add(msg.tokens.cache_write);
+        acc.tokens.cache_write_1h = acc
+            .tokens
+            .cache_write_1h
+            .saturating_add(msg.tokens.cache_write_1h);
         acc.tokens.reasoning = acc.tokens.reasoning.saturating_add(msg.tokens.reasoning);
         acc.cost += msg.cost;
         acc.message_count = acc.message_count.saturating_add(msg.message_count.max(0));
@@ -449,6 +456,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost: 0.01,
             cost_source: crate::CostSource::Unknown,
@@ -475,6 +483,42 @@ mod tests {
         assert_eq!(result[0].wall_duration_ms, 0);
         assert_eq!(result[0].active_duration_ms, 0);
         assert_eq!(result[0].message_count, 1);
+    }
+
+    /// Same contract as `every_fold_carries_the_one_hour_cache_write_subset`
+    /// in `aggregator`, for the two folds that live here. `TokenBreakdown` is
+    /// public, so a caller can populate `cache_write_1h` before this crate's
+    /// parsers do, and a session fold that drops it would swallow the value
+    /// with a green build. Both entry points are covered because the batch
+    /// `sessionize` and the streaming accumulator sum tokens independently.
+    #[test]
+    fn session_folds_carry_the_one_hour_cache_write_subset() {
+        let msg = |timestamp: i64| {
+            let mut m = make_msg("opencode", "ses1", timestamp);
+            m.tokens.cache_write = 200;
+            m.tokens.cache_write_1h = 120;
+            m
+        };
+        let msgs = vec![msg(1_000_000), msg(1_060_000)];
+
+        let batch = sessionize(&msgs, DEFAULT_IDLE_GAP_MS);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].tokens.cache_write_1h, 240);
+        assert_eq!(
+            batch[0].tokens.cache_write, 400,
+            "the 1h value is a subset of the total, which is unchanged"
+        );
+
+        let mut acc = SessionizeAccumulator::new();
+        for m in &msgs {
+            acc.feed(m);
+        }
+        let streamed = acc.finalize(DEFAULT_IDLE_GAP_MS);
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(
+            streamed[0].tokens.cache_write_1h, 240,
+            "the streaming fold must agree with the batch one"
+        );
     }
 
     #[test]
@@ -754,7 +798,7 @@ mod tests {
             workspace_label: None,
             timestamp,
             date: "2024-01-01".to_string(),
-            tokens: TokenBreakdown { input, output, cache_read: 0, cache_write: 0, reasoning: 0 },
+            tokens: TokenBreakdown { input, output, cache_read: 0, cache_write: 0, reasoning: 0, cache_write_1h: 0 },
             cost,
             cost_source: crate::CostSource::Unknown,
             message_count,
@@ -913,6 +957,7 @@ mod tests {
                 cache_read: i64::MAX,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             };
             message
         };

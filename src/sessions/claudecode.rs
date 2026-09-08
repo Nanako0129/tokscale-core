@@ -698,6 +698,7 @@ pub fn parse_claude_file_with_cache_and_home(
                         cache_read: usage.cache_read_input_tokens.unwrap_or(0).max(0),
                         cache_write: usage.cache_creation_input_tokens.unwrap_or(0).max(0),
                         reasoning: 0,
+                        cache_write_1h: 0,
                     },
                     0.0,
                     dedup_key,
@@ -1089,6 +1090,7 @@ fn extract_claude_tool_result_message(
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         },
         0.0,
         usage
@@ -1445,6 +1447,7 @@ fn extract_claude_headless_message(
                 .unwrap_or(0)
                 .max(0),
             reasoning: 0,
+            cache_write_1h: 0,
         },
         0.0,
     ))
@@ -1673,6 +1676,7 @@ fn finalize_headless_state(
             cache_read: state.cache_read.max(0),
             cache_write: state.cache_write.max(0),
             reasoning: 0,
+            cache_write_1h: 0,
         },
         0.0,
     );

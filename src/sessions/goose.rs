@@ -207,6 +207,7 @@ pub fn parse_goose_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                     } else {
                         0
                     },
+                    cache_write_1h: 0,
                 },
                 0.0,
             );

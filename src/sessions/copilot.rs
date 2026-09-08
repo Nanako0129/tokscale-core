@@ -760,6 +760,7 @@ pub(crate) fn normalize_input_tokens(
         cache_read: cache_read.max(0),
         cache_write: cache_write.max(0),
         reasoning: reasoning.max(0),
+        cache_write_1h: 0,
     }
 }
 

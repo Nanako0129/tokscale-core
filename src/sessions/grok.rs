@@ -242,6 +242,7 @@ impl ActiveTurn {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
             Some(format!("grok:{}:{}", metadata.session_id, self.turn_index)),
@@ -285,6 +286,7 @@ impl ParsedUsage {
             cache_read,
             cache_write: 0,
             reasoning: self.reasoning_tokens.max(0),
+            cache_write_1h: 0,
         }
     }
 
@@ -967,6 +969,7 @@ fn parse_grok_unified_log_snapshot(
                 cache_read: cached_prompt_tokens,
                 cache_write: 0,
                 reasoning,
+                cache_write_1h: 0,
             },
             0.0,
             Some(dedup_key),
@@ -1308,6 +1311,7 @@ fn append_signals_reconciliation(
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         },
         0.0,
         Some(format!("grok:{}:signals", metadata.session_id)),
@@ -1924,6 +1928,7 @@ mod tests {
             cache_read: 70,
             cache_write: 60,
             reasoning: 50,
+            cache_write_1h: 0,
         };
         covered_legacy.message_count = 7;
         covered_legacy.set_workspace(
@@ -1943,6 +1948,7 @@ mod tests {
             cache_read: 60,
             cache_write: 0,
             reasoning: 5,
+            cache_write_1h: 0,
         };
         covered_unified.message_count = 1;
 
@@ -1979,6 +1985,7 @@ mod tests {
                 cache_read: 60,
                 cache_write: 0,
                 reasoning: 5,
+                cache_write_1h: 0,
             }
         );
         assert_eq!(token_buckets.total(), 142);

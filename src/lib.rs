@@ -249,6 +249,17 @@ pub struct TokenBreakdown {
     pub cache_read: i64,
     pub cache_write: i64,
     pub reasoning: i64,
+    /// The 1-hour-TTL portion of `cache_write`, which Anthropic bills at 2x
+    /// base input where a 5-minute write is 1.25x. Always <= `cache_write`,
+    /// which stays the total. Not yet populated or priced -- this change
+    /// carries the layout only.
+    ///
+    /// `default` because this type is also read from JSON, where a payload
+    /// written before the split simply lacks the key and must still decode.
+    /// It does nothing for bincode, whose positional layout is what
+    /// `CACHE_FORMAT_VERSION` 4 and `mod format3` exist to handle.
+    #[serde(default)]
+    pub cache_write_1h: i64,
 }
 
 impl TokenBreakdown {
@@ -6424,6 +6435,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
             cache_read: msg.cache_read,
             cache_write: msg.cache_write,
             reasoning: msg.reasoning,
+            cache_write_1h: 0,
         },
         cost,
         cost_source: CostSource::Unknown,
@@ -6466,6 +6478,27 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// A payload written before the 1h/5m split lacks the key entirely, and a
+    /// reader that rejects it would break every stored snapshot at once. This
+    /// is separate from the bincode path, which `CACHE_FORMAT_VERSION` 4 and
+    /// `mod format3` handle by decoding the old layout rather than defaulting.
+    #[test]
+    fn token_breakdown_decodes_json_written_before_the_1h_split() {
+        let before = r#"{"input":1,"output":2,"cache_read":3,"cache_write":4,"reasoning":5}"#;
+        let decoded: TokenBreakdown =
+            serde_json::from_str(before).expect("pre-split JSON must still decode");
+        assert_eq!(decoded.cache_write, 4, "existing lanes must survive");
+        assert_eq!(
+            decoded.cache_write_1h, 0,
+            "a payload that predates the split reports no 1h portion"
+        );
+        assert_eq!(
+            decoded.total(),
+            15,
+            "total is unchanged: cache_write is still the whole write"
+        );
+    }
 
     struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
@@ -9725,6 +9758,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             Some(key.to_string()),
@@ -10178,6 +10212,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
         );
@@ -10206,6 +10241,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             dedup_key.map(str::to_string),
@@ -10519,6 +10555,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let raw_cost = service.calculate_cost_with_provider("claude-opus-4-8-cc", None, &tokens);
         let group_label_cost =
@@ -10587,6 +10624,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.25,
         )]);
@@ -10686,6 +10724,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let msg_a = UnifiedMessage::new(
             "claude",
@@ -10825,6 +10864,7 @@ mod tests {
             cache_read: 25,
             cache_write: 0,
             reasoning: 25,
+            cache_write_1h: 0,
         };
         timed.duration_ms = Some(400);
 
@@ -10843,6 +10883,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
 
         let entries = aggregate_model_usage_entries(vec![timed, untimed], &GroupBy::ClientModel);
@@ -11031,6 +11072,7 @@ mod tests {
                 cache_read: 2,
                 cache_write: 0,
                 reasoning: 1,
+                cache_write_1h: 0,
             },
             1.25,
         );
@@ -12084,6 +12126,7 @@ mod tests {
                     cache_read: 2,
                     cache_write: 1,
                     reasoning: 3,
+                    cache_write_1h: 0,
                 },
                 0.5,
                 agent.map(|a| a.to_string()),
@@ -12133,6 +12176,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )
@@ -12216,6 +12260,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             );
@@ -12254,6 +12299,7 @@ mod tests {
                         cache_read: 0,
                         cache_write: 0,
                         reasoning: 0,
+                        cache_write_1h: 0,
                     },
                     0.0,
                 )
@@ -12670,6 +12716,7 @@ mod tests {
                 cache_read: 5,
                 cache_write: 2,
                 reasoning: 1,
+                cache_write_1h: 0,
             },
             0.0,
             Some("message-v1".to_string()),
@@ -15000,6 +15047,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.42,
             Some("planner".to_string()),
@@ -15035,6 +15083,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15104,6 +15153,7 @@ mod tests {
                 cache_read: 3,
                 cache_write: 7,
                 reasoning: 2,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15170,6 +15220,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.42,
         );
@@ -15340,6 +15391,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15376,6 +15428,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15414,6 +15467,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15448,6 +15502,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 7,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15483,6 +15538,7 @@ mod tests {
                 cache_read: 7,
                 cache_write: 0,
                 reasoning: 3,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15517,6 +15573,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15559,6 +15616,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15601,6 +15659,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15645,6 +15704,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.123,
         );
@@ -15692,6 +15752,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 3,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15734,6 +15795,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15759,6 +15821,7 @@ mod tests {
                 cache_read: 50_000,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15794,6 +15857,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15828,6 +15892,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15866,6 +15931,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -16983,6 +17049,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 embedded_cost,
             )
@@ -18610,6 +18677,7 @@ mod tests {
                 cache_read: 60,
                 cache_write: 0,
                 reasoning: 5,
+                cache_write_1h: 0,
             }
         );
         assert!(selected.iter().any(|message| {
@@ -19410,6 +19478,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             cost_source: crate::CostSource::Unknown,
@@ -19924,6 +19993,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )
@@ -19954,6 +20024,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )

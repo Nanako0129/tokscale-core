@@ -1170,6 +1170,7 @@ impl PricingLookup {
             cache_read,
             cache_write,
             reasoning,
+            cache_write_1h: 0,
         };
         self.calculate_cost_with_provider(model_id, None, &usage)
     }
@@ -5635,6 +5636,7 @@ mod tests {
             cache_read: 3,
             cache_write: 7,
             reasoning: 2,
+            cache_write_1h: 0,
         };
 
         let estimate = lookup
@@ -6114,6 +6116,7 @@ mod tests {
             cache_read: 2,
             cache_write: 0,
             reasoning: 4,
+            cache_write_1h: 0,
         };
 
         let cost = lookup.calculate_cost_with_provider("openai/gpt-5.5", Some("openai"), &usage);
@@ -6202,6 +6205,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
         )
         .cost;
