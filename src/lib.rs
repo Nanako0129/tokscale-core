@@ -250,9 +250,19 @@ pub struct TokenBreakdown {
     pub cache_write: i64,
     pub reasoning: i64,
     /// The 1-hour-TTL portion of `cache_write`, which Anthropic bills at 2x
-    /// base input where a 5-minute write is 1.25x. Always <= `cache_write`,
-    /// which stays the total. Not yet populated or priced -- this change
-    /// carries the layout only.
+    /// base input where a 5-minute write is 1.25x.
+    ///
+    /// This is a **subset** of `cache_write`, never a bucket beside it:
+    /// `cache_write` stays the whole write and the invariant
+    /// `cache_write_1h <= cache_write` holds, which is why `total()` and
+    /// every total sum ignore this field. Pricing derives the 5-minute
+    /// portion by subtraction (`cache_write - cache_write_1h`) and reprices
+    /// this one; a consumer that adds this to a total, or prices it without
+    /// subtracting, double-counts those tokens.
+    ///
+    /// Zero means "no 1h portion reported", which covers both a turn that
+    /// wrote none and a transcript predating the split. Both price the whole
+    /// write at the 5-minute rate, as every turn did before the split existed.
     ///
     /// `default` because this type is also read from JSON, where a payload
     /// written before the split simply lacks the key and must still decode.
