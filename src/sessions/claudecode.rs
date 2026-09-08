@@ -79,6 +79,53 @@ pub struct ClaudeUsage {
     pub output_tokens: Option<i64>,
     pub cache_read_input_tokens: Option<i64>,
     pub cache_creation_input_tokens: Option<i64>,
+    /// Present since Anthropic introduced the 1-hour cache TTL. Absent on
+    /// older transcripts, which is why the whole struct is optional rather
+    /// than defaulted: absent means "this turn predates the split", not
+    /// "this turn wrote no 1h cache", and the two must price differently
+    /// only if we ever want to distinguish them. Today both fall back to
+    /// pricing the whole write at the 5-minute rate, which is what the
+    /// parser did for every turn before this change.
+    pub cache_creation: Option<ClaudeCacheCreation>,
+}
+
+/// The per-TTL split of `cache_creation_input_tokens`, which is their sum.
+///
+/// Anthropic bills a 5-minute cache write at 1.25x base input and a 1-hour
+/// write at 2x, so a transcript that reports only the total is priced as if
+/// every write were the cheaper kind. Measured over 84,713 assistant turns
+/// carrying a cache write, the two fields summed to the reported total in
+/// every single one; the clamp at the call sites is defence against a
+/// malformed payload, not a case this corpus produced.
+#[derive(Debug, Deserialize)]
+pub struct ClaudeCacheCreation {
+    pub ephemeral_1h_input_tokens: Option<i64>,
+}
+
+/// The 1h portion of a turn's cache write, clamped to the total.
+///
+/// The two numbers come from independent JSON fields, so a payload that
+/// reports a larger split than total would otherwise make the derived 5m
+/// bucket (`cache_write - cache_write_1h`) negative. `tiered_cost` clamps a
+/// negative bucket to zero internally, which would silently drop the write
+/// from the bill instead of surfacing the bad payload; clamping here keeps
+/// the invariant `cache_write_1h <= cache_write` that the pricing split and
+/// every fold depend on.
+fn clamp_cache_write_1h(cache_write: i64, cache_write_1h: i64) -> i64 {
+    cache_write_1h.max(0).min(cache_write.max(0))
+}
+
+/// The 1h portion reported by a typed `ClaudeUsage`, or zero when the
+/// transcript predates the split.
+fn claude_cache_write_1h(usage: &ClaudeUsage) -> i64 {
+    clamp_cache_write_1h(
+        usage.cache_creation_input_tokens.unwrap_or(0),
+        usage
+            .cache_creation
+            .as_ref()
+            .and_then(|c| c.ephemeral_1h_input_tokens)
+            .unwrap_or(0),
+    )
 }
 
 /// Tier 1 of subagent resolution on its own: the sibling `.meta.json` sidecar's
@@ -698,7 +745,7 @@ pub fn parse_claude_file_with_cache_and_home(
                         cache_read: usage.cache_read_input_tokens.unwrap_or(0).max(0),
                         cache_write: usage.cache_creation_input_tokens.unwrap_or(0).max(0),
                         reasoning: 0,
-                        cache_write_1h: 0,
+                        cache_write_1h: claude_cache_write_1h(&usage),
                     },
                     0.0,
                     dedup_key,
@@ -891,6 +938,7 @@ fn merge_claude_duplicate(
     t.cache_write = t
         .cache_write
         .max(usage.cache_creation_input_tokens.unwrap_or(0).max(0));
+    t.cache_write_1h = t.cache_write_1h.max(claude_cache_write_1h(usage));
 
     if let Some(timestamp_ms) = parsed_timestamp {
         if timestamp_ms >= existing.timestamp {
@@ -1303,6 +1351,7 @@ struct ClaudeHeadlessState {
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    cache_write_1h: i64,
     timestamp_ms: Option<i64>,
 }
 
@@ -1447,7 +1496,13 @@ fn extract_claude_headless_message(
                 .unwrap_or(0)
                 .max(0),
             reasoning: 0,
-            cache_write_1h: 0,
+            cache_write_1h: clamp_cache_write_1h(
+                extract_i64(usage.get("cache_creation_input_tokens")).unwrap_or(0),
+                usage
+                    .get("cache_creation")
+                    .and_then(|c| extract_i64(c.get("ephemeral_1h_input_tokens")))
+                    .unwrap_or(0),
+            ),
         },
         0.0,
     ))
@@ -1639,6 +1694,12 @@ fn update_claude_usage(state: &mut ClaudeHeadlessState, usage: &Value) {
     if let Some(cache_write) = extract_i64(usage.get("cache_creation_input_tokens")) {
         state.cache_write = state.cache_write.max(cache_write);
     }
+    if let Some(cache_write_1h) = usage
+        .get("cache_creation")
+        .and_then(|c| extract_i64(c.get("ephemeral_1h_input_tokens")))
+    {
+        state.cache_write_1h = state.cache_write_1h.max(cache_write_1h);
+    }
 }
 
 fn finalize_headless_state(
@@ -1676,7 +1737,7 @@ fn finalize_headless_state(
             cache_read: state.cache_read.max(0),
             cache_write: state.cache_write.max(0),
             reasoning: 0,
-            cache_write_1h: 0,
+            cache_write_1h: clamp_cache_write_1h(state.cache_write, state.cache_write_1h),
         },
         0.0,
     );
@@ -1813,6 +1874,65 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, content).unwrap();
         (temp_dir, path)
+    }
+
+    /// The shape here is copied from a real transcript: `cache_creation` is a
+    /// sibling of `cache_creation_input_tokens`, and the two ephemeral fields
+    /// sum to it. Over 84,713 assistant turns in the corpus this was measured
+    /// against, that sum held every time.
+    #[test]
+    fn the_one_hour_portion_of_a_cache_write_is_read_from_the_transcript() {
+        let content = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"output_tokens":1002,"cache_read_input_tokens":26470,"cache_creation_input_tokens":40575,"cache_creation":{"ephemeral_1h_input_tokens":30000,"ephemeral_5m_input_tokens":10575}}}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].tokens.cache_write, 40575,
+            "the total keeps its meaning: it is the whole write, not the 5m half"
+        );
+        assert_eq!(
+            messages[0].tokens.cache_write_1h, 30000,
+            "the 1h portion is a subset of that total"
+        );
+    }
+
+    /// A transcript written before Anthropic split the field has no
+    /// `cache_creation` object at all. Reporting zero there is what keeps the
+    /// whole write on the 5-minute rate, which is how it was priced before
+    /// this change -- inventing a split for a turn that reported none would
+    /// rewrite history the transcript carries no evidence about.
+    #[test]
+    fn a_transcript_predating_the_split_reports_no_one_hour_portion() {
+        let content = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.cache_write, 5);
+        assert_eq!(messages[0].tokens.cache_write_1h, 0);
+    }
+
+    /// The two numbers come from independent fields, so nothing in the format
+    /// stops a payload reporting a larger split than total. Clamping at the
+    /// parser keeps the invariant every fold and the pricing subtraction
+    /// depend on, rather than letting a negative 5m bucket reach
+    /// `tiered_cost`, which would clamp it to zero and drop the write.
+    #[test]
+    fn a_one_hour_portion_larger_than_the_total_is_clamped_at_the_parser() {
+        let content = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"output_tokens":10,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_1h_input_tokens":9999,"ephemeral_5m_input_tokens":0}}}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.cache_write, 100);
+        assert_eq!(
+            messages[0].tokens.cache_write_1h, 100,
+            "clamped to the total, never above it"
+        );
     }
 
     #[test]

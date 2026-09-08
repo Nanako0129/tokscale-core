@@ -868,7 +868,16 @@ fn parser_version(client: ClientId) -> u32 {
         // here used to discard retained-only turns; an entry behind the
         // current version is now kept and read through `retainable_history`.
         // A `CACHE_FORMAT_VERSION` bump alongside one still discards them.
-        ClientId::Claude => 3,
+        //
+        // 4: the cache write is split into its 1h and 5m portions, read from
+        // `usage.cache_creation.ephemeral_1h_input_tokens`. Without this bump
+        // the fix reaches nobody who already has a cache: `get` returns an
+        // entry whose own `parser_version` matches as a hit, so a transcript
+        // whose fingerprint has not changed is never re-parsed, and its
+        // `cache_write_1h` stays zero and its cost stays at the old value.
+        // Cold-cache verification passes either way, which is exactly why
+        // the acceptance for this change is a warm-cache measurement.
+        ClientId::Claude => 4,
         _ => 1,
     }
 }
@@ -5600,8 +5609,12 @@ mod tests {
         assert_eq!(parser_version(ClientId::Hermes), 1);
         assert_eq!(parser_version(ClientId::Trae), 1);
         // 2 was RET-CLAUDE-001 retention; 3 dropped the tool_result char
-        // estimate, which keeping migratable entries makes non-lossy.
-        assert_eq!(parser_version(ClientId::Claude), 3);
+        // estimate, which keeping migratable entries makes non-lossy; 4 reads
+        // the 1h/5m cache-write split. Each of those changed what a parse
+        // produces from an unchanged transcript, which is the whole reason
+        // this number exists -- without the bump `get` treats a stale entry
+        // as a hit and the new parse never runs.
+        assert_eq!(parser_version(ClientId::Claude), 4);
         assert_eq!(CacheIdentity::synthetic().parser_version, 1);
         for client in ClientId::iter() {
             if !matches!(

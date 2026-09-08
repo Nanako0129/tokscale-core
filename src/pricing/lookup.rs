@@ -1207,6 +1207,7 @@ pub(crate) fn compute_cost_and_coverage_for_lookup_result(
             usage.output,
             usage.cache_read,
             usage.cache_write,
+            usage.cache_write_1h,
             usage.reasoning,
         )
     } else {
@@ -1216,6 +1217,7 @@ pub(crate) fn compute_cost_and_coverage_for_lookup_result(
             usage.output,
             usage.cache_read,
             usage.cache_write,
+            usage.cache_write_1h,
             usage.reasoning,
         )
     };
@@ -1338,6 +1340,8 @@ fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> 
     let output_clamped = usage.output.max(0).saturating_add(usage.reasoning.max(0)) as f64;
     let cache_read_clamped = usage.cache_read.max(0) as f64;
     let cache_write_clamped = usage.cache_write.max(0) as f64;
+    let cache_write_1h_clamped = (usage.cache_write_1h.max(0) as f64).min(cache_write_clamped);
+    let cache_write_5m_clamped = cache_write_clamped - cache_write_1h_clamped;
     let mut fold = CoverageFold::default();
 
     if uses_full_session_long_context_tier(result) {
@@ -1423,9 +1427,12 @@ fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> 
     }
 
     // Cache-write remains an independent marginal bucket, including for the
-    // full-session long-context identities.
+    // full-session long-context identities. The two TTL portions are observed
+    // separately because they are priced off different table entries: a model
+    // whose table carries a cache-creation rate but no input rate would report
+    // Complete while the 1h half silently cost zero.
     fold.observe(ordinary_bucket_coverage(
-        cache_write_clamped,
+        cache_write_5m_clamped,
         result.pricing.cache_creation_input_token_cost,
         &[(
             TIERED_PRICING_THRESHOLD_200K_TOKENS,
@@ -1434,16 +1441,44 @@ fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> 
                 .cache_creation_input_token_cost_above_200k_tokens,
         )],
     ));
+    fold.observe(ordinary_bucket_coverage(
+        cache_write_1h_clamped,
+        result.pricing.input_cost_per_token,
+        &[
+            (
+                TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                result.pricing.input_cost_per_token_above_128k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                result.pricing.input_cost_per_token_above_200k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                result.pricing.input_cost_per_token_above_256k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                result.pricing.input_cost_per_token_above_272k_tokens,
+            ),
+        ],
+    ));
 
     fold.finish()
 }
 
+/// `cache_write_1h` is the 1-hour-TTL portion of `cache_write`, not a bucket
+/// beside it. Anthropic bills a 5-minute write at 1.25x base input and a
+/// 1-hour write at 2x, so the 1h portion is subtracted from the cache-write
+/// bucket and repriced rather than added on top; passing it without
+/// subtracting would bill those tokens twice.
 pub fn compute_cost(
     pricing: &ModelPricing,
     input: i64,
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    cache_write_1h: i64,
     reasoning: i64,
 ) -> f64 {
     let safe_price = |opt: Option<f64>| opt.filter(|v| is_valid_price_value(*v)).unwrap_or(0.0);
@@ -1478,6 +1513,13 @@ pub fn compute_cost(
     let output_clamped = output.max(0).saturating_add(reasoning.max(0)) as f64;
     let cache_read_clamped = cache_read.max(0) as f64;
     let cache_write_clamped = cache_write.max(0) as f64;
+    // The parser already clamps this to the total, but `compute_cost` is
+    // `pub` and this is the one place the subtraction happens: a caller that
+    // over-reports the split would otherwise drive the 5m bucket negative,
+    // and `tiered_cost` would silently clamp that to zero, dropping the whole
+    // write from the bill instead of surfacing the bad input.
+    let cache_write_1h_clamped = (cache_write_1h.max(0) as f64).min(cache_write_clamped);
+    let cache_write_5m_clamped = cache_write_clamped - cache_write_1h_clamped;
 
     let input_cost = tiered_cost(
         input_clamped,
@@ -1544,16 +1586,50 @@ pub fn compute_cost(
             ),
         ],
     );
-    let cache_write_cost = tiered_cost(
-        cache_write_clamped,
+    let cache_write_5m_cost = tiered_cost(
+        cache_write_5m_clamped,
         pricing.cache_creation_input_token_cost,
         &[(
             TIERED_PRICING_THRESHOLD_200K_TOKENS,
             pricing.cache_creation_input_token_cost_above_200k_tokens,
         )],
     );
+    // A 1-hour write is 2x base input where a 5-minute write is 1.25x, and no
+    // pricing table publishes the 1h rate as its own key. `tiered_cost` is
+    // linear in the price, so doubling the whole result is exactly doubling
+    // every tier, and the input tier ladder is reused rather than a second
+    // table of pre-doubled thresholds being invented.
+    //
+    // Each TTL bucket walks its own tier ladder from zero. That extends the
+    // approximation the function already makes -- input, cache read and cache
+    // write are each tiered independently rather than against one request
+    // context size -- and it matches how Anthropic bills the two writes as
+    // separate line items.
+    let cache_write_1h_cost = 2.0
+        * tiered_cost(
+            cache_write_1h_clamped,
+            pricing.input_cost_per_token,
+            &[
+                (
+                    TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                    pricing.input_cost_per_token_above_128k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                    pricing.input_cost_per_token_above_200k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                    pricing.input_cost_per_token_above_256k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                    pricing.input_cost_per_token_above_272k_tokens,
+                ),
+            ],
+        );
 
-    input_cost + output_cost + cache_read_cost + cache_write_cost
+    input_cost + output_cost + cache_read_cost + cache_write_5m_cost + cache_write_1h_cost
 }
 
 /// Apply a provider-documented long-context tier to the whole request. The
@@ -1565,6 +1641,7 @@ fn compute_full_session_long_context_cost(
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    cache_write_1h: i64,
     reasoning: i64,
 ) -> f64 {
     let safe_price = |opt: Option<f64>| opt.filter(|v| is_valid_price_value(*v)).unwrap_or(0.0);
@@ -1603,7 +1680,7 @@ fn compute_full_session_long_context_cost(
 
     // Cache-write is an independently reported subset and does not select the
     // request's input-context tier.
-    let cache_write_cost = compute_cost(pricing, 0, 0, 0, cache_write, 0);
+    let cache_write_cost = compute_cost(pricing, 0, 0, 0, cache_write, cache_write_1h, 0);
 
     input_cost + output_cost + cache_read_cost + cache_write_cost
 }
@@ -4941,7 +5018,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 200_000, 200_000, 0, 0, 0);
+        let cost = compute_cost(&pricing, 200_000, 200_000, 0, 0, 0, 0);
         let expected = 200_000.0 * 0.000001 + 200_000.0 * 0.000003;
 
         assert!((cost - expected).abs() < 1e-12);
@@ -4959,7 +5036,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 200_001, 200_001, 0, 0, 0);
+        let cost = compute_cost(&pricing, 200_001, 200_001, 0, 0, 0, 0);
         let expected =
             (200_000.0 * 0.000001 + 1.0 * 0.000002) + (200_000.0 * 0.000003 + 1.0 * 0.000004);
 
@@ -4980,7 +5057,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 272_001, 272_001, 272_001, 0, 0);
+        let cost = compute_cost(&pricing, 272_001, 272_001, 272_001, 0, 0, 0);
         let expected = (272_000.0 * 0.000005 + 1.0 * 0.000010)
             + (272_000.0 * 0.000030 + 1.0 * 0.000045)
             + (272_000.0 * 0.0000005 + 1.0 * 0.000001);
@@ -5000,7 +5077,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 300_000, 0, 0, 0, 0);
+        let cost = compute_cost(&pricing, 300_000, 0, 0, 0, 0, 0);
         let expected = (128_000.0 * 0.000001)
             + (128_000.0 * 0.000002)
             + (16_000.0 * 0.000003)
@@ -5021,10 +5098,168 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 200_001, 200_000, 0, 0, 0);
+        let cost = compute_cost(&pricing, 200_001, 200_000, 0, 0, 0, 0);
         let expected = (200_000.0 * 0.000001 + 1.0 * 0.000002) + (200_000.0 * 0.000003);
 
         assert!((cost - expected).abs() < 1e-12);
+    }
+
+    /// Anthropic bills a 5-minute cache write at 1.25x base input and a
+    /// 1-hour write at 2x. The engine reads only the total until #287, so
+    /// every write was priced at the cache-creation rate, which is the 5m
+    /// one. The expected value here is worked out by hand from the rates in
+    /// the fixture, not read back out of the function under test.
+    #[test]
+    fn one_hour_cache_writes_are_priced_at_twice_base_input() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000003,
+                "cache_creation_input_token_cost": 0.00000375
+            }"#,
+        )
+        .unwrap();
+
+        // 1000 tokens written, 600 of them with the 1-hour TTL.
+        let cost = compute_cost(&pricing, 0, 0, 0, 1000, 600, 0);
+        let expected = 400.0 * 0.00000375 + 600.0 * 2.0 * 0.000003;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "got {cost}, expected {expected}"
+        );
+
+        // The old behaviour, still reachable by passing no 1h portion, is the
+        // number this change moves away from -- stated here so the test fails
+        // if the split silently stops applying rather than merely drifting.
+        let all_five_minute = compute_cost(&pricing, 0, 0, 0, 1000, 0, 0);
+        assert!((all_five_minute - 1000.0 * 0.00000375).abs() < 1e-12);
+        assert!(
+            cost > all_five_minute,
+            "the 1h rate is the more expensive one"
+        );
+    }
+
+    /// A transcript written before Anthropic split the field reports only the
+    /// total. Pricing it at the 5-minute rate is what the parser did for
+    /// every turn before this change, and staying on that path is what keeps
+    /// the change from rewriting history it has no evidence about.
+    #[test]
+    fn a_cache_write_with_no_reported_split_stays_on_the_five_minute_rate() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000003,
+                "cache_creation_input_token_cost": 0.00000375
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 0, 0, 0, 1000, 0, 0);
+        assert!((cost - 1000.0 * 0.00000375).abs() < 1e-12);
+    }
+
+    /// The 1h bucket is priced off `input_cost_per_token`, a different table
+    /// entry from the one the 5m bucket uses. A model whose table carries the
+    /// cache-creation rate but no input rate therefore prices the 1h half at
+    /// zero, and the coverage fold has to say so -- reporting Complete while
+    /// silently undercharging is the failure this observation exists for.
+    #[test]
+    fn a_one_hour_write_with_no_input_rate_is_not_reported_as_complete() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "cache_creation_input_token_cost": 0.00000375
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 0, 0, 0, 1000, 600, 0);
+        assert!(
+            (cost - 400.0 * 0.00000375).abs() < 1e-12,
+            "only the 5m half can be priced"
+        );
+
+        let usage = TokenBreakdown {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 1000,
+            reasoning: 0,
+            cache_write_1h: 600,
+        };
+        let result = LookupResult {
+            pricing,
+            matched_key: "test-model".to_string(),
+            source: "LiteLLM".to_string(),
+        };
+        assert_ne!(
+            coverage_for_lookup_result(&result, &usage),
+            EstimateCoverage::Complete,
+            "an unpriced 1h half must not be reported as fully covered"
+        );
+    }
+
+    /// The mirror of the test above. Coverage subtracts the 1h portion for the
+    /// same reason pricing does: when the whole write is 1h, the 5m bucket is
+    /// empty and must not demand a cache-creation rate that nothing is being
+    /// charged against. Without the subtraction here a model priced entirely
+    /// correctly -- input rate present, every token billed -- would still be
+    /// reported as incompletely covered.
+    #[test]
+    fn an_all_one_hour_write_does_not_demand_a_five_minute_rate() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000003
+            }"#,
+        )
+        .unwrap();
+
+        let usage = TokenBreakdown {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 1000,
+            reasoning: 0,
+            cache_write_1h: 1000,
+        };
+        let result = LookupResult {
+            pricing,
+            matched_key: "test-model".to_string(),
+            source: "LiteLLM".to_string(),
+        };
+
+        assert!(
+            (compute_cost(&result.pricing, 0, 0, 0, 1000, 1000, 0) - 1000.0 * 2.0 * 0.000003).abs()
+                < 1e-12,
+            "every token is priced"
+        );
+        assert_eq!(
+            coverage_for_lookup_result(&result, &usage),
+            EstimateCoverage::Complete,
+            "an empty 5m bucket must not be observed against a missing rate"
+        );
+    }
+
+    /// The two numbers arrive from independent JSON fields. A payload
+    /// reporting a larger split than total would drive the 5m bucket
+    /// negative, and `tiered_cost` clamps a negative bucket to zero -- which
+    /// would drop the whole write from the bill rather than surface the bad
+    /// input. The clamp inside `compute_cost` is what prevents that.
+    #[test]
+    fn an_over_reported_one_hour_split_is_clamped_to_the_total() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000003,
+                "cache_creation_input_token_cost": 0.00000375
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 0, 0, 0, 1000, 5000, 0);
+        let expected = 1000.0 * 2.0 * 0.000003;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "the whole write prices at the 1h rate, with no negative 5m bucket \
+             and no silently dropped tokens: got {cost}, expected {expected}"
+        );
+        assert!(cost > 0.0);
     }
 
     #[test]
@@ -5036,8 +5271,8 @@ mod tests {
         )
         .unwrap();
 
-        let at_threshold = compute_cost(&pricing, 200_000, 0, 0, 0, 0);
-        let above_threshold = compute_cost(&pricing, 200_001, 0, 0, 0, 0);
+        let at_threshold = compute_cost(&pricing, 200_000, 0, 0, 0, 0, 0);
+        let above_threshold = compute_cost(&pricing, 200_001, 0, 0, 0, 0, 0);
 
         assert_eq!(at_threshold, 0.0);
         assert!((above_threshold - 0.000002).abs() < 1e-12);
@@ -5053,8 +5288,8 @@ mod tests {
         )
         .unwrap();
 
-        let at_threshold = compute_cost(&pricing, 0, 0, 200_000, 0, 0);
-        let above_threshold = compute_cost(&pricing, 0, 0, 200_001, 0, 0);
+        let at_threshold = compute_cost(&pricing, 0, 0, 200_000, 0, 0, 0);
+        let above_threshold = compute_cost(&pricing, 0, 0, 200_001, 0, 0, 0);
 
         assert!((at_threshold - (200_000.0 * 0.0000001)).abs() < 1e-12);
         assert!((above_threshold - (200_000.0 * 0.0000001 + 0.0000002)).abs() < 1e-12);
@@ -5070,8 +5305,8 @@ mod tests {
         )
         .unwrap();
 
-        let at_threshold = compute_cost(&pricing, 0, 0, 0, 200_000, 0);
-        let above_threshold = compute_cost(&pricing, 0, 0, 0, 200_001, 0);
+        let at_threshold = compute_cost(&pricing, 0, 0, 0, 200_000, 0, 0);
+        let above_threshold = compute_cost(&pricing, 0, 0, 0, 200_001, 0, 0);
 
         assert!((at_threshold - (200_000.0 * 0.0000003)).abs() < 1e-12);
         assert!((above_threshold - (200_000.0 * 0.0000003 + 0.0000004)).abs() < 1e-12);
@@ -5084,7 +5319,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cost = compute_cost(&pricing, 250_000, 0, 0, 0, 0);
+        let cost = compute_cost(&pricing, 250_000, 0, 0, 0, 0, 0);
 
         assert!((cost - (250_000.0 * 0.000001)).abs() < 1e-12);
     }
@@ -5108,9 +5343,9 @@ mod tests {
         };
 
         let expected = 200_001.0 * 0.000001;
-        assert!((compute_cost(&pricing_negative, 200_001, 0, 0, 0, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_infinite, 200_001, 0, 0, 0, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_nan, 200_001, 0, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_negative, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -5121,7 +5356,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cost = compute_cost(&pricing, 0, 199_999, 0, 0, 1);
+        let cost = compute_cost(&pricing, 0, 199_999, 0, 0, 0, 1);
         let expected = 200_000.0 * 0.000003;
 
         assert!((cost - expected).abs() < 1e-12);
@@ -5146,9 +5381,9 @@ mod tests {
         };
 
         let expected = 200_001.0 * 0.000003;
-        assert!((compute_cost(&pricing_negative, 0, 199_999, 0, 0, 2) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_infinite, 0, 199_999, 0, 0, 2) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_nan, 0, 199_999, 0, 0, 2) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_negative, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -5170,9 +5405,9 @@ mod tests {
         };
 
         let expected = 200_001.0 * 0.0000001;
-        assert!((compute_cost(&pricing_negative, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_infinite, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_nan, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_negative, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -5194,9 +5429,9 @@ mod tests {
         };
 
         let expected = 200_001.0 * 0.0000003;
-        assert!((compute_cost(&pricing_negative, 0, 0, 0, 200_001, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_infinite, 0, 0, 0, 200_001, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_nan, 0, 0, 0, 200_001, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_negative, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
     }
 
     #[test]
