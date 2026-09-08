@@ -79,13 +79,17 @@ pub struct ClaudeUsage {
     pub output_tokens: Option<i64>,
     pub cache_read_input_tokens: Option<i64>,
     pub cache_creation_input_tokens: Option<i64>,
-    /// Present since Anthropic introduced the 1-hour cache TTL. Absent on
-    /// older transcripts, which is why the whole struct is optional rather
-    /// than defaulted: absent means "this turn predates the split", not
-    /// "this turn wrote no 1h cache", and the two must price differently
-    /// only if we ever want to distinguish them. Today both fall back to
-    /// pricing the whole write at the 5-minute rate, which is what the
-    /// parser did for every turn before this change.
+    /// Present since Anthropic introduced the 1-hour cache TTL, absent on
+    /// older transcripts. When it is present its `ephemeral_1h_input_tokens`
+    /// is read into `TokenBreakdown::cache_write_1h` and priced at 2x base
+    /// input, with the remainder of the write staying on the 5-minute rate.
+    ///
+    /// When it is absent the whole write prices at the 5-minute rate, as
+    /// every turn did before the split existed. That conflates "this turn
+    /// predates the split" with "this turn wrote no 1h cache", which is
+    /// deliberate: the transcript carries no evidence separating them, and
+    /// inventing a split for a turn that reported none would rewrite history
+    /// rather than read it.
     pub cache_creation: Option<ClaudeCacheCreation>,
 }
 
