@@ -68,6 +68,22 @@ pub struct CodexPayload {
     /// system-injected context (`<environment_context>`, `<system-reminder>`,
     /// `<user_instructions>`, …) begins with `<`.
     pub message: Option<String>,
+    /// Body of an `event_msg` `item_completed` payload. Codex 0.145+ stopped
+    /// emitting `user_message` events and now reports the same human input as
+    /// an `item_completed` carrying an `item` whose `type` is `"UserMessage"`.
+    ///
+    /// Deliberately `Value` rather than a typed struct. `CodexEntry` is
+    /// deserialized one whole line at a time, so a single field whose JSON type
+    /// does not match its Rust type rejects the entire line: the entry is then
+    /// unhandled and falls through to `parse_codex_headless_line`, which
+    /// overwrites `current_model` before its usage check and mints a message
+    /// from any `usage` object anywhere in the line. `item` holds a different
+    /// payload per item type — `CommandExecution`, `Reasoning`, `AgentMessage`,
+    /// `SubAgentActivity`, `FileChange`, `CollabAgentToolCall`, `Extension`,
+    /// `McpToolCall`, `ContextCompaction` — none of which we control across
+    /// Codex versions. `Value` accepts every one of them. Same lesson as
+    /// `started_at` above, reached the same way.
+    pub item: Option<Value>,
 }
 
 /// Lenient `Option<i64>` deserializer for `CodexPayload::started_at`. Coerces
@@ -512,6 +528,36 @@ fn parse_codex_reader<R: BufRead>(
                             parse_codex_entry_timestamp(entry.timestamp.as_deref());
                     }
                     handled = true;
+                }
+
+                // Codex 0.145+ reports that same human input as an
+                // `item_completed` carrying a `UserMessage` item instead of a
+                // `user_message` event. Same deferred marker, same filter — a
+                // parallel branch rather than a boolean OR, matching how every
+                // other event type is recognized in this loop.
+                //
+                // Deliberately no `handled = true`, unlike the sibling branch
+                // above: `item_completed` already falls through to the headless
+                // fallback today, so leaving it alone keeps that path bit for
+                // bit as it was and this change cannot move a single token.
+                //
+                // Deliberately no `last_accepted_token_timestamp_ms` reset
+                // either. The sibling resets it because `turn_context` does not
+                // always precede the reply; that is equally true here (measured
+                // on one day of real rollouts: 15 of 78 turns had no preceding
+                // `turn_context`), but those replies already anchor to the
+                // previous turn's last token time today. Fixing the anchor
+                // would move messages between days, which is a separate defect
+                // with a separate blast radius, tracked on its own.
+                if entry.entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("item_completed")
+                {
+                    if let Some(text) = payload.item.as_ref().and_then(codex_user_message_item_text)
+                    {
+                        if codex_message_is_human_turn(Some(&text)) {
+                            state.pending_turn_start = true;
+                        }
+                    }
                 }
 
                 // Process token_count events
@@ -1243,17 +1289,54 @@ fn extract_timestamp_from_value(value: &Value) -> Option<i64> {
         .and_then(parse_timestamp_value)
 }
 
-/// Prefixes Codex prepends to context it injects as `user_message` events.
-/// These are the bodies that must NOT be counted as human turns.
-const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 3] = [
+/// Prefixes Codex prepends to context it injects as a human-input body, in
+/// either transport: a `user_message` event or an `item_completed`
+/// `UserMessage` item. These are the bodies that must NOT be counted as human
+/// turns.
+///
+/// `<task-notification>` is a harness-injected report that a background agent
+/// finished. It arrives on the `UserMessage` transport only, and it is not
+/// rare enough to leave in: one real session emitted 549 of them in a single
+/// day, against 384 genuine turns that day.
+const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 4] = [
     "<environment_context>",
     "<system-reminder>",
     "<user_instructions>",
+    "<task-notification>",
 ];
 
-/// Returns true when a Codex `user_message` payload represents real human input
+/// Text of an `item_completed` payload's `item`, when that item is the human
+/// input Codex 0.145+ emits in place of a `user_message` event. `None` for
+/// every other item type, which is what keeps assistant messages, tool calls
+/// and reasoning items from being mistaken for a turn.
+///
+/// A `UserMessage` with no readable text yields `Some("")`, not `None`: an
+/// image-only prompt is still one human turn, and
+/// [`codex_message_is_human_turn`] maps `None` to "not a turn". Anything
+/// unexpected in `content` — absent, not an array, elements that are not
+/// objects or carry no `text` — contributes nothing and is never an error, so
+/// a shape we have not seen can only lose text, never reject the line.
+fn codex_user_message_item_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("UserMessage") {
+        return None;
+    }
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    Some(text)
+}
+
+/// Returns true when a Codex human-input body represents real human input
 /// rather than system-injected context. Codex stores the body as a plain string
-/// in `payload.message`; the harness injects context blocks that open with one of
+/// in `payload.message`, or as the text of an `item_completed` `UserMessage`
+/// item; the harness injects context blocks that open with one of
 /// the known tags in [`CODEX_SYSTEM_INJECTED_PREFIXES`] after trimming. Matching
 /// those specific prefixes — rather than any leading `<` — avoids dropping
 /// legitimate human prompts that happen to start with markup (asking about a
@@ -1302,6 +1385,13 @@ mod tests {
         )));
         // A missing body is never a human turn.
         assert!(!codex_message_is_human_turn(None));
+        // A background-agent completion report is injected, not typed.
+        assert!(!codex_message_is_human_turn(Some(
+            "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"
+        )));
+        // An image-only prompt carries no text but is still a human turn; the
+        // helper hands us `Some("")` for it and this is where that lands.
+        assert!(codex_message_is_human_turn(Some("")));
     }
 
     fn create_test_file(content: &str) -> NamedTempFile {
@@ -2896,6 +2986,281 @@ mod tests {
             !incremental.state.pending_turn_start,
             "the pending flag is consumed once applied"
         );
+    }
+
+    /// Fixture helper for the `item_completed` transport Codex 0.145+ uses.
+    /// `content` is spliced in raw so a test can hand it a shape the parser is
+    /// not supposed to trust.
+    fn item_completed_line(timestamp: &str, item_type: &str, content: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"{item_type}","content":{content}}}}}}}"#
+        )
+    }
+
+    fn user_text_item(timestamp: &str, text: &str) -> String {
+        item_completed_line(
+            timestamp,
+            "UserMessage",
+            &format!(r#"[{{"type":"text","text":{}}}]"#, serde_json::json!(text)),
+        )
+    }
+
+    const TOKEN_COUNT_10_3: &str = r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#;
+    const TOKEN_COUNT_20_6: &str = r#"{"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"cached_input_tokens":4,"output_tokens":6}}}}"#;
+    const TURN_CONTEXT: &str = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+
+    #[test]
+    fn test_item_completed_user_message_marks_next_token_count_as_turn_start() {
+        let content = [
+            TURN_CONTEXT,
+            &user_text_item("2026-01-01T00:00:02Z", "continue please"),
+            TOKEN_COUNT_10_3,
+            TOKEN_COUNT_20_6,
+        ]
+        .join("\n");
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[0].is_turn_start,
+            "the first reply after a UserMessage item is a turn start"
+        );
+        assert!(
+            !messages[1].is_turn_start,
+            "a later reply with no new human input is not a turn start"
+        );
+    }
+
+    #[test]
+    fn test_task_notification_item_does_not_mark_turn_start() {
+        // A background agent finishing is reported on the same transport as a
+        // human prompt. One real session emitted 549 of these in a day.
+        let content = [
+            TURN_CONTEXT,
+            &user_text_item(
+                "2026-01-01T00:00:02Z",
+                "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n</task-notification>",
+            ),
+            TOKEN_COUNT_10_3,
+        ]
+        .join("\n");
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1, "the usage itself still counts");
+        assert!(
+            !messages[0].is_turn_start,
+            "an injected task notification is not a human turn"
+        );
+    }
+
+    #[test]
+    fn test_injected_context_item_does_not_mark_turn_start() {
+        // The existing prefix filter must apply to the new transport too.
+        let content = [
+            TURN_CONTEXT,
+            &user_text_item(
+                "2026-01-01T00:00:02Z",
+                "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>",
+            ),
+            TOKEN_COUNT_10_3,
+        ]
+        .join("\n");
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].is_turn_start);
+    }
+
+    #[test]
+    fn test_image_only_item_still_marks_turn_start() {
+        // Dropping an image with no caption is one human turn. The item has no
+        // readable text, which must not be confused with "no human input".
+        let content = [
+            TURN_CONTEXT,
+            &item_completed_line(
+                "2026-01-01T00:00:02Z",
+                "UserMessage",
+                r#"[{"type":"local_image","path":"/tmp/shot.png"}]"#,
+            ),
+            TOKEN_COUNT_10_3,
+        ]
+        .join("\n");
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].is_turn_start,
+            "an image-only prompt is still one turn"
+        );
+    }
+
+    #[test]
+    fn test_non_user_message_items_do_not_mark_turn_start() {
+        // `item_completed` carries every kind of item, not just human input.
+        // Only `UserMessage` may set the flag.
+        for item_type in ["AgentMessage", "CommandExecution", "Reasoning"] {
+            let content = [
+                TURN_CONTEXT,
+                &item_completed_line(
+                    "2026-01-01T00:00:02Z",
+                    item_type,
+                    r#"[{"type":"text","text":"hello"}]"#,
+                ),
+                TOKEN_COUNT_10_3,
+            ]
+            .join("\n");
+            let file = create_test_file(&content);
+
+            let messages = parse_codex_file(file.path());
+
+            assert_eq!(messages.len(), 1);
+            assert!(!messages[0].is_turn_start, "{item_type} is not human input");
+        }
+    }
+
+    #[test]
+    fn test_both_human_input_transports_in_one_file_count_one_turn() {
+        // The two transports have never been observed in the same file, but the
+        // marker is a bool and must stay one turn if they ever are.
+        let content = [
+            TURN_CONTEXT,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#,
+            &user_text_item("2026-01-01T00:00:02Z", "hello"),
+            TOKEN_COUNT_10_3,
+            TOKEN_COUNT_20_6,
+        ]
+        .join("\n");
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages.iter().filter(|m| m.is_turn_start).count(),
+            1,
+            "one human input reported twice is still one turn"
+        );
+    }
+
+    #[test]
+    fn test_item_without_following_token_count_produces_no_turn() {
+        // A prompt whose reply never recorded usage cannot be attributed to a
+        // message, so it is silently dropped. Real corpora contain these; this
+        // pins the loss as intended rather than a regression to chase.
+        let content = [
+            TURN_CONTEXT,
+            TOKEN_COUNT_10_3,
+            &user_text_item("2026-01-01T00:00:05Z", "one more thing"),
+        ]
+        .join("\n");
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert!(
+            !messages[0].is_turn_start,
+            "the trailing prompt has no reply to mark"
+        );
+    }
+
+    #[test]
+    fn test_incremental_parse_preserves_pending_turn_start_from_item() {
+        let content = [
+            TURN_CONTEXT,
+            &user_text_item("2026-01-01T00:00:02Z", "hello"),
+            "",
+        ]
+        .join("\n");
+        let file = create_test_file(&content);
+        let initial_size = file.as_file().metadata().unwrap().len();
+
+        let initial = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(initial.messages.is_empty());
+        assert!(
+            initial.state.pending_turn_start,
+            "a pending turn from an item survives a chunk boundary"
+        );
+
+        let appended = format!("{}\n", TOKEN_COUNT_10_3);
+        let mut reopened = file.reopen().unwrap();
+        reopened.seek(SeekFrom::End(0)).unwrap();
+        reopened.write_all(appended.as_bytes()).unwrap();
+        reopened.flush().unwrap();
+
+        let incremental =
+            parse_codex_file_incremental(file.path(), initial_size, initial.state.clone());
+
+        assert_eq!(incremental.messages.len(), 1);
+        assert!(incremental.messages[0].is_turn_start);
+        assert!(!incremental.state.pending_turn_start);
+    }
+
+    #[test]
+    fn test_forked_child_replayed_item_gains_no_turn() {
+        // A fork log replays the parent's prompt before the child's own
+        // turn_context. The replay must not become a turn of the child's.
+        let content = [
+            r#"{"timestamp":"2026-05-05T21:51:57.991Z","type":"session_meta","payload":{"id":"child-session","forked_from_id":"parent-session","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}},"model_provider":"openai","agent_nickname":"worker","cwd":"/repo-child"}}"#,
+            &user_text_item("2026-05-05T21:51:58.000Z", "parent prompt copied into child log"),
+            r#"{"timestamp":"2026-05-05T21:51:58.100Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":99,"cached_input_tokens":0,"output_tokens":99},"last_token_usage":{"input_tokens":99,"cached_input_tokens":0,"output_tokens":99}}}}"#,
+            r#"{"timestamp":"2026-05-05T21:52:10.000Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+            &user_text_item("2026-05-05T21:52:11.000Z", "the child's own prompt"),
+            r#"{"timestamp":"2026-05-05T21:52:12.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+        ]
+        .join("\n");
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(
+            messages.iter().filter(|m| m.is_turn_start).count(),
+            1,
+            "only the child's own prompt counts; the replayed parent prompt does not"
+        );
+    }
+
+    #[test]
+    fn test_unexpected_item_shape_does_not_cost_the_line_its_own_handling() {
+        // `item` is `Value` precisely so that a shape we did not anticipate
+        // cannot reject the whole JSONL line. A rejected line loses its real
+        // handling and falls through to the headless fallback, which is how a
+        // turn-counting change would end up moving tokens. Each shape here
+        // rides on a `token_count` payload, so the assertion is that the usage
+        // still lands.
+        for shape in [
+            r#""not-an-object""#,
+            r#"{"type":"UserMessage","content":"not-an-array"}"#,
+            r#"{"type":"UserMessage","content":["not-an-object"]}"#,
+            r#"{"type":"UserMessage"}"#,
+            r#"[]"#,
+            "null",
+        ] {
+            let line = format!(
+                r#"{{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{{"type":"token_count","item":{shape},"info":{{"last_token_usage":{{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}}}}}"#
+            );
+            let content = [TURN_CONTEXT, &line].join("\n");
+            let file = create_test_file(&content);
+
+            let messages = parse_codex_file(file.path());
+
+            assert_eq!(
+                messages.len(),
+                1,
+                "a token_count carrying item shape {shape} must still be parsed"
+            );
+            assert_eq!(messages[0].tokens.output, 3, "shape {shape}");
+            assert_eq!(messages[0].model_id, "gpt-5.2", "shape {shape}");
+            assert!(!messages[0].is_turn_start, "shape {shape}");
+        }
     }
 
     #[test]
