@@ -317,6 +317,18 @@ fn source_aware_filter_parity_fixture_is_stable_cold_and_warm() {
     ));
     assert_eq!((variant.input, variant.output), (300, 70));
 
+    // Same blind spot for the `synthetic` branch of the report gate: the full
+    // list names `opencode`, so the gateway row passes the exact match even if
+    // that branch regresses. This is the one report-level `synthetic` request.
+    let synthetic = hourly_aggregate(&hourly_report(
+        source_home.path(),
+        Some(vec!["synthetic".to_string()]),
+    ));
+    assert_eq!(
+        (synthetic.entry_count, synthetic.input, synthetic.output),
+        (1, 10, 5)
+    );
+
     let warm = reports(source_home.path(), &clients);
     assert_eq!(
         warm, cold,
