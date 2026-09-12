@@ -307,6 +307,16 @@ fn source_aware_filter_parity_fixture_is_stable_cold_and_warm() {
     assert!(cold.agents_nil.entry_count >= 1);
     assert!(cold.agents_nil.message_count >= 1, "Main must retain usage");
 
+    // Parity cannot see a report that stops filtering at all, because nil and
+    // full then agree trivially. This is the one hourly test that requests a
+    // dynamic `cc-mirror/*` id on its own; the Agents half is owned by
+    // `test_agents_report_cc_mirror_variant_slice_issue36`.
+    let variant = hourly_aggregate(&hourly_report(
+        source_home.path(),
+        Some(vec!["cc-mirror/kimi-code".to_string()]),
+    ));
+    assert_eq!((variant.input, variant.output), (300, 70));
+
     let warm = reports(source_home.path(), &clients);
     assert_eq!(
         warm, cold,
