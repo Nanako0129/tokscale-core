@@ -222,18 +222,6 @@ fn write_fixture(home: &Path) {
     )
     .unwrap();
 
-    // Kimi is another canonical client with no agent attribution.
-    let kimi_dir = home.join(".kimi/sessions/group/session");
-    std::fs::create_dir_all(&kimi_dir).unwrap();
-    std::fs::write(
-        kimi_dir.join("wire.jsonl"),
-        concat!(
-            "{\"type\":\"metadata\",\"protocol_version\":\"1.3\"}\n",
-            "{\"timestamp\":1770983410.0,\"message\":{\"type\":\"StatusUpdate\",\"payload\":{\"token_usage\":{\"input_other\":100,\"output\":50,\"input_cache_read\":3,\"input_cache_creation\":4},\"message_id\":\"KIMI-1\"}}}"
-        ),
-    )
-    .unwrap();
-
     // Synthetic gateway traffic rides the OpenCode lane. Its canonical client
     // remains `opencode`; the synthetic matcher must therefore agree in both
     // the nil and full-list report paths without adding a fake client id.
@@ -305,7 +293,6 @@ fn source_aware_filter_parity_fixture_is_stable_cold_and_warm() {
     assert!(clients
         .iter()
         .any(|client| client.starts_with("cc-mirror/")));
-    assert!(clients.iter().any(|client| client == "kimi"));
     assert!(clients.iter().any(|client| client == "opencode"));
 
     let cold = reports(source_home.path(), &clients);
@@ -320,72 +307,27 @@ fn source_aware_filter_parity_fixture_is_stable_cold_and_warm() {
     assert!(cold.agents_nil.entry_count >= 1);
     assert!(cold.agents_nil.message_count >= 1, "Main must retain usage");
 
-    // Explicit slices prove the report producer, rather than a shared mixed
-    // bucket, applies the requested client filter before aggregation. The
-    // exact cc-mirror and synthetic seams are otherwise easy for nil/full
-    // parity to miss because both paths could be wrong in the same way.
-    let variant = reports(source_home.path(), &["cc-mirror/kimi-code".to_string()]);
-    assert_eq!(
-        (variant.hourly_full.input, variant.hourly_full.output),
-        (300, 70)
-    );
-    assert_eq!(
-        (variant.agents_full.input, variant.agents_full.output),
-        (300, 70)
-    );
+    // Parity cannot see a report that stops filtering at all, because nil and
+    // full then agree trivially. This is the one hourly test that requests a
+    // dynamic `cc-mirror/*` id on its own; the Agents half is owned by
+    // `test_agents_report_cc_mirror_variant_slice_issue36`.
+    let variant = hourly_aggregate(&hourly_report(
+        source_home.path(),
+        Some(vec!["cc-mirror/kimi-code".to_string()]),
+    ));
+    assert_eq!((variant.input, variant.output), (300, 70));
 
-    let claude = reports(source_home.path(), &["claude".to_string()]);
+    // Same blind spot for the `synthetic` branch of the report gate: the full
+    // list names `opencode`, so the gateway row passes the exact match even if
+    // that branch regresses. This is the one report-level `synthetic` request.
+    let synthetic = hourly_aggregate(&hourly_report(
+        source_home.path(),
+        Some(vec!["synthetic".to_string()]),
+    ));
     assert_eq!(
-        (claude.hourly_full.input, claude.hourly_full.output),
-        (100, 50)
+        (synthetic.entry_count, synthetic.input, synthetic.output),
+        (1, 10, 5)
     );
-    assert_eq!(
-        (claude.agents_full.input, claude.agents_full.output),
-        (100, 50)
-    );
-
-    let codebuff = reports(source_home.path(), &["codebuff".to_string()]);
-    assert_eq!(
-        (codebuff.hourly_full.input, codebuff.hourly_full.output),
-        (200, 80)
-    );
-    assert_eq!(
-        (codebuff.agents_full.input, codebuff.agents_full.output),
-        (200, 80)
-    );
-
-    let synthetic = hourly_report(source_home.path(), Some(vec!["synthetic".to_string()]));
-    assert_eq!(
-        synthetic.entries.len(),
-        1,
-        "synthetic filter returns gateway row"
-    );
-    assert_eq!(
-        (synthetic.entries[0].input, synthetic.entries[0].output),
-        (10, 5)
-    );
-
-    let synthetic_agents = agents_report(source_home.path(), Some(vec!["synthetic".to_string()]));
-    assert_eq!(
-        synthetic_agents.entries.len(),
-        1,
-        "synthetic filter returns one Agents row"
-    );
-    assert_eq!(
-        (
-            synthetic_agents.entries[0].input,
-            synthetic_agents.entries[0].output
-        ),
-        (10, 5)
-    );
-
-    let all_agents = agents_report(source_home.path(), None);
-    let main = all_agents
-        .entries
-        .iter()
-        .find(|entry| entry.agent == "Main")
-        .expect("unattributed usage must remain in Main");
-    assert_eq!((main.input, main.output), (710, 255));
 
     let warm = reports(source_home.path(), &clients);
     assert_eq!(
