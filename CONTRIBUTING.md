@@ -105,7 +105,7 @@ Prefer an assertion on observed behaviour over a scan of source text. A property
 
 ## Pull requests
 
-One reviewable concern per branch. Name the branch `<type>/<kebab-summary>`, with the same `type` as the commit's Conventional Commit prefix (`feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `build`, `perf`, or any other prefix this repository's commits already use — the list is not closed) — for example `fix/codex-item-completed-turns`. TokenBar and Syrtis-Windows use the same rule, so a branch name reads the same across the three repositories. Write the commit message as a durable record: what the change does, the data flow when it matters, and the reasoning a diff alone would not show.
+One reviewable concern per branch. Name the branch `<type>/<kebab-summary>`, where `type` is the Conventional Commit prefix of the branch's primary concern — the type its pull-request title carries (`feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `build`, `perf`, or any other prefix this repository's commits already use; the list is not closed) — for example `fix/codex-item-completed-turns`. Supporting commits on the branch may use other types. TokenBar and Syrtis-Windows use the same rule, so a branch name reads the same across the three repositories. Write the commit message as a durable record: what the change does, the data flow when it matters, and the reasoning a diff alone would not show.
 
 State how you verified it, and be specific about what the verification does *not* cover. A gap named honestly is useful; a gap papered over costs the next person a debugging session.
 
