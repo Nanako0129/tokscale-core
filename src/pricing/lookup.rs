@@ -614,7 +614,7 @@ impl PricingLookup {
             } else {
                 if let Some(result) = choose_best_source_result(
                     self.exact_match_litellm_for_provider(stripped, provider_id),
-                    self.exact_match_openrouter_for_provider(stripped, provider_id),
+                    self.exact_or_normalized_openrouter_for_provider(stripped, provider_id),
                     provider_id,
                 ) {
                     return Some(result);
@@ -627,7 +627,7 @@ impl PricingLookup {
 
         if let Some(result) = choose_best_source_result(
             self.exact_match_litellm_for_provider(model_id, provider_id),
-            self.exact_match_openrouter_for_provider(model_id, provider_id),
+            self.exact_or_normalized_openrouter_for_provider(model_id, provider_id),
             provider_id,
         ) {
             return Some(result);
@@ -925,6 +925,39 @@ impl PricingLookup {
         )
     }
 
+    /// [`exact_match_openrouter_for_provider`], retrying the
+    /// separator-normalized spelling when the raw one finds nothing.
+    ///
+    /// OpenRouter dots minor versions (`anthropic/claude-haiku-4.5`) where
+    /// LiteLLM and callers hyphenate (`claude-haiku-4-5`). The provider-scoped
+    /// exact stages below compare raw spellings and return early, so without
+    /// this retry a hint-matching reseller LiteLLM row can win the stage
+    /// outright while OpenRouter's first-party entry — the one the hint
+    /// actually names — never participates in arbitration at all (#1329).
+    ///
+    /// Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`). Upstream
+    /// tags the normalized hit with `LookupResult::with_normalization()`; this
+    /// tree's `LookupResult` carries no `evidence` field, so that call is
+    /// dropped and the result is returned unchanged. Nothing else differs.
+    fn exact_or_normalized_openrouter_for_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.exact_match_openrouter_for_provider(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) =
+                self.exact_match_openrouter_for_provider(&version_normalized, provider_id)
+            {
+                return Some(result);
+            }
+        }
+        normalize_model_name(model_id)
+            .and_then(|normalized| self.exact_match_openrouter_for_provider(&normalized, provider_id))
+    }
+
     fn exact_match_openrouter_with_provider(
         &self,
         model_id: &str,
@@ -1121,6 +1154,31 @@ impl PricingLookup {
     }
 
     fn fuzzy_match_openrouter(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.fuzzy_match_openrouter_spelling(model_id, provider_id) {
+            return Some(result);
+        }
+        // OpenRouter spells some minor versions with a dot where LiteLLM and
+        // callers hyphenate (`anthropic/claude-haiku-4.5` vs
+        // `claude-haiku-4-5`), and `contains_model_id` is a literal find, so
+        // the pass above never sees those keys. Retry the same fuzzy passes
+        // against the normalized spelling before giving up, the way the exact
+        // passes already do (#1329).
+        //
+        // Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`).
+        // Upstream tags the normalized hit with `with_normalization()`; this
+        // tree's `LookupResult` has no `evidence` field, so that call is
+        // dropped.
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            return self.fuzzy_match_openrouter_spelling(&version_normalized, provider_id);
+        }
+        None
+    }
+
+    fn fuzzy_match_openrouter_spelling(
         &self,
         model_id: &str,
         provider_id: Option<&str>,
@@ -5753,6 +5811,112 @@ mod tests {
         assert_eq!(result.matched_key, "claude-opus-4-6-20250301");
         assert_eq!(result.source, "LiteLLM");
         assert!(result.pricing.input_cost_per_token.is_some());
+    }
+
+    #[test]
+    fn test_fuzzy_openrouter_crosses_version_separator_difference() {
+        // OpenRouter keys dot-separated minors (`claude-haiku-4.5`) where the
+        // caller hyphenates (`claude-haiku-4-5`), so a literal `contains`
+        // never pairs them and OpenRouter dropped out of arbitration — with an
+        // `anthropic` hint the reseller LiteLLM entry won and priced cache
+        // writes at zero (#1329).
+        //
+        // Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`) with
+        // the assertions retargeted, because the two trees settle this
+        // differently. Upstream has no cache backfill, so once the OpenRouter
+        // entry reaches arbitration it wins outright and upstream asserts
+        // `source == "OpenRouter"`. This tree has `backfill_cache_costs`
+        // (local since `8bf52d4`, never adopted upstream), so the (Some, Some)
+        // branch keeps the hint-matching LiteLLM key as the winner and grafts
+        // the missing rate onto it. Different mechanism, same outcome for the
+        // user: the cache-write rate stops being zero.
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "perplexity/anthropic/claude-haiku-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                cache_creation_input_token_cost: Some(0.00000125),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("claude-haiku-4-5", Some("anthropic"))
+            .expect("normalized OpenRouter entry should participate in arbitration");
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "perplexity/anthropic/claude-haiku-4-5");
+        assert_eq!(
+            result.pricing.cache_creation_input_token_cost,
+            Some(0.00000125),
+            "the OpenRouter donor has to reach the backfill; without the \
+             normalized retry it never enters arbitration and this stays None"
+        );
+
+        let usage = |cache_write: i64| TokenBreakdown {
+            input: 1_000,
+            output: 1_000,
+            cache_read: 0,
+            cache_write,
+            reasoning: 0,
+            cache_write_1h: 0,
+        };
+        let cost =
+            lookup.calculate_cost_with_provider("claude-haiku-4-5", Some("anthropic"), &usage(1_000));
+        assert!(
+            cost > 0.001,
+            "cache writes should price above zero, got {cost}"
+        );
+        // Upstream stops at the line above. It cannot fail for the reason the
+        // test is about: input and output alone already total 0.006 here, so
+        // the assertion passes with the cache rate still missing. Price the
+        // same call with and without the writes and check the difference is
+        // the rate itself.
+        let without = lookup.calculate_cost_with_provider(
+            "claude-haiku-4-5",
+            Some("anthropic"),
+            &usage(0),
+        );
+        assert!(
+            (cost - without - 0.00125).abs() < 1e-9,
+            "1,000 cache-write tokens must add 1.25e-6 each; delta was {}",
+            cost - without
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_openrouter_version_separator_without_hint() {
+        // Unhinted lookups hit the same wall: without any LiteLLM entry the
+        // dotted OpenRouter key is the only candidate, and the literal
+        // `contains` hid it entirely. Ported unchanged from upstream #1338.
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+        let result = lookup
+            .lookup("claude-haiku-4-5")
+            .expect("fuzzy match should reach the dotted OpenRouter key");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
     }
 
     #[test]
