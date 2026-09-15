@@ -5901,6 +5901,13 @@ mod tests {
         // Unhinted lookups hit the same wall: without any LiteLLM entry the
         // dotted OpenRouter key is the only candidate, and the literal
         // `contains` hid it entirely. Ported unchanged from upstream #1338.
+        //
+        // It does NOT guard the fuzzy retry in this tree, and is kept because
+        // it is upstream's rather than because it protects anything here. The
+        // key below is resolved by the earlier `normalize_version_separator`
+        // exact block, so this test passes with the fuzzy retry deleted
+        // outright — established by mutation, not assumed. The test that does
+        // guard it is `..._reaches_a_suffixed_key` below.
         let mut openrouter = HashMap::new();
         openrouter.insert(
             "anthropic/claude-haiku-4.5".into(),
@@ -5917,6 +5924,34 @@ mod tests {
             .expect("fuzzy match should reach the dotted OpenRouter key");
         assert_eq!(result.source, "OpenRouter");
         assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
+    }
+
+    #[test]
+    fn test_fuzzy_openrouter_normalized_retry_reaches_a_suffixed_key() {
+        // The guard for the fuzzy half of this port, which upstream's own
+        // `..._without_hint` above cannot be in this tree: that one is settled
+        // by the earlier `normalize_version_separator` exact block and passes
+        // with the fuzzy retry deleted outright.
+        //
+        // Reaching the fuzzy stage needs a key no exact stage can match: a
+        // dotted minor version PLUS a suffix, so only a substring comparison
+        // can pair it with the caller's hyphenated id.
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5-preview".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+        let result = lookup
+            .lookup("claude-haiku-4-5")
+            .expect("the fuzzy pass must retry the normalized spelling");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5-preview");
     }
 
     #[test]
