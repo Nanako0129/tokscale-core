@@ -22,7 +22,7 @@ reviews:
 
         Toolchain: Rust 1.96.1 is pinned by rust-toolchain.toml and Cargo.lock
         is committed. A change must pass the locked build, test and
-        `clippy -- -D warnings` on both macOS and Windows.
+        clippy -- -D warnings on both macOS and Windows.
 
     - path: "src/**/cache*.rs"
       instructions: |
@@ -34,30 +34,30 @@ reviews:
 
         Ask whose payload can no longer be decoded, not "which counter":
         - one client's parse semantics or its own serialized state
-          -> `parser_version(client)`
+          -> parser_version(client)
         - the synthetic namespace's parse output
-          -> the `parser_version` inside `CacheIdentity::synthetic()`
+          -> the parser_version inside CacheIdentity::synthetic()
         - the envelope itself, or a type shared by every namespace
-          (`CachedSourceEntry`, `UnifiedMessage`, `TokenBreakdown`)
-          -> `CACHE_FORMAT_VERSION`
+          (CachedSourceEntry, UnifiedMessage, TokenBreakdown)
+          -> CACHE_FORMAT_VERSION
 
-        Reach for `parser_version` first and justify a global bump, never the
-        other way round. `CACHE_FORMAT_VERSION` has the wider blast radius and
+        Reach for parser_version first and justify a global bump, never the
+        other way round. CACHE_FORMAT_VERSION has the wider blast radius and
         for one namespace it is not recoverable.
 
         Claude is not merely cold. For the namespace covered by
-        `retained_history_key_filter`, the cache holds turns the live file no
+        retained_history_key_filter, the cache holds turns the live file no
         longer contains, and re-parsing will not reproduce them. A
-        `CACHE_FORMAT_VERSION` bump still deletes them, because its gate runs
+        CACHE_FORMAT_VERSION bump still deletes them, because its gate runs
         before the namespace is looked at. If a change forces one, say so
         plainly in the PR rather than letting it be discovered afterwards.
 
     - path: "tests/**"
       instructions: |
         Verification (CONTRIBUTING.md, "Tests"). Build JSON with
-        `serde_json::json!`, never by interpolating a path into a hand-written
-        JSON string: on Windows every backslash in `C:\Users\...` becomes an
-        invalid escape, the fixture fails to parse, and the test goes silently
+        serde_json::json!, never by interpolating a path into a hand-written
+        JSON string. On Windows the backslashes in an absolute path become invalid
+        JSON escapes, the fixture fails to parse, and the test goes silently
         inert. Only the Windows runner sees it.
 
         A parser-output change that invalidates wants a same-fingerprint
