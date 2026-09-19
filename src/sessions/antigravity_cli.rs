@@ -82,10 +82,10 @@ pub(crate) fn find_log_files(conversation_paths: &[PathBuf]) -> Vec<PathBuf> {
 fn parse_log_year(path: &Path) -> Option<i32> {
     let file_name = path.file_name()?.to_str()?;
     let rest = file_name.strip_prefix("cli-")?;
-    if rest.len() < 4 {
-        return None;
-    }
-    let year: i32 = rest[..4].parse().ok()?;
+    // `len()` / `&rest[..4]` are byte-based: a multi-byte UTF-8 filename such as
+    // `cli-日本語.log` would slice mid-character and panic. `get` returns None
+    // when 4 is not a char boundary, so the file is skipped instead.
+    let year: i32 = rest.get(..4)?.parse().ok()?;
     if (1970..=9999).contains(&year) {
         Some(year)
     } else {
@@ -131,9 +131,13 @@ fn parse_header_timestamp(header: &str, year: i32) -> Option<i64> {
 
     let naive_date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
     let naive_dt = naive_date.and_hms_micro_opt(hour, min, sec, micro)?;
-    let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
+    // glog writes the wall-clock time of the machine that produced the line and
+    // carries no UTC offset, so it must be read back in the system timezone.
+    // Only meaningful when the log is parsed on the same machine/timezone that
+    // wrote it; logs copied across timezones are not accounted for, and this is
+    // not valid if the writer had FLAGS_log_utc_time enabled.
     use chrono::TimeZone;
-    let dt = offset.from_local_datetime(&naive_dt).single()?;
+    let dt = chrono::Local.from_local_datetime(&naive_dt).single()?;
     let utc_ms = dt.timestamp_millis();
     if utc_ms > 0 {
         Some(utc_ms)
@@ -1566,8 +1570,7 @@ mod tests {
                 .unwrap()
                 .and_hms_micro_opt(5, 51, 58, 547986)
                 .unwrap();
-            let offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-            chrono::TimeZone::from_local_datetime(&offset, &naive)
+            chrono::TimeZone::from_local_datetime(&chrono::Local, &naive)
                 .single()
                 .unwrap()
                 .timestamp_millis()
@@ -1757,5 +1760,51 @@ mod tests {
         let msg2 = &messages2[0];
         assert_eq!(msg2.timestamp, 1_781_502_653_000);
         assert_standard_message_fields(msg2, Some("resp-1"));
+    }
+
+    #[test]
+    fn log_scan_skips_multibyte_utf8_log_filename_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let conv_dir = dir.path().join("conversations");
+        let log_dir = dir.path().join("log");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let db_path = conv_dir.join("session-multibyte.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+            params![build_gen_metadata_full(
+                "gemini-3-flash-a",
+                Some(b"resp-1"),
+                None
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let log_path = log_dir.join("cli-日本語.log");
+        std::fs::write(
+            &log_path,
+            "I0907 05:51:58.547986 135 http_helpers.go:296] ResponseID: resp-1\n",
+        )
+        .unwrap();
+
+        let ctx = build_timestamp_context(std::slice::from_ref(&db_path));
+        let messages = parse_antigravity_cli_file_with_context(&db_path, &ctx);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].timestamp, 1_781_502_653_000);
+        assert_standard_message_fields(&messages[0], Some("resp-1"));
     }
 }

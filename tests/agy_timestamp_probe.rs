@@ -5,7 +5,30 @@ use tokscale_core::sessions::antigravity_cli::{
     build_timestamp_context, parse_antigravity_cli_file_with_context,
     AntigravityCliTimestampContext,
 };
-use tokscale_core::UnifiedMessage;
+use tokscale_core::{TokenBreakdown, UnifiedMessage};
+
+/// Saturating per-message token total. The parser clamps oversized token fields
+/// to i64::MAX, so a plain `+` accumulator would overflow (panic in debug).
+fn accumulate_tokens(acc: i64, tokens: &TokenBreakdown) -> i64 {
+    acc.saturating_add(tokens.total())
+}
+
+#[test]
+fn token_accumulator_saturates_on_clamped_buckets() {
+    // The parser clamps oversized buckets to i64::MAX; summing them must not
+    // overflow (debug builds panic on overflow).
+    let clamped = TokenBreakdown {
+        input: i64::MAX,
+        output: i64::MAX,
+        cache_read: i64::MAX,
+        cache_write: i64::MAX,
+        reasoning: i64::MAX,
+    };
+    assert_eq!(clamped.total(), i64::MAX);
+    let once = accumulate_tokens(0, &clamped);
+    assert_eq!(once, i64::MAX);
+    assert_eq!(accumulate_tokens(once, &clamped), i64::MAX);
+}
 
 #[test]
 #[ignore]
@@ -108,18 +131,12 @@ fn real_antigravity_cli_timestamp_probe() {
                 session_count += 1;
             }
 
-            let tokens = msg.tokens.input
-                + msg.tokens.output
-                + msg.tokens.cache_read
-                + msg.tokens.cache_write
-                + msg.tokens.reasoning;
-
             if msg.timestamp >= from_ms && msg.timestamp < until_ms {
-                corrected_tokens += tokens;
+                corrected_tokens = accumulate_tokens(corrected_tokens, &msg.tokens);
             }
 
             if session_ts >= from_ms && session_ts < until_ms {
-                legacy_session_tokens += tokens;
+                legacy_session_tokens = accumulate_tokens(legacy_session_tokens, &msg.tokens);
             }
         }
     }

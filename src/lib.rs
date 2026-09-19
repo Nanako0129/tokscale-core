@@ -16670,8 +16670,7 @@ mod tests {
                 .unwrap()
                 .and_hms_micro_opt(5, 51, 58, 547986)
                 .unwrap();
-            let offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-            chrono::TimeZone::from_local_datetime(&offset, &naive)
+            chrono::TimeZone::from_local_datetime(&chrono::Local, &naive)
                 .single()
                 .unwrap()
                 .timestamp_millis()
@@ -16682,7 +16681,7 @@ mod tests {
             source_home.path().to_str().unwrap(),
             &["antigravity-cli".to_string()],
             None,
-            true,
+            false,
             &scanner::ScannerSettings::default(),
             None,
         );
@@ -16709,7 +16708,7 @@ mod tests {
         let count_result = parse_local_clients(LocalParseOptions {
             home_dir: Some(source_home.path().to_string_lossy().to_string()),
             clients: Some(vec!["antigravity-cli".to_string()]),
-            use_env_roots: true,
+            use_env_roots: false,
             ..Default::default()
         })
         .unwrap();
