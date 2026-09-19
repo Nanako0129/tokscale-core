@@ -56,13 +56,13 @@ fn real_antigravity_cli_timestamp_probe() {
 
     let from_ms = chrono::NaiveDate::from_ymd_opt(2026, 9, 16)
         .unwrap()
-        .and_hms_opt(17, 8, 0)
+        .and_hms_opt(17, 8, 21)
         .unwrap()
         .and_utc()
         .timestamp_millis();
     let until_ms = chrono::NaiveDate::from_ymd_opt(2026, 9, 16)
         .unwrap()
-        .and_hms_opt(22, 8, 0)
+        .and_hms_opt(22, 8, 21)
         .unwrap()
         .and_utc()
         .timestamp_millis();
@@ -131,7 +131,7 @@ fn real_antigravity_cli_timestamp_probe() {
         total, native_count, steps_count, log_count, session_count
     );
     println!(
-        "AGY_WINDOW from=2026-09-16T17:08:00Z until=2026-09-16T22:08:00Z legacy_session_tokens={} corrected_tokens={} delta={}",
+        "AGY_WINDOW from=2026-09-16T17:08:21Z until=2026-09-16T22:08:21Z legacy_session_tokens={} corrected_tokens={} delta={}",
         legacy_session_tokens, corrected_tokens, delta
     );
 }
