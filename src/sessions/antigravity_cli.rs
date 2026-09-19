@@ -35,7 +35,7 @@ use super::utils::open_readonly_sqlite;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{pricing, provider_identity, TokenBreakdown};
 use rusqlite::Connection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
@@ -61,14 +61,20 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
         Err(_) => return Vec::new(),
     };
 
+    let step_timestamps = read_step_timestamps(&conn);
+
     let mut messages = Vec::new();
     let mut seen_response_ids: HashSet<String> = HashSet::new();
     for blob in rows.flatten() {
         // `timestamp` is the session-created fallback; each row prefers its own
         // per-generation wall-clock stamp (see `parse_gen_metadata`).
-        if let Some(mut message) =
-            parse_gen_metadata(&blob, &session_id, timestamp, &mut seen_response_ids)
-        {
+        if let Some(mut message) = parse_gen_metadata(
+            &blob,
+            &session_id,
+            timestamp,
+            &step_timestamps,
+            &mut seen_response_ids,
+        ) {
             if workspace_key.is_some() {
                 message.set_workspace(workspace_key.clone(), workspace_label.clone());
             }
@@ -83,22 +89,29 @@ fn parse_gen_metadata(
     blob: &[u8],
     session_id: &str,
     session_timestamp: i64,
+    step_timestamps: &HashMap<Vec<u8>, StepTimestamp>,
     seen_response_ids: &mut HashSet<String>,
 ) -> Option<UnifiedMessage> {
     let chat_model = message_field(blob, 1)?;
     let usage = message_field(chat_model, 4)?;
 
-    // Per-generation wall-clock time: `chatModel.#9.#4` is an absolute
-    // `{#1: seconds, #2: nanos}` Timestamp for this turn (same shape as the
-    // session-created stamp), so each turn is dated when it actually happened
-    // rather than at conversation start. Fall back to the session-created
-    // `session_timestamp` when the field is absent or zero (older databases or
-    // malformed rows).
-    let timestamp = message_field(chat_model, 9)
+    // Per-generation wall-clock time fallback chain:
+    // 1. `chatModel.#9.#4` (native Timestamp {#1 seconds, #2 nanos})
+    // 2. `steps` table timestamp joined on responseId (`usage.#11`)
+    // 3. session-created fallback `session_timestamp`
+    let native = message_field(chat_model, 9)
         .and_then(|gen| message_field(gen, 4))
         .and_then(proto_timestamp_ms)
-        .filter(|&ms| ms > 0)
-        .unwrap_or(session_timestamp);
+        .filter(|&ms| ms > 0);
+
+    let steps = message_field(usage, 11)
+        .and_then(|resp_id| step_timestamps.get(resp_id))
+        .and_then(|ts| match ts {
+            StepTimestamp::Unique(ms) if *ms > 0 => Some(*ms),
+            _ => None,
+        });
+
+    let timestamp = native.or(steps).unwrap_or(session_timestamp);
 
     // input = fixed system prompt (#1) + newly-processed input (#2). The
     // constant #1 is, to the best of our reverse-engineering, the agent's fixed
@@ -189,6 +202,61 @@ fn read_trajectory_meta(conn: &Connection, path: &Path) -> (i64, Option<String>,
 
 fn session_created_ms(blob: &[u8]) -> Option<i64> {
     proto_timestamp_ms(message_field(blob, 2)?)
+}
+
+/// One resolved step timestamp candidate for a responseId.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepTimestamp {
+    Unique(i64),
+    Ambiguous,
+}
+
+fn read_step_timestamps(conn: &Connection) -> HashMap<Vec<u8>, StepTimestamp> {
+    let mut map = HashMap::new();
+    let mut stmt = match conn.prepare("SELECT idx, step_type, metadata FROM steps") {
+        Ok(stmt) => stmt,
+        Err(_) => return map,
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        let step_type: Option<i64> = row.get(1).ok();
+        let metadata: Option<Vec<u8>> = row.get(2).ok();
+        Ok((step_type, metadata))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return map,
+    };
+
+    for row in rows.flatten() {
+        let (Some(15), Some(metadata)) = row else {
+            continue;
+        };
+
+        let Some(key) = message_field(&metadata, 9)
+            .and_then(|m9| message_field(m9, 11))
+            .filter(|k| !k.is_empty())
+        else {
+            continue;
+        };
+
+        let Some(ms) = message_field(&metadata, 1)
+            .and_then(proto_timestamp_ms)
+            .filter(|&ms| ms > 0)
+        else {
+            continue;
+        };
+
+        match map.entry(key.to_vec()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(StepTimestamp::Unique(ms));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.insert(StepTimestamp::Ambiguous);
+            }
+        }
+    }
+
+    map
 }
 
 /// Decode a protobuf `{#1: seconds, #2: nanos}` Timestamp message to epoch ms.
@@ -414,21 +482,68 @@ mod tests {
     }
 
     fn build_gen_metadata_with_model(model: &str) -> Vec<u8> {
-        // usage message (#4 of chatModel)
+        build_gen_metadata_full(model, Some(b"resp-1"), None)
+    }
+
+    fn build_gen_metadata_full(
+        model: &str,
+        response_id: Option<&[u8]>,
+        native_ts: Option<(u64, u64)>,
+    ) -> Vec<u8> {
         let mut usage = Vec::new();
         usage.extend(enc_varint(1, 1132)); // fixed system prompt
         usage.extend(enc_varint(2, 500)); // new input
         usage.extend(enc_varint(5, 16000)); // cacheRead
         usage.extend(enc_varint(9, 300)); // output
         usage.extend(enc_varint(10, 40)); // thinking
-        usage.extend(enc_len(11, b"resp-1")); // responseId
+        if let Some(resp_id) = response_id {
+            usage.extend(enc_len(11, resp_id)); // responseId
+        }
 
-        // chatModel message (#1 of gen_metadata)
         let mut chat_model = Vec::new();
         chat_model.extend(enc_len(4, &usage));
+        if let Some((sec, nano)) = native_ts {
+            let mut gen_time = Vec::new();
+            gen_time.extend(enc_varint(1, sec));
+            gen_time.extend(enc_varint(2, nano));
+            let gen9 = enc_len(4, &gen_time);
+            chat_model.extend(enc_len(9, &gen9));
+        }
         chat_model.extend(enc_len(19, model.as_bytes()));
 
         enc_len(1, &chat_model)
+    }
+
+    fn build_step_metadata_raw(response_id: Option<&[u8]>, ts_bytes: Option<&[u8]>) -> Vec<u8> {
+        let mut metadata = Vec::new();
+        if let Some(ts) = ts_bytes {
+            metadata.extend(enc_len(1, ts));
+        }
+        if let Some(resp_id) = response_id {
+            let mut m9 = Vec::new();
+            m9.extend(enc_len(11, resp_id));
+            metadata.extend(enc_len(9, &m9));
+        }
+        metadata
+    }
+
+    fn build_step_metadata(response_id: &[u8], seconds: u64, nanos: u64) -> Vec<u8> {
+        let mut ts = Vec::new();
+        ts.extend(enc_varint(1, seconds));
+        ts.extend(enc_varint(2, nanos));
+        build_step_metadata_raw(Some(response_id), Some(&ts))
+    }
+
+    fn assert_standard_message_fields(msg: &UnifiedMessage, expected_dedup: Option<&str>) {
+        assert_eq!(msg.client, "antigravity-cli");
+        assert_eq!(msg.model_id, "gemini-3.5-flash-high");
+        assert_eq!(msg.provider_id, "google");
+        assert_eq!(msg.tokens.input, 1632);
+        assert_eq!(msg.tokens.output, 300);
+        assert_eq!(msg.tokens.cache_read, 16000);
+        assert_eq!(msg.tokens.reasoning, 40);
+        assert_eq!(msg.tokens.cache_write, 0);
+        assert_eq!(msg.dedup_key.as_deref(), expected_dedup);
     }
 
     fn build_trajectory_meta() -> Vec<u8> {
@@ -460,7 +575,8 @@ mod tests {
         let blob = enc_len(1, &chat_model);
 
         let mut seen = HashSet::new();
-        let msg = parse_gen_metadata(&blob, "s", 1_000, &mut seen).expect("parses");
+        let msg =
+            parse_gen_metadata(&blob, "s", 1_000, &HashMap::new(), &mut seen).expect("parses");
         assert_eq!(msg.tokens.output, i64::MAX);
         assert_eq!(msg.tokens.input, i64::MAX); // saturating_add, not negative
         assert!(msg.tokens.input >= 0 && msg.tokens.output >= 0);
@@ -520,7 +636,8 @@ mod tests {
         let blob = build_gen_metadata_with_model("gemini-3-flash-agent");
         let mut seen = HashSet::new();
 
-        let message = parse_gen_metadata(&blob, "session", 1_000, &mut seen).unwrap();
+        let message =
+            parse_gen_metadata(&blob, "session", 1_000, &HashMap::new(), &mut seen).unwrap();
 
         assert_eq!(message.model_id, "gemini-3.5-flash-high");
         assert_eq!(message.provider_id, "google");
@@ -553,7 +670,8 @@ mod tests {
         let blob = enc_len(1, &chat_model);
 
         let mut seen = HashSet::new();
-        let message = parse_gen_metadata(&blob, "s", session_fallback, &mut seen).unwrap();
+        let message =
+            parse_gen_metadata(&blob, "s", session_fallback, &HashMap::new(), &mut seen).unwrap();
         assert_eq!(
             message.timestamp,
             1_781_000_000 * 1000 + 250,
@@ -563,8 +681,14 @@ mod tests {
         // The same row shape without #9 falls back to the session timestamp
         // (build_gen_metadata carries no #9.#4).
         let mut seen2 = HashSet::new();
-        let fallback_msg =
-            parse_gen_metadata(&build_gen_metadata(), "s", session_fallback, &mut seen2).unwrap();
+        let fallback_msg = parse_gen_metadata(
+            &build_gen_metadata(),
+            "s",
+            session_fallback,
+            &HashMap::new(),
+            &mut seen2,
+        )
+        .unwrap();
         assert_eq!(
             fallback_msg.timestamp, session_fallback,
             "a row without #9.#4 must use the session-created fallback"
@@ -646,7 +770,7 @@ mod tests {
         let blob = enc_len(1, &chat_model);
 
         let mut seen = HashSet::new();
-        let message = parse_gen_metadata(&blob, "session", 0, &mut seen).unwrap();
+        let message = parse_gen_metadata(&blob, "session", 0, &HashMap::new(), &mut seen).unwrap();
         assert_eq!(message.tokens.output, output as i64);
         assert_eq!(message.tokens.reasoning, thinking as i64);
         // The contract: the two component fields sum to the stored total.
@@ -660,19 +784,26 @@ mod tests {
     fn malformed_blob_returns_none_without_panic() {
         let mut seen = HashSet::new();
         // Empty buffer: no chatModel sub-message.
-        assert!(parse_gen_metadata(&[], "s", 0, &mut seen).is_none());
+        assert!(parse_gen_metadata(&[], "s", 0, &HashMap::new(), &mut seen).is_none());
         // Garbage bytes that do not form a valid wire-format message.
-        assert!(parse_gen_metadata(&[0xff, 0xff, 0xff, 0xff], "s", 0, &mut seen).is_none());
+        assert!(parse_gen_metadata(
+            &[0xff, 0xff, 0xff, 0xff],
+            "s",
+            0,
+            &HashMap::new(),
+            &mut seen
+        )
+        .is_none());
         // A length-delimited #1 whose declared length overruns the buffer:
         // exercises the ProtoReader bounds check (must stop, not index OOB).
         let truncated = [(1u8 << 3) | 2, 0x7f, 0x01, 0x02];
-        assert!(parse_gen_metadata(&truncated, "s", 0, &mut seen).is_none());
+        assert!(parse_gen_metadata(&truncated, "s", 0, &HashMap::new(), &mut seen).is_none());
         // Valid outer #1 wrapping a #4 usage whose declared length overruns:
         // the inner reader must bail without panicking.
         let inner = [(4u8 << 3) | 2, 0x40, 0x00];
         let mut outer = vec![(1u8 << 3) | 2, inner.len() as u8];
         outer.extend_from_slice(&inner);
-        assert!(parse_gen_metadata(&outer, "s", 0, &mut seen).is_none());
+        assert!(parse_gen_metadata(&outer, "s", 0, &HashMap::new(), &mut seen).is_none());
     }
 
     #[test]
@@ -752,7 +883,8 @@ mod tests {
         let blob = enc_len(1, &chat_model);
 
         let mut seen = HashSet::new();
-        let message = parse_gen_metadata(&blob, "s", session_fallback, &mut seen).unwrap();
+        let message =
+            parse_gen_metadata(&blob, "s", session_fallback, &HashMap::new(), &mut seen).unwrap();
         assert_eq!(
             message.timestamp, session_fallback,
             "out-of-range per-generation nanos must fall back to the session timestamp"
@@ -783,5 +915,354 @@ mod tests {
         );
         // Anything without the scheme prefix is rejected.
         assert_eq!(file_uri_to_path("not-a-file-uri"), None);
+    }
+
+    #[test]
+    fn native_timestamp_takes_precedence_over_step_and_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native-precedence.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);
+             CREATE TABLE steps (idx integer, step_type integer, metadata blob);",
+        )
+        .unwrap();
+
+        let native_sec = 1_783_000_000u64;
+        let native_nano = 250_000_000u64;
+        let expected_native_ms = 1_783_000_000 * 1000 + 250;
+
+        let step_sec = 1_782_000_000u64;
+        let step_nano = 100_000_000u64;
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+            params![build_gen_metadata_full(
+                "gemini-3-flash-a",
+                Some(b"resp-1"),
+                Some((native_sec, native_nano))
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            params![build_step_metadata(b"resp-1", step_sec, step_nano)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.timestamp, expected_native_ms);
+        assert_standard_message_fields(msg, Some("resp-1"));
+    }
+
+    #[test]
+    fn steps_join_succeeds_when_native_timestamp_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("steps-join.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);
+             CREATE TABLE steps (idx integer, step_type integer, metadata blob);",
+        )
+        .unwrap();
+
+        let step_sec = 1_782_000_000u64;
+        let step_nano = 100_000_000u64;
+        let expected_step_ms = 1_782_000_000 * 1000 + 100;
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+            params![build_gen_metadata_full(
+                "gemini-3-flash-a",
+                Some(b"resp-1"),
+                None
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            params![build_step_metadata(b"resp-1", step_sec, step_nano)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.timestamp, expected_step_ms);
+        assert_standard_message_fields(msg, Some("resp-1"));
+    }
+
+    #[test]
+    fn join_fallback_when_generation_has_no_response_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-response-id.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);
+             CREATE TABLE steps (idx integer, step_type integer, metadata blob);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+            params![build_gen_metadata_full("gemini-3-flash-a", None, None)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            params![build_step_metadata(b"resp-1", 1_782_000_000, 0)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.timestamp, 1_781_502_653_000);
+        assert_standard_message_fields(msg, None);
+    }
+
+    #[test]
+    fn join_fallback_when_multiple_steps_match_response_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ambiguous-steps.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);
+             CREATE TABLE steps (idx integer, step_type integer, metadata blob);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+            params![build_gen_metadata_full(
+                "gemini-3-flash-a",
+                Some(b"resp-1"),
+                None
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+        // Two steps with same responseId (different timestamps) -> ambiguous
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            params![build_step_metadata(b"resp-1", 1_782_000_000, 0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 15, ?1)",
+            params![build_step_metadata(b"resp-1", 1_782_500_000, 0)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.timestamp, 1_781_502_653_000);
+        assert_standard_message_fields(msg, Some("resp-1"));
+    }
+
+    #[test]
+    fn join_fallback_when_multiple_steps_have_identical_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identical-ambiguous-steps.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);
+             CREATE TABLE steps (idx integer, step_type integer, metadata blob);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+            params![build_gen_metadata_full(
+                "gemini-3-flash-a",
+                Some(b"resp-1"),
+                None
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+        // Two steps with same responseId and identical timestamps -> ambiguous
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            params![build_step_metadata(b"resp-1", 1_782_000_000, 0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 15, ?1)",
+            params![build_step_metadata(b"resp-1", 1_782_000_000, 0)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.timestamp, 1_781_502_653_000);
+        assert_standard_message_fields(msg, Some("resp-1"));
+    }
+
+    #[test]
+    fn join_fallback_when_step_timestamp_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-step-time.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);
+             CREATE TABLE steps (idx integer, step_type integer, metadata blob);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+            params![build_gen_metadata_full(
+                "gemini-3-flash-a",
+                Some(b"resp-1"),
+                None
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+
+        // Step timestamp carries out-of-range nanos (1_000_000_000)
+        let mut bad_ts = Vec::new();
+        bad_ts.extend(enc_varint(1, 1_782_000_000));
+        bad_ts.extend(enc_varint(2, 1_000_000_000));
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            params![build_step_metadata_raw(Some(b"resp-1"), Some(&bad_ts))],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.timestamp, 1_781_502_653_000);
+        assert_standard_message_fields(msg, Some("resp-1"));
+    }
+
+    #[test]
+    fn join_fallback_when_steps_table_missing_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-steps.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+            params![build_gen_metadata_full(
+                "gemini-3-flash-a",
+                Some(b"resp-1"),
+                None
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.timestamp, 1_781_502_653_000);
+        assert_standard_message_fields(msg, Some("resp-1"));
+    }
+
+    #[test]
+    fn read_step_timestamps_filters_and_marks_ambiguous() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx integer, step_type integer, metadata blob);")
+            .unwrap();
+
+        // 1. Valid step_type=15
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            params![build_step_metadata(b"key-unique", 1_782_000_000, 0)],
+        )
+        .unwrap();
+
+        // 2. step_type != 15 should be ignored
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 14, ?1)",
+            params![build_step_metadata(b"key-ignored-type", 1_782_000_000, 0)],
+        )
+        .unwrap();
+
+        // 3. metadata NULL should be ignored
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 15, NULL)",
+            [],
+        )
+        .unwrap();
+
+        // 4. Duplicate keys become Ambiguous
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (3, 15, ?1)",
+            params![build_step_metadata(b"key-ambig", 1_782_000_000, 0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (4, 15, ?1)",
+            params![build_step_metadata(b"key-ambig", 1_782_100_000, 0)],
+        )
+        .unwrap();
+
+        let map = read_step_timestamps(&conn);
+        assert_eq!(
+            map.get(b"key-unique".as_slice()),
+            Some(&StepTimestamp::Unique(1_782_000_000_000))
+        );
+        assert_eq!(map.get(b"key-ignored-type".as_slice()), None);
+        assert_eq!(
+            map.get(b"key-ambig".as_slice()),
+            Some(&StepTimestamp::Ambiguous)
+        );
     }
 }
