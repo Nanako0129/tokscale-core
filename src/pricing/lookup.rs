@@ -1153,6 +1153,13 @@ impl PricingLookup {
         select_best_match(&all_matches, &self.litellm, "LiteLLM", provider_id)
     }
 
+    /// Fuzzy-match OpenRouter, trying the caller's spelling and then the
+    /// separator-normalized one.
+    ///
+    /// The two datasets disagree about how a minor version is written, so one
+    /// pass over a literal substring comparison can only ever reach half of
+    /// them. [`fuzzy_match_openrouter_spelling`] holds that single pass; this
+    /// runs it twice. See the comment on the retry below for the mechanism.
     fn fuzzy_match_openrouter(
         &self,
         model_id: &str,
@@ -1178,6 +1185,14 @@ impl PricingLookup {
         None
     }
 
+    /// One fuzzy pass over the OpenRouter catalog for exactly the spelling it
+    /// is given.
+    ///
+    /// Split out of [`fuzzy_match_openrouter`] so that caller can run it against
+    /// more than one spelling of the same model. It performs no normalization
+    /// of its own: `contains_model_id` is a literal find, so `claude-haiku-4-5`
+    /// reaches `anthropic/claude-haiku-4.5` only if someone converts the
+    /// spelling first.
     fn fuzzy_match_openrouter_spelling(
         &self,
         model_id: &str,
@@ -5813,23 +5828,23 @@ mod tests {
         assert!(result.pricing.input_cost_per_token.is_some());
     }
 
+        /// OpenRouter keys dot-separated minors (`claude-haiku-4.5`) where the
+        /// caller hyphenates (`claude-haiku-4-5`), so a literal `contains`
+        /// never pairs them and OpenRouter dropped out of arbitration — with an
+        /// `anthropic` hint the reseller LiteLLM entry won and priced cache
+        /// writes at zero (#1329).
+        ///
+        /// Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`) with
+        /// the assertions retargeted, because the two trees settle this
+        /// differently. Upstream has no cache backfill, so once the OpenRouter
+        /// entry reaches arbitration it wins outright and upstream asserts
+        /// `source == "OpenRouter"`. This tree has `backfill_cache_costs`
+        /// (local since `8bf52d4`, never adopted upstream), so the (Some, Some)
+        /// branch keeps the hint-matching LiteLLM key as the winner and grafts
+        /// the missing rate onto it. Different mechanism, same outcome for the
+        /// user: the cache-write rate stops being zero.
     #[test]
     fn test_fuzzy_openrouter_crosses_version_separator_difference() {
-        // OpenRouter keys dot-separated minors (`claude-haiku-4.5`) where the
-        // caller hyphenates (`claude-haiku-4-5`), so a literal `contains`
-        // never pairs them and OpenRouter dropped out of arbitration — with an
-        // `anthropic` hint the reseller LiteLLM entry won and priced cache
-        // writes at zero (#1329).
-        //
-        // Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`) with
-        // the assertions retargeted, because the two trees settle this
-        // differently. Upstream has no cache backfill, so once the OpenRouter
-        // entry reaches arbitration it wins outright and upstream asserts
-        // `source == "OpenRouter"`. This tree has `backfill_cache_costs`
-        // (local since `8bf52d4`, never adopted upstream), so the (Some, Some)
-        // branch keeps the hint-matching LiteLLM key as the winner and grafts
-        // the missing rate onto it. Different mechanism, same outcome for the
-        // user: the cache-write rate stops being zero.
         let mut litellm = HashMap::new();
         litellm.insert(
             "perplexity/anthropic/claude-haiku-4-5".into(),
@@ -5896,18 +5911,18 @@ mod tests {
         );
     }
 
+        /// Unhinted lookups hit the same wall: without any LiteLLM entry the
+        /// dotted OpenRouter key is the only candidate, and the literal
+        /// `contains` hid it entirely. Ported unchanged from upstream #1338.
+        ///
+        /// It does NOT guard the fuzzy retry in this tree, and is kept because
+        /// it is upstream's rather than because it protects anything here. The
+        /// key below is resolved by the earlier `normalize_version_separator`
+        /// exact block, so this test passes with the fuzzy retry deleted
+        /// outright — established by mutation, not assumed. The test that does
+        /// guard it is `..._reaches_a_suffixed_key` below.
     #[test]
     fn test_fuzzy_openrouter_version_separator_without_hint() {
-        // Unhinted lookups hit the same wall: without any LiteLLM entry the
-        // dotted OpenRouter key is the only candidate, and the literal
-        // `contains` hid it entirely. Ported unchanged from upstream #1338.
-        //
-        // It does NOT guard the fuzzy retry in this tree, and is kept because
-        // it is upstream's rather than because it protects anything here. The
-        // key below is resolved by the earlier `normalize_version_separator`
-        // exact block, so this test passes with the fuzzy retry deleted
-        // outright — established by mutation, not assumed. The test that does
-        // guard it is `..._reaches_a_suffixed_key` below.
         let mut openrouter = HashMap::new();
         openrouter.insert(
             "anthropic/claude-haiku-4.5".into(),
@@ -5926,16 +5941,16 @@ mod tests {
         assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
     }
 
+        /// The guard for the fuzzy half of this port, which upstream's own
+        /// `..._without_hint` above cannot be in this tree: that one is settled
+        /// by the earlier `normalize_version_separator` exact block and passes
+        /// with the fuzzy retry deleted outright.
+        ///
+        /// Reaching the fuzzy stage needs a key no exact stage can match: a
+        /// dotted minor version PLUS a suffix, so only a substring comparison
+        /// can pair it with the caller's hyphenated id.
     #[test]
     fn test_fuzzy_openrouter_normalized_retry_reaches_a_suffixed_key() {
-        // The guard for the fuzzy half of this port, which upstream's own
-        // `..._without_hint` above cannot be in this tree: that one is settled
-        // by the earlier `normalize_version_separator` exact block and passes
-        // with the fuzzy retry deleted outright.
-        //
-        // Reaching the fuzzy stage needs a key no exact stage can match: a
-        // dotted minor version PLUS a suffix, so only a substring comparison
-        // can pair it with the caller's hyphenated id.
         let mut openrouter = HashMap::new();
         openrouter.insert(
             "anthropic/claude-haiku-4.5-preview".into(),
