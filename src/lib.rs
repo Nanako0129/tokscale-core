@@ -2187,17 +2187,22 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .collect();
     all_messages.extend(antigravity_messages);
 
-    let antigravity_cli_messages: Vec<UnifiedMessage> = scan_result
-        .get(ClientId::AntigravityCli)
+    let antigravity_cli_paths = scan_result.get(ClientId::AntigravityCli);
+    let antigravity_cli_ctx =
+        sessions::antigravity_cli::build_timestamp_context(antigravity_cli_paths);
+    let antigravity_cli_messages: Vec<UnifiedMessage> = antigravity_cli_paths
         .par_iter()
         .flat_map(|path| {
-            sessions::antigravity_cli::parse_antigravity_cli_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+            sessions::antigravity_cli::parse_antigravity_cli_file_with_context(
+                path,
+                &antigravity_cli_ctx,
+            )
+            .into_iter()
+            .map(|mut msg| {
+                apply_pricing_if_available(&mut msg, pricing);
+                msg
+            })
+            .collect::<Vec<_>>()
         })
         .collect();
     all_messages.extend(antigravity_cli_messages);
@@ -4627,8 +4632,14 @@ where
     // ---- Antigravity CLI (.db protobuf, own dedup set on responseId) ----
     {
         let mut antigravity_cli_seen: HashSet<String> = HashSet::new();
-        for path in scan_result.get(ClientId::AntigravityCli) {
-            for mut m in sessions::antigravity_cli::parse_antigravity_cli_file(path) {
+        let antigravity_cli_paths = scan_result.get(ClientId::AntigravityCli);
+        let antigravity_cli_ctx =
+            sessions::antigravity_cli::build_timestamp_context(antigravity_cli_paths);
+        for path in antigravity_cli_paths {
+            for mut m in sessions::antigravity_cli::parse_antigravity_cli_file_with_context(
+                path,
+                &antigravity_cli_ctx,
+            ) {
                 apply_pricing_if_available(&mut m, pricing);
                 if !passes_client(&m) {
                     continue;
@@ -5403,12 +5414,19 @@ fn scan_local_sources_with_context(
         .map_err(|error| error.to_string())
 }
 
+fn antigravity_cli_log_dependencies(scan_result: &scanner::ScanResult) -> Vec<PathBuf> {
+    sessions::antigravity_cli::find_log_files(scan_result.get(ClientId::AntigravityCli))
+}
+
 fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     let mut latest: u64 = 0;
     for files in scan_result.files.iter() {
         for path in files {
             latest = latest.max(file_mtime_ms(path).unwrap_or(0));
         }
+    }
+    for log_path in antigravity_cli_log_dependencies(scan_result) {
+        latest = latest.max(file_mtime_ms(&log_path).unwrap_or(0));
     }
     let mut dbs: Vec<PathBuf> = scan_result.opencode_dbs.clone();
     let single_dbs = [
@@ -5613,6 +5631,7 @@ fn local_source_change_token_inner(scan_result: &scanner::ScanResult) -> Result<
             .iter()
             .filter_map(|path| sessions::kiro::kiro_related_messages_path(path)),
     );
+    paths.extend(antigravity_cli_log_dependencies(scan_result));
 
     paths.sort();
     paths.dedup();
@@ -6404,14 +6423,19 @@ fn parse_local_clients_inner(
     counts.set(ClientId::Antigravity, antigravity_count);
     messages.extend(antigravity_msgs);
 
-    let antigravity_cli_msgs: Vec<ParsedMessage> = scan_result
-        .get(ClientId::AntigravityCli)
+    let antigravity_cli_paths = scan_result.get(ClientId::AntigravityCli);
+    let antigravity_cli_ctx =
+        sessions::antigravity_cli::build_timestamp_context(antigravity_cli_paths);
+    let antigravity_cli_msgs: Vec<ParsedMessage> = antigravity_cli_paths
         .par_iter()
         .flat_map(|path| {
-            sessions::antigravity_cli::parse_antigravity_cli_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
+            sessions::antigravity_cli::parse_antigravity_cli_file_with_context(
+                path,
+                &antigravity_cli_ctx,
+            )
+            .into_iter()
+            .map(|msg| unified_to_parsed(&msg))
+            .collect::<Vec<_>>()
         })
         .collect();
     let antigravity_cli_count = summed_parsed_message_count(&antigravity_cli_msgs);
@@ -16921,6 +16945,138 @@ mod tests {
                 "both conversations reusing responseId \"SHARED\" must survive"
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_antigravity_cli_three_lanes_parity_with_log_timestamp() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let conv_dir = source_home
+            .path()
+            .join(".gemini/antigravity-cli/conversations");
+        let log_dir = source_home.path().join(".gemini/antigravity-cli/log");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        write_antigravity_cli_db(&conv_dir, "conv-parity", "resp-parity-1");
+
+        let log_path = log_dir.join("cli-20260907_055144.log");
+        std::fs::write(
+            &log_path,
+            "ERROR: logging before google.Init: I0907 05:51:58.547986     135 http_helpers.go:296] URL: https://example.com Trace: 0x123 ResponseID: resp-parity-1\n",
+        )
+        .unwrap();
+
+        let expected_log_ts = {
+            let naive = chrono::NaiveDate::from_ymd_opt(2026, 9, 7)
+                .unwrap()
+                .and_hms_micro_opt(5, 51, 58, 547986)
+                .unwrap();
+            chrono::TimeZone::from_local_datetime(&chrono::Local, &naive)
+                .single()
+                .unwrap()
+                .timestamp_millis()
+        };
+
+        // 1. Materialized lane
+        let mat_messages = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["antigravity-cli".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_eq!(mat_messages.len(), 1);
+        let mat_ts = mat_messages[0].timestamp;
+        assert_eq!(mat_ts, expected_log_ts);
+
+        // 2. Streaming lane
+        let mut stream_messages = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["antigravity-cli".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| stream_messages.push(m.clone()),
+        );
+        assert_eq!(stream_messages.len(), 1);
+        let stream_ts = stream_messages[0].timestamp;
+        assert_eq!(stream_ts, expected_log_ts);
+
+        // 3. Count lane
+        let count_result = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_string_lossy().to_string()),
+            clients: Some(vec!["antigravity-cli".to_string()]),
+            use_env_roots: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(count_result.messages.len(), 1);
+        let count_ts = count_result.messages[0].timestamp;
+        assert_eq!(count_ts, expected_log_ts);
+
+        // Parity assert
+        assert_eq!(mat_ts, stream_ts);
+        assert_eq!(stream_ts, count_ts);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_antigravity_cli_log_only_change_advances_change_token() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let conv_dir = source_home
+            .path()
+            .join(".gemini/antigravity-cli/conversations");
+        let log_dir = source_home.path().join(".gemini/antigravity-cli/log");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        write_antigravity_cli_db(&conv_dir, "conv-token", "resp-token-1");
+
+        let log_path = log_dir.join("cli-20260907_055144.log");
+        std::fs::write(
+            &log_path,
+            "I0907 05:51:58.547986 135 http_helpers.go:296] ResponseID: resp-token-1\n",
+        )
+        .unwrap();
+
+        let local_options = LocalParseOptions {
+            home_dir: Some(source_home.path().to_string_lossy().to_string()),
+            clients: Some(vec!["antigravity-cli".to_string()]),
+            use_env_roots: true,
+            ..Default::default()
+        };
+
+        let token_before = local_source_change_token(&local_options).unwrap();
+
+        // Mutate log file only (DB remains untouched)
+        let log_path_2 = log_dir.join("cli-20260907_055248.log");
+        std::fs::write(
+            &log_path_2,
+            "I0907 05:52:51.538480 314 http_helpers.go:296] ResponseID: resp-token-2\n",
+        )
+        .unwrap();
+
+        let token_after = local_source_change_token(&local_options).unwrap();
+        assert_ne!(
+            token_before, token_after,
+            "log-only addition/modification must advance the change token"
+        );
     }
 
     // jcode (`~/.jcode/sessions/session_*.json`) must be discovered by the
