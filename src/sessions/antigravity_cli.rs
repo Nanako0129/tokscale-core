@@ -33,7 +33,7 @@
 
 use super::utils::open_readonly_sqlite;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
-use crate::{pricing, provider_identity, TokenBreakdown};
+use crate::{pricing, TokenBreakdown};
 use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::Path;
@@ -132,9 +132,11 @@ fn parse_gen_metadata(
     let model_id = pricing::aliases::resolve_alias(model_raw)
         .unwrap_or(model_raw)
         .to_string();
-    let provider_id = provider_identity::inferred_provider_from_model(&model_id)
-        .unwrap_or("antigravity")
-        .to_string();
+    // Antigravity CLI is a subscription *channel*: usage is billed against
+    // Google's official price list, so the hint names the channel rather than
+    // the model vendor — `pricing/lookup.rs::prefer_litellm_over_openrouter`
+    // uses it to pick the price dataset.
+    let provider_id = "antigravity".to_string();
 
     Some(UnifiedMessage::new_with_dedup(
         "antigravity-cli",
@@ -501,7 +503,7 @@ mod tests {
         // belongs to the Gemini 3.5 Flash High tier, not the retired preview
         // family.
         assert_eq!(message.model_id, "gemini-3.5-flash-high");
-        assert_eq!(message.provider_id, "google");
+        assert_eq!(message.provider_id, "antigravity");
         assert_eq!(message.session_id, "session-test");
         assert_eq!(message.tokens.input, 1632); // 1132 + 500
         assert_eq!(message.tokens.cache_read, 16000);
@@ -524,7 +526,7 @@ mod tests {
         let message = parse_gen_metadata(&blob, "session", 1_000, &mut seen).unwrap();
 
         assert_eq!(message.model_id, "gemini-3.5-flash-high");
-        assert_eq!(message.provider_id, "google");
+        assert_eq!(message.provider_id, "antigravity");
     }
 
     #[test]
