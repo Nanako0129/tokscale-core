@@ -886,6 +886,13 @@ fn parser_version(client: ClientId) -> u32 {
         // Cold-cache verification passes either way, which is exactly why
         // the acceptance for this change is a warm-cache measurement.
         ClientId::Claude => 4,
+        // 2: OpenCode 2.x renamed the session metadata table `session` ->
+        // `session_v2`, so the v2 `session_message` parse now falls back to
+        // the renamed join table. An unchanged database fingerprint whose
+        // version-1 entry cached the dropped-empty result would otherwise
+        // keep reporting zero OpenCode usage; the bump makes the namespace
+        // cold so every source re-parses with the corrected query.
+        ClientId::OpenCode => 2,
         _ => 1,
     }
 }
@@ -5720,6 +5727,10 @@ mod tests {
         assert_eq!(parser_version(ClientId::Jcode), 4);
         assert_eq!(parser_version(ClientId::Copilot), 4);
         assert_eq!(parser_version(ClientId::Grok), 3);
+        // 2 is the OpenCode 2.x `session_v2` join-table fallback: a database
+        // fingerprint unchanged since the `session`-only parse must re-parse
+        // instead of replaying the dropped-empty result.
+        assert_eq!(parser_version(ClientId::OpenCode), 2);
         for client in [
             ClientId::Amp,
             ClientId::Cursor,
@@ -5758,6 +5769,7 @@ mod tests {
                     | ClientId::OpenClaw
                     | ClientId::MiMoCode
                     | ClientId::Mux
+                    | ClientId::OpenCode
             ) {
                 assert_eq!(
                     parser_version(client),

@@ -504,19 +504,34 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
 
     let mut acc = OpenCodeSqliteAccumulator::default();
 
-    // OpenCode v2 (`opencode-next.db`): per-message rows live in
-    // `session_message`, keyed by a `type` column, with model + provider nested
-    // under `$.model`. Absent in v1 databases, where the prepare fails and this
-    // is a no-op.
-    let v2_query = r#"
+    // OpenCode v2: per-message rows live in `session_message`, keyed by a
+    // `type` column, with model + provider nested under `$.model`. Absent in
+    // v1 databases, where the prepare fails and this is a no-op.
+    //
+    // The session-side join table was renamed: OpenCode 2.0.x stores sessions
+    // in `session_v2` (with the same `id`/`directory` columns the join reads),
+    // while older v2 databases used `session`. Exactly one of the two exists
+    // in any given database, so probe the legacy name first and fall back to
+    // `session_v2`; the failed prepare makes the other variant a no-op.
+    let v2_query = |session_table: &str| {
+        format!(
+            r#"
         SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root
         FROM session_message sm
-        LEFT JOIN session s ON s.id = sm.session_id
+        LEFT JOIN {session_table} s ON s.id = sm.session_id
         WHERE sm.type = 'assistant'
           AND json_extract(sm.data, '$.tokens') IS NOT NULL
         ORDER BY sm.id, sm.session_id
-    "#;
-    collect_opencode_rows(&conn, v2_query, &mut acc, false);
+    "#
+        )
+    };
+    let v2_legacy_query = v2_query("session");
+    let v2_session_v2_query = v2_query("session_v2");
+    if conn.prepare(&v2_legacy_query).is_ok() {
+        collect_opencode_rows(&conn, &v2_legacy_query, &mut acc, false);
+    } else {
+        collect_opencode_rows(&conn, &v2_session_v2_query, &mut acc, false);
+    }
 
     // OpenCode v1 (`opencode.db`, 1.2+): per-message rows in `message`, role in
     // the JSON `$.role`. The `session` join supplies the workspace directory;
@@ -738,6 +753,29 @@ mod tests {
         conn
     }
 
+    /// Build a database shaped like OpenCode 2.0.x: `session_message` rows plus
+    /// a `session_v2` table. The session_v2 columns are trimmed to the ones
+    /// the parser's join reads; `project_id` is NOT NULL in the real schema,
+    /// so the fixture keeps it to mirror the real CREATE TABLE.
+    fn create_opencode_v2_session_v2_sqlite_db(db_path: &Path) -> Connection {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL,
+                project_id TEXT NOT NULL
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
     /// A representative v2 assistant payload: no `role` field, model + provider
     /// nested under `$.model`, integer timestamps.
     const V2_ASSISTANT_DATA: &str = r#"{
@@ -830,6 +868,46 @@ mod tests {
         assert_eq!(
             msg.cost_source,
             crate::sessions::CostSource::ProviderReported
+        );
+    }
+
+    /// Regression guard for OpenCode 2.0.x, which renamed the session-side join
+    /// table from `session` to `session_v2` while keeping `id`/`directory`.
+    /// The v2 query previously joined `session` only, so the prepare failed and
+    /// every session_message row was silently dropped.
+    #[test]
+    fn test_parse_v2_session_message_with_session_v2_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+
+        let conn = create_opencode_v2_session_v2_sqlite_db(&db_path);
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, project_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["ses_v2x", "/Users/alice/opencode-v2x-repo", "proj_1"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["msg_v2x_001", "ses_v2x", "assistant", V2_ASSISTANT_DATA],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_opencode_sqlite(&db_path);
+        assert_eq!(
+            messages.len(),
+            1,
+            "OpenCode 2.0.x session_message row should be parsed"
+        );
+        let msg = &messages[0];
+        assert_eq!(msg.client, "opencode");
+        assert_eq!(msg.model_id, "claude-sonnet-4");
+        assert_eq!(msg.provider_id, "anthropic");
+        assert_eq!(msg.tokens.input, 5519);
+        assert_eq!(
+            msg.workspace_key.as_deref(),
+            Some("/Users/alice/opencode-v2x-repo"),
+            "workspace should come from session_v2.directory"
         );
     }
 
