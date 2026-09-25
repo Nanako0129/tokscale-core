@@ -44,11 +44,29 @@ reviews:
     # A top-level '@coderabbitai review' comment still works and is still the
     # way to re-run a review on demand. It is just not a requirement here.
     #
-    # What remains genuinely unverified: whether this account is on a trial
-    # whose expiry would change the above. Nothing observable from the
-    # repository says so, and the date 2026-10-02 has no source that could be
-    # found. If such a trial exists, record where that is visible rather than
-    # restating the date.
+    # There IS a trial, and it has a date. Verified 2026-09-25 from the
+    # CodeRabbit billing page (app.coderabbit.ai, Plans & products), which is
+    # the only place it is visible -- nothing in this repository, in the bot's
+    # comments, or on coderabbit.ai/oss shows it:
+    #
+    #   Plan: Advanced, monthly, on trial. 8 seats. Trial ends 02 Oct 2026.
+    #   Estimated monthly cost after that: USD 720. Credits: 0.
+    #
+    # So the date the earlier comment named was real. What was wrong about it
+    # was the reason: it tied the date to a star-count rule that does not
+    # exist. The trial is an account-level plan, so its expiry lands on every
+    # repository at once and has nothing to do with this one's star count.
+    #
+    # WATCH THIS, because it is a charge and not a cut-off. 'Usage-based
+    # reviews' is Active on the same page at USD 0.25 per reviewed file, and
+    # its own description is "continue reviewing after your plan's included
+    # limits are reached". Reviews may therefore keep working past 02 Oct and
+    # bill per file rather than stopping. coderabbit.ai/oss separately states
+    # reviews are free on every public repository, which would cover this one,
+    # but the interaction between that and an expired paid plan with
+    # usage-based billing switched on has NOT been observed here. Check the
+    # billing page after the first review in October rather than assuming
+    # either outcome.
     #
     # The Copilot ruleset is set to enforcement=disabled through the API
     # rather than deleted, so two reviewers do not both run and re-enabling
