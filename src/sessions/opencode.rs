@@ -506,31 +506,43 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
 
     // OpenCode v2: per-message rows live in `session_message`, keyed by a
     // `type` column, with model + provider nested under `$.model`. Absent in
-    // v1 databases, where the prepare fails and this is a no-op.
+    // v1 databases, where every prepare fails and this is a no-op.
     //
     // The session-side join table was renamed: OpenCode 2.0.x stores sessions
     // in `session_v2` (with the same `id`/`directory` columns the join reads),
-    // while older v2 databases used `session`. Exactly one of the two exists
-    // in any given database, so probe the legacy name first and fall back to
-    // `session_v2`; the failed prepare makes the other variant a no-op.
-    let v2_query = |session_table: &str| {
-        format!(
+    // while older v2 databases used `session`. Same order as upstream
+    // `OPENCODE_V2_QUERIES` (junhoyeo/tokscale #1156): the current table first,
+    // so a database that kept an old `session` next to `session_v2` does not
+    // join the stale one; then the legacy table; then no join at all, so the
+    // usage still parses (without a workspace) when neither metadata table
+    // exists instead of every row being dropped.
+    let v2_query = |session_table: Option<&str>| match session_table {
+        Some(table) => format!(
             r#"
         SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root
         FROM session_message sm
-        LEFT JOIN {session_table} s ON s.id = sm.session_id
+        LEFT JOIN {table} s ON s.id = sm.session_id
         WHERE sm.type = 'assistant'
           AND json_extract(sm.data, '$.tokens') IS NOT NULL
         ORDER BY sm.id, sm.session_id
     "#
-        )
+        ),
+        None => r#"
+        SELECT sm.id, sm.session_id, sm.data, NULL AS workspace_root
+        FROM session_message sm
+        WHERE sm.type = 'assistant'
+          AND json_extract(sm.data, '$.tokens') IS NOT NULL
+        ORDER BY sm.id, sm.session_id
+    "#
+        .to_string(),
     };
-    let v2_legacy_query = v2_query("session");
-    let v2_session_v2_query = v2_query("session_v2");
-    if conn.prepare(&v2_legacy_query).is_ok() {
-        collect_opencode_rows(&conn, &v2_legacy_query, &mut acc, false);
-    } else {
-        collect_opencode_rows(&conn, &v2_session_v2_query, &mut acc, false);
+    let v2_queries = [
+        v2_query(Some("session_v2")),
+        v2_query(Some("session")),
+        v2_query(None),
+    ];
+    if let Some(query) = v2_queries.iter().find(|q| conn.prepare(q).is_ok()) {
+        collect_opencode_rows(&conn, query, &mut acc, false);
     }
 
     // OpenCode v1 (`opencode.db`, 1.2+): per-message rows in `message`, role in
@@ -908,6 +920,82 @@ mod tests {
             msg.workspace_key.as_deref(),
             Some("/Users/alice/opencode-v2x-repo"),
             "workspace should come from session_v2.directory"
+        );
+    }
+
+    /// Ported from upstream #1156: with neither `session` nor `session_v2`,
+    /// the usage must still parse, just without a workspace.
+    #[test]
+    fn test_parse_v2_session_message_without_metadata_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "msg_without_metadata",
+                "ses_without_metadata",
+                "assistant",
+                V2_ASSISTANT_DATA
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_opencode_sqlite(&db_path);
+        assert_eq!(
+            messages.len(),
+            1,
+            "usage should parse without session metadata"
+        );
+        assert_eq!(messages[0].workspace_key, None);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("msg_without_metadata")
+        );
+    }
+
+    /// Both metadata tables present (an old `session` left next to
+    /// `session_v2`): the join reads the current table, as upstream orders it.
+    #[test]
+    fn test_parse_v2_session_message_prefers_session_v2_over_legacy_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_opencode_v2_session_v2_sqlite_db(&db_path);
+        conn.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory) VALUES (?1, ?2)",
+            rusqlite::params!["ses_both", "/Users/alice/stale-legacy-dir"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, project_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["ses_both", "/Users/alice/current-dir", "proj_1"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["msg_both", "ses_both", "assistant", V2_ASSISTANT_DATA],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_opencode_sqlite(&db_path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].workspace_key.as_deref(),
+            Some("/Users/alice/current-dir"),
+            "the workspace comes from session_v2, not the stale session table"
         );
     }
 
