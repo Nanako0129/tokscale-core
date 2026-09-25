@@ -857,10 +857,19 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Jcode => 4,
         ClientId::Copilot => 4,
         ClientId::Grok => 3,
+        // 2: the shared Roo/Kilo/Cline task-log parser now takes each entry's
+        // `modelInfo` model (and provider when `apiProtocol` is silent), so
+        // Cline 4.x tasks stop resolving to `unknown/unknown` (upstream
+        // #1340). All three clients share `parse_roo_kilo_file`, so all three
+        // re-parse.
+        ClientId::RooCode | ClientId::KiloCode | ClientId::Cline => 2,
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
+        // 3: `Input (w/ Cache Write)` is read as the cache-write bucket instead
+        // of being reduced by `Input (w/o Cache Write)` (upstream #1154), so
+        // cached rows under-count cache writes until re-parsed.
+        ClientId::Cursor => 3,
         ClientId::Amp
-        | ClientId::Cursor
         | ClientId::OpenClaw
         | ClientId::MiMoCode
         | ClientId::Mux => 2,
@@ -5733,7 +5742,6 @@ mod tests {
         assert_eq!(parser_version(ClientId::OpenCode), 2);
         for client in [
             ClientId::Amp,
-            ClientId::Cursor,
             ClientId::OpenClaw,
             ClientId::MiMoCode,
             ClientId::Mux,
@@ -5744,6 +5752,12 @@ mod tests {
                 "{} parser version",
                 client.as_str()
             );
+        }
+        // 3 reads Cursor's cache-write column as its own bucket (#1154).
+        assert_eq!(parser_version(ClientId::Cursor), 3);
+        for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {
+            // 2: per-message `modelInfo` identity (#1340).
+            assert_eq!(parser_version(client), 2, "{}", client.as_str());
         }
         assert_eq!(parser_version(ClientId::Crush), 1);
         assert_eq!(parser_version(ClientId::Hermes), 1);
@@ -5770,6 +5784,9 @@ mod tests {
                     | ClientId::MiMoCode
                     | ClientId::Mux
                     | ClientId::OpenCode
+                    | ClientId::RooCode
+                    | ClientId::KiloCode
+                    | ClientId::Cline
             ) {
                 assert_eq!(
                     parser_version(client),

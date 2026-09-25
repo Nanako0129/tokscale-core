@@ -170,11 +170,11 @@ pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        // Cache write = input_with_cache_write - input_without_cache_write
-        let cache_write = (input_with_cache_write - input_without_cache_write).max(0);
-        // Input tokens = input_without_cache_write
-        let input = input_without_cache_write;
-
+        // Cursor exports independent token buckets, not cumulative totals
+        // (upstream #1154): `Input (w/ Cache Write)` is the cache-write count
+        // and `Input (w/o Cache Write)` the plain input, and `Total Tokens` is
+        // the sum of all four columns. Subtracting one from the other
+        // under-counted cache writes.
         let mut message = UnifiedMessage::new(
             "cursor",
             model,
@@ -182,10 +182,10 @@ pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
             format!("cursor-{}-{}", account_id, date_str),
             timestamp,
             TokenBreakdown {
-                input: input.max(0),
+                input: input_without_cache_write.max(0),
                 output: output_tokens.max(0),
                 cache_read: cache_read.max(0),
-                cache_write, // Already clamped above with .max(0)
+                cache_write: input_with_cache_write.max(0),
                 reasoning: 0,
                 cache_write_1h: 0,
             },
@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(messages[0].provider_id, "openai");
         assert_eq!(messages[0].tokens.input, 5);
         assert_eq!(messages[0].tokens.output, 15);
-        assert_eq!(messages[0].tokens.cache_write, 5); // 10 - 5
+        assert_eq!(messages[0].tokens.cache_write, 10);
         assert!((messages[0].cost - 0.10).abs() < 0.001);
         assert!(messages[0].has_authoritative_cost());
 
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(messages[0].tokens.input, 775);
         assert_eq!(messages[0].tokens.output, 21282);
         assert_eq!(messages[0].tokens.cache_read, 105891);
-        assert_eq!(messages[0].tokens.cache_write, 28342 - 775); // 27567
+        assert_eq!(messages[0].tokens.cache_write, 28342);
         assert!((messages[0].cost - 0.19).abs() < 0.001);
         assert!(messages[0].has_authoritative_cost());
 
@@ -374,6 +374,26 @@ mod tests {
         assert_eq!(messages[1].provider_id, "openai"); // gpt -> openai
         assert_eq!(messages[1].tokens.input, 8263);
         assert_eq!(messages[1].tokens.cache_read, 66964);
+    }
+
+    // Ported from upstream #1154: the four token columns are independent
+    // buckets whose sum is `Total Tokens`.
+    #[test]
+    fn test_parse_cursor_csv_luna_style_total_tokens() {
+        let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"2026-08-18T12:00:00.000Z","On-Demand","claude-sonnet-4","No","15000000","1000000","20000000","2000000","38000000","$9.50"
+"2026-08-18T13:00:00.000Z","On-Demand","claude-sonnet-4","No","5000000","500000","8000000","660000","14160000","$3.54""#;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.csv");
+        std::fs::write(&file_path, csv).unwrap();
+
+        let total_tokens: i64 = parse_cursor_file(&file_path)
+            .iter()
+            .map(|message| message.tokens.total())
+            .sum();
+
+        assert_eq!(total_tokens, 52_160_000);
     }
 
     #[test]
