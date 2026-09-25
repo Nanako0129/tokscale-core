@@ -855,15 +855,41 @@ fn parser_version(client: ClientId) -> u32 {
         // zero turns. Cold-rebuild only, for the same reason as 5.
         ClientId::Codex => 6,
         ClientId::Jcode => 4,
-        ClientId::Copilot => 4,
-        ClientId::Grok => 3,
+        // 5: Copilot Desktop's `events.jsonl` metadata reader now reads past a
+        // non-UTF-8 line (`lossy_lines`) instead of stopping, and the desktop
+        // DB entry can be served for an unchanged fingerprint, so only the
+        // bump lets truncated metadata re-read.
+        ClientId::Copilot => 5,
+        // 4: session files are now read past a non-UTF-8 line instead of
+        // stopping at the first one (upstream `cfe1304a`, #1031). A Grok
+        // session file that is never appended to again keeps its fingerprint,
+        // so only this bump discards the truncated parse.
+        ClientId::Grok => 4,
+        // 3: `.jsonl.zst` archives (and the `.jsonl.deleted.<ts>.zst` /
+        // `.jsonl.reset.<ts>.zst` forms the scanner already matched) were read
+        // as plain text and cached as empty; they now decode (upstream #1285).
+        // Those archives never change on disk, so without the bump the empty
+        // entries would be served forever. The same bump covers dropping
+        // compaction checkpoint snapshots from discovery (upstream #1293).
+        ClientId::OpenClaw => 3,
+        // 2: the shared Roo/Kilo/Cline task-log parser now takes each entry's
+        // `modelInfo` model (and provider when `apiProtocol` is silent), so
+        // Cline 4.x tasks stop resolving to `unknown/unknown` (upstream
+        // #1340). All three clients share `parse_roo_kilo_file`, so all three
+        // re-parse.
+        ClientId::RooCode | ClientId::KiloCode | ClientId::Cline => 2,
+        // 3: `Input (w/ Cache Write)` is read as the cache-write bucket instead
+        // of being reduced by `Input (w/o Cache Write)`, and any numeric
+        // exported Cost (including an explicit `$0.00`) is provider-reported
+        // (upstream #1154). Cached rows hold the old tokens and cost source.
+        ClientId::Cursor => 3,
+        // 2: Pi messages now carry a cross-session dedup key (upstream #1323),
+        // and a cached v1 entry has none, so fork copies would keep counting
+        // once per session file until re-parsed.
+        ClientId::Pi => 2,
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
-        ClientId::Amp
-        | ClientId::Cursor
-        | ClientId::OpenClaw
-        | ClientId::MiMoCode
-        | ClientId::Mux => 2,
+        ClientId::Amp | ClientId::MiMoCode | ClientId::Mux => 2,
         // 2: Claude gained retention of history-only turns dropped by a
         // Claude Code transcript rewrite (see RET-CLAUDE-001 in
         // UPSTREAM.md). This records the parse-semantics change, not a
@@ -886,6 +912,13 @@ fn parser_version(client: ClientId) -> u32 {
         // Cold-cache verification passes either way, which is exactly why
         // the acceptance for this change is a warm-cache measurement.
         ClientId::Claude => 4,
+        // 2: OpenCode 2.x renamed the session metadata table `session` ->
+        // `session_v2`, so the v2 `session_message` parse now falls back to
+        // the renamed join table. An unchanged database fingerprint whose
+        // version-1 entry cached the dropped-empty result would otherwise
+        // keep reporting zero OpenCode usage; the bump makes the namespace
+        // cold so every source re-parses with the corrected query.
+        ClientId::OpenCode => 2,
         _ => 1,
     }
 }
@@ -5718,12 +5751,14 @@ mod tests {
     fn test_parser_versions_are_identity_scoped() {
         assert_eq!(parser_version(ClientId::Codex), 6);
         assert_eq!(parser_version(ClientId::Jcode), 4);
-        assert_eq!(parser_version(ClientId::Copilot), 4);
-        assert_eq!(parser_version(ClientId::Grok), 3);
+        assert_eq!(parser_version(ClientId::Copilot), 5);
+        assert_eq!(parser_version(ClientId::Grok), 4);
+        // 2 is the OpenCode 2.x `session_v2` join-table fallback: a database
+        // fingerprint unchanged since the `session`-only parse must re-parse
+        // instead of replaying the dropped-empty result.
+        assert_eq!(parser_version(ClientId::OpenCode), 2);
         for client in [
             ClientId::Amp,
-            ClientId::Cursor,
-            ClientId::OpenClaw,
             ClientId::MiMoCode,
             ClientId::Mux,
         ] {
@@ -5733,6 +5768,17 @@ mod tests {
                 "{} parser version",
                 client.as_str()
             );
+        }
+        // 3 is the `.zst` archive decode plus checkpoint exclusion (#1285,
+        // #1293): unchanged archives must re-parse instead of replaying empty.
+        assert_eq!(parser_version(ClientId::OpenClaw), 3);
+        // 3 reads Cursor's cache-write column as its own bucket (#1154).
+        assert_eq!(parser_version(ClientId::Cursor), 3);
+        // 2 carries the cross-session Pi dedup key (#1323).
+        assert_eq!(parser_version(ClientId::Pi), 2);
+        for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {
+            // 2: per-message `modelInfo` identity (#1340).
+            assert_eq!(parser_version(client), 2, "{}", client.as_str());
         }
         assert_eq!(parser_version(ClientId::Crush), 1);
         assert_eq!(parser_version(ClientId::Hermes), 1);
@@ -5758,6 +5804,11 @@ mod tests {
                     | ClientId::OpenClaw
                     | ClientId::MiMoCode
                     | ClientId::Mux
+                    | ClientId::OpenCode
+                    | ClientId::RooCode
+                    | ClientId::KiloCode
+                    | ClientId::Cline
+                    | ClientId::Pi
             ) {
                 assert_eq!(
                     parser_version(client),

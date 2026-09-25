@@ -60,6 +60,8 @@ pub struct PiMessage {
     pub usage: Option<PiUsage>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    #[serde(rename = "responseId")]
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,11 +216,11 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
                 .to_string(),
         };
 
-        let timestamp = entry
+        let recorded_timestamp = entry
             .timestamp
             .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
-            .map(|dt| dt.timestamp_millis())
-            .unwrap_or(fallback_timestamp);
+            .map(|dt| dt.timestamp_millis());
+        let timestamp = recorded_timestamp.unwrap_or(fallback_timestamp);
 
         let mut unified = UnifiedMessage::new_with_agent(
             "pi",
@@ -237,6 +239,43 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
             0.0,
             agent.clone(),
         );
+        // Cross-session dedup key (upstream #1323, issue #1306). A Pi
+        // branch/fork writes a new session file and copies the parent's
+        // assistant records into it verbatim - same `responseId`, entry id and
+        // usage - so a key scoped to the session would count every copied
+        // record once per file. `responseId` is preferred; the entry id plus
+        // the immutable event fields is the fallback. The lanes in `lib.rs`
+        // drop repeats first-wins in scan order.
+        //
+        // Local deviation from upstream: the response key also carries the
+        // provider. `responseId` is issued by each provider, so two providers
+        // can hand out the same id, and first-wins would then drop a real
+        // message. A fork copy keeps its provider, so copies still collapse.
+        let response_key = message
+            .response_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("pi:response:{}:{id}", unified.provider_id));
+        unified.dedup_key = response_key.or_else(|| {
+            entry
+                .id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| {
+                    let stable_timestamp = recorded_timestamp
+                        .map(|timestamp| timestamp.to_string())
+                        .unwrap_or_else(|| "missing".to_string());
+                    format!(
+                        "pi:message:{id}:{stable_timestamp}:{}:{}:{}:{}:{}:{}",
+                        unified.provider_id,
+                        unified.model_id,
+                        unified.tokens.input,
+                        unified.tokens.output,
+                        unified.tokens.cache_read,
+                        unified.tokens.cache_write,
+                    )
+                })
+        });
         unified.set_workspace(workspace_key.clone(), workspace_label.clone());
         messages.push(unified);
     }
@@ -459,5 +498,138 @@ not valid json
 
         // then
         assert!(messages.is_empty());
+    }
+
+    // Ported from upstream #1323.
+
+    /// The record shape from the token-monitor synthetic repro
+    /// (Javis603/token-monitor#627, tokscale#1306): a Pi branch copies the
+    /// parent's assistant entries into a new session file verbatim —
+    /// same `message.responseId`, same entry id, same usage — and only the
+    /// session header differs.
+    fn fork_fixture(session_id: &str, extra_message: Option<&str>) -> String {
+        let copied = format!(
+            r#"{{"type":"message","id":"entry-fork-copy","parentId":"{session_id}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-demo-fork","usage":{{"input":100,"output":20,"cacheRead":300,"cacheWrite":0,"totalTokens":420}}}}}}"#
+        );
+        let mut lines = vec![
+            format!(
+                r#"{{"type":"session","id":"{session_id}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#
+            ),
+            copied,
+        ];
+        if let Some(message) = extra_message {
+            lines.push(message.to_string());
+        }
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn fork_copies_across_session_files_share_a_response_level_key() {
+        let parent = create_test_file(&fork_fixture("session-demo-1", None));
+        let child = create_test_file(&fork_fixture("session-demo-2", None));
+
+        let parent_messages = parse_pi_file(parent.path());
+        let child_messages = parse_pi_file(child.path());
+
+        assert_eq!(parent_messages.len(), 1);
+        assert_eq!(child_messages.len(), 1);
+        // Session-independent identity: the key must not embed the session id.
+        let parent_key = parent_messages[0].dedup_key.as_deref().unwrap();
+        let child_key = child_messages[0].dedup_key.as_deref().unwrap();
+        assert_eq!(parent_key, child_key);
+        assert_eq!(parent_key, "pi:response:openai-codex:resp-demo-fork");
+    }
+
+    #[test]
+    fn fork_copy_plus_new_turns_only_the_prefix_collapses() {
+        // given: the child file copies the parent's record and then continues
+        // with a genuinely new response. Only the copied prefix must share a
+        // key; the new turn must survive.
+        let new_turn = r#"{"type":"message","id":"entry-child-new","parentId":"session-demo-2","timestamp":"2026-09-06T12:01:00.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-demo-child-new","usage":{"input":7,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":10}}}"#;
+        let parent = create_test_file(&fork_fixture("session-demo-1", None));
+        let child = create_test_file(&fork_fixture("session-demo-2", Some(new_turn)));
+
+        let parent_messages = parse_pi_file(parent.path());
+        let child_messages = parse_pi_file(child.path());
+
+        assert_eq!(parent_messages.len(), 1);
+        assert_eq!(child_messages.len(), 2);
+        let child_keys: Vec<&str> = child_messages
+            .iter()
+            .map(|message| message.dedup_key.as_deref().unwrap())
+            .collect();
+        assert_eq!(child_keys[0], "pi:response:openai-codex:resp-demo-fork");
+        assert_eq!(
+            child_keys[1],
+            "pi:response:openai-codex:resp-demo-child-new"
+        );
+        assert!(child_keys[1] != child_keys[0]);
+    }
+
+    #[test]
+    fn different_response_ids_stay_separate_even_with_identical_content() {
+        // given: two genuinely separate calls with the same usage but
+        // different response ids must not merge (regenerate/retry case).
+        let file = create_test_file(concat!(
+            r#"{"type":"session","id":"session-demo-1","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}"#,
+            "\n",
+            r#"{"type":"message","id":"entry-a","parentId":"session-demo-1","timestamp":"2026-09-06T12:00:00.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-A","usage":{"input":100,"output":20,"cacheRead":300,"cacheWrite":0,"totalTokens":420}}}"#,
+            "\n",
+            r#"{"type":"message","id":"entry-b","parentId":"session-demo-1","timestamp":"2026-09-06T12:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-B","usage":{"input":100,"output":20,"cacheRead":300,"cacheWrite":0,"totalTokens":420}}}"#,
+            "\n",
+        ));
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_ne!(messages[0].dedup_key, messages[1].dedup_key);
+    }
+
+    #[test]
+    fn missing_response_id_falls_back_to_entry_identity_across_files() {
+        // given: no responseId, but the fork preserves the entry id and the
+        // immutable event fields — those form the fallback key, and it must
+        // still be session-independent.
+        let record = r#"{"type":"message","id":"entry-no-resp","parentId":"SESSION","timestamp":"2026-09-06T12:00:00.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","usage":{"input":100,"output":20,"cacheRead":300,"cacheWrite":0,"totalTokens":420}}}"#;
+        let make = |session: &str| {
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#
+            ) + "\n"
+                + &record.replace("SESSION", session)
+                + "\n"
+        };
+        let parent = create_test_file(&make("session-a"));
+        let child = create_test_file(&make("session-b"));
+
+        let parent_messages = parse_pi_file(parent.path());
+        let child_messages = parse_pi_file(child.path());
+
+        assert_eq!(parent_messages.len(), 1);
+        assert_eq!(child_messages.len(), 1);
+        let parent_key = parent_messages[0].dedup_key.as_deref().unwrap();
+        let child_key = child_messages[0].dedup_key.as_deref().unwrap();
+        assert_eq!(parent_key, child_key);
+        assert!(parent_key.starts_with("pi:message:entry-no-resp:"));
+    }
+
+    #[test]
+    fn same_response_id_from_different_providers_stays_separate() {
+        // `responseId` is provider-issued; two providers can return the same
+        // id for unrelated messages, which must not collapse into one.
+        let make = |session: &str, provider: &str| {
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#
+            ) + "\n"
+                + &format!(
+                    r#"{{"type":"message","id":"entry-{provider}","parentId":"{session}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"{provider}","model":"gpt-6-astra","responseId":"resp-shared","usage":{{"input":100,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":120}}}}}}"#
+                )
+                + "\n"
+        };
+        let a = create_test_file(&make("session-a", "openai"));
+        let b = create_test_file(&make("session-b", "openrouter"));
+
+        let key_a = parse_pi_file(a.path())[0].dedup_key.clone().unwrap();
+        let key_b = parse_pi_file(b.path())[0].dedup_key.clone().unwrap();
+        assert_ne!(key_a, key_b);
     }
 }

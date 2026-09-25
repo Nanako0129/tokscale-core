@@ -1745,8 +1745,16 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             )
         })
         .collect();
+    // Cross-file dedup: a Pi fork copies its parent's records verbatim into a
+    // new session file (upstream #1323). First-wins in scan order.
+    let mut pi_seen: HashSet<String> = HashSet::new();
     for outcome in pi_outcomes {
-        all_messages.extend(outcome.messages);
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut pi_seen, message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
@@ -6095,15 +6103,16 @@ fn parse_local_clients_inner(
     counts.set(ClientId::OpenClaw, openclaw_count);
     messages.extend(openclaw_msgs);
 
-    let pi_msgs: Vec<ParsedMessage> = scan_result
+    let pi_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Pi)
         .par_iter()
-        .flat_map(|path| {
-            sessions::pi::parse_pi_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::pi::parse_pi_file(path))
+        .collect();
+    let mut pi_seen: HashSet<String> = HashSet::new();
+    let pi_msgs: Vec<ParsedMessage> = pi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut pi_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let pi_count = pi_msgs.len() as i32;
     counts.set(ClientId::Pi, pi_count);
@@ -11574,7 +11583,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_cursor_parse_path_reprices_zero_cost_composer_1_5_rows() {
+    fn test_cursor_parse_path_reprices_missing_cost_composer_1_5_rows() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let _env = EnvGuard::set(&[
             ("HOME", cache_home.path().as_os_str()),
@@ -11585,7 +11594,7 @@ mod tests {
         std::fs::create_dir_all(&cursor_cache_dir).unwrap();
 
         let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
-"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","0""#;
+"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","Included""#;
         std::fs::write(cursor_cache_dir.join("usage.csv"), csv).unwrap();
 
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
@@ -11599,6 +11608,7 @@ mod tests {
         assert_eq!(messages[0].client, "cursor");
         assert_eq!(messages[0].model_id, "Composer 1.5");
         assert!(messages[0].cost > 0.0);
+        assert!(!messages[0].has_authoritative_cost());
     }
 
     fn write_kimi_repeated_status_fixture_at(session_dir: &Path) {
@@ -11849,6 +11859,82 @@ mod tests {
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 5);
         }
+    }
+
+    // Ported from upstream #1323: two Pi session files carrying the same
+    // `responseId` with conflicting usage keep the first copy in scan-path
+    // order, on the count lane; the materialized and streaming lanes must
+    // agree with it.
+    #[test]
+    #[serial_test::serial]
+    fn test_pi_fork_copies_dedup_first_wins_on_every_lane() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let sessions_dir = source_home.path().join(".pi/agent/sessions/--fixture--");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let record = |session: &str, input: i64, output: i64| {
+            let total = input + output;
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#,
+            ) + "\n"
+                + &format!(
+                    r#"{{"type":"message","id":"entry-fork-copy","parentId":"{session}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-demo-fork","usage":{{"input":{input},"output":{output},"cacheRead":0,"cacheWrite":0,"totalTokens":{total}}}}}}}"#
+                )
+                + "\n"
+        };
+        std::fs::write(
+            sessions_dir.join("session-a.jsonl"),
+            record("session-a", 100, 20),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("session-b.jsonl"),
+            record("session-b", 999, 999),
+        )
+        .unwrap();
+
+        for _ in 0..25 {
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["pi".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(parsed.counts.get(ClientId::Pi), 1);
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].input, 100);
+            assert_eq!(parsed.messages[0].output, 20);
+        }
+
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["pi".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].tokens.input, 100);
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["pi".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].tokens.input, 100);
     }
 
     #[test]
@@ -15241,7 +15327,7 @@ mod tests {
             std::fs::create_dir_all(&cursor_cache_dir).unwrap();
 
             let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
-"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","0""#;
+"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","Included""#;
             std::fs::write(cursor_cache_dir.join("usage.csv"), csv).unwrap();
 
             let mut litellm = HashMap::new();
@@ -16921,6 +17007,88 @@ mod tests {
                 "both conversations reusing responseId \"SHARED\" must survive"
             );
         }
+    }
+
+    // The `steps` turn time must date the row identically on the materialized,
+    // streaming and count lanes; each lane calls the parser on its own.
+    #[test]
+    #[serial_test::serial]
+    fn test_antigravity_cli_three_lanes_parity_with_step_timestamp() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let conv_dir = source_home
+            .path()
+            .join(".gemini/antigravity-cli/conversations");
+        write_antigravity_cli_db(&conv_dir, "conv-parity", "resp-parity-1");
+
+        // steps.metadata = {#1: {#1: seconds}, #9: {#11: responseId}}
+        let step_seconds: u64 = 1_789_200_000;
+        let mut ts = vec![0x08];
+        let mut v = step_seconds;
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            ts.push(if v == 0 { byte } else { byte | 0x80 });
+            if v == 0 {
+                break;
+            }
+        }
+        let resp = b"resp-parity-1";
+        let mut m9 = vec![(11 << 3) | 2, resp.len() as u8];
+        m9.extend_from_slice(resp);
+        let mut metadata = vec![(1 << 3) | 2, ts.len() as u8];
+        metadata.extend(ts);
+        metadata.extend([(9 << 3) | 2, m9.len() as u8]);
+        metadata.extend(m9);
+        let conn = rusqlite::Connection::open(conv_dir.join("conv-parity.db")).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx integer, step_type integer, metadata blob);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            rusqlite::params![metadata],
+        )
+        .unwrap();
+        drop(conn);
+        let expected_ts = step_seconds as i64 * 1000;
+
+        let mat_messages = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["antigravity-cli".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_eq!(mat_messages.len(), 1);
+        assert_eq!(mat_messages[0].timestamp, expected_ts);
+
+        let mut stream_messages = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["antigravity-cli".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| stream_messages.push(m.clone()),
+        );
+        assert_eq!(stream_messages.len(), 1);
+        assert_eq!(stream_messages[0].timestamp, expected_ts);
+
+        let count_result = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_string_lossy().to_string()),
+            clients: Some(vec!["antigravity-cli".to_string()]),
+            use_env_roots: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(count_result.messages.len(), 1);
+        assert_eq!(count_result.messages[0].timestamp, expected_ts);
     }
 
     // jcode (`~/.jcode/sessions/session_*.json`) must be discovered by the
