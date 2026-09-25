@@ -1745,8 +1745,16 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             )
         })
         .collect();
+    // Cross-file dedup: a Pi fork copies its parent's records verbatim into a
+    // new session file (upstream #1323). First-wins in scan order.
+    let mut pi_seen: HashSet<String> = HashSet::new();
     for outcome in pi_outcomes {
-        all_messages.extend(outcome.messages);
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut pi_seen, message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
@@ -6095,15 +6103,16 @@ fn parse_local_clients_inner(
     counts.set(ClientId::OpenClaw, openclaw_count);
     messages.extend(openclaw_msgs);
 
-    let pi_msgs: Vec<ParsedMessage> = scan_result
+    let pi_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Pi)
         .par_iter()
-        .flat_map(|path| {
-            sessions::pi::parse_pi_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::pi::parse_pi_file(path))
+        .collect();
+    let mut pi_seen: HashSet<String> = HashSet::new();
+    let pi_msgs: Vec<ParsedMessage> = pi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut pi_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let pi_count = pi_msgs.len() as i32;
     counts.set(ClientId::Pi, pi_count);
@@ -11850,6 +11859,82 @@ mod tests {
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 5);
         }
+    }
+
+    // Ported from upstream #1323: two Pi session files carrying the same
+    // `responseId` with conflicting usage keep the first copy in scan-path
+    // order, on the count lane; the materialized and streaming lanes must
+    // agree with it.
+    #[test]
+    #[serial_test::serial]
+    fn test_pi_fork_copies_dedup_first_wins_on_every_lane() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let sessions_dir = source_home.path().join(".pi/agent/sessions/--fixture--");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let record = |session: &str, input: i64, output: i64| {
+            let total = input + output;
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#,
+            ) + "\n"
+                + &format!(
+                    r#"{{"type":"message","id":"entry-fork-copy","parentId":"{session}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-demo-fork","usage":{{"input":{input},"output":{output},"cacheRead":0,"cacheWrite":0,"totalTokens":{total}}}}}}}"#
+                )
+                + "\n"
+        };
+        std::fs::write(
+            sessions_dir.join("session-a.jsonl"),
+            record("session-a", 100, 20),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("session-b.jsonl"),
+            record("session-b", 999, 999),
+        )
+        .unwrap();
+
+        for _ in 0..25 {
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["pi".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(parsed.counts.get(ClientId::Pi), 1);
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].input, 100);
+            assert_eq!(parsed.messages[0].output, 20);
+        }
+
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["pi".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].tokens.input, 100);
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["pi".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].tokens.input, 100);
     }
 
     #[test]

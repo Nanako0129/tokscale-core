@@ -883,6 +883,10 @@ fn parser_version(client: ClientId) -> u32 {
         // exported Cost (including an explicit `$0.00`) is provider-reported
         // (upstream #1154). Cached rows hold the old tokens and cost source.
         ClientId::Cursor => 3,
+        // 2: Pi messages now carry a cross-session dedup key (upstream #1323),
+        // and a cached v1 entry has none, so fork copies would keep counting
+        // once per session file until re-parsed.
+        ClientId::Pi => 2,
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
         ClientId::Amp | ClientId::MiMoCode | ClientId::Mux => 2,
@@ -5770,6 +5774,8 @@ mod tests {
         assert_eq!(parser_version(ClientId::OpenClaw), 3);
         // 3 reads Cursor's cache-write column as its own bucket (#1154).
         assert_eq!(parser_version(ClientId::Cursor), 3);
+        // 2 carries the cross-session Pi dedup key (#1323).
+        assert_eq!(parser_version(ClientId::Pi), 2);
         for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {
             // 2: per-message `modelInfo` identity (#1340).
             assert_eq!(parser_version(client), 2, "{}", client.as_str());
@@ -5802,6 +5808,7 @@ mod tests {
                     | ClientId::RooCode
                     | ClientId::KiloCode
                     | ClientId::Cline
+                    | ClientId::Pi
             ) {
                 assert_eq!(
                     parser_version(client),
