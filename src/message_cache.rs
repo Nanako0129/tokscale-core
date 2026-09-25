@@ -865,13 +865,16 @@ fn parser_version(client: ClientId) -> u32 {
         // session file that is never appended to again keeps its fingerprint,
         // so only this bump discards the truncated parse.
         ClientId::Grok => 4,
+        // 3: `.jsonl.zst` archives (and the `.jsonl.deleted.<ts>.zst` /
+        // `.jsonl.reset.<ts>.zst` forms the scanner already matched) were read
+        // as plain text and cached as empty; they now decode (upstream #1285).
+        // Those archives never change on disk, so without the bump the empty
+        // entries would be served forever. The same bump covers dropping
+        // compaction checkpoint snapshots from discovery (upstream #1293).
+        ClientId::OpenClaw => 3,
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
-        ClientId::Amp
-        | ClientId::Cursor
-        | ClientId::OpenClaw
-        | ClientId::MiMoCode
-        | ClientId::Mux => 2,
+        ClientId::Amp | ClientId::Cursor | ClientId::MiMoCode | ClientId::Mux => 2,
         // 2: Claude gained retention of history-only turns dropped by a
         // Claude Code transcript rewrite (see RET-CLAUDE-001 in
         // UPSTREAM.md). This records the parse-semantics change, not a
@@ -5742,7 +5745,6 @@ mod tests {
         for client in [
             ClientId::Amp,
             ClientId::Cursor,
-            ClientId::OpenClaw,
             ClientId::MiMoCode,
             ClientId::Mux,
         ] {
@@ -5753,6 +5755,9 @@ mod tests {
                 client.as_str()
             );
         }
+        // 3 is the `.zst` archive decode plus checkpoint exclusion (#1285,
+        // #1293): unchanged archives must re-parse instead of replaying empty.
+        assert_eq!(parser_version(ClientId::OpenClaw), 3);
         assert_eq!(parser_version(ClientId::Crush), 1);
         assert_eq!(parser_version(ClientId::Hermes), 1);
         assert_eq!(parser_version(ClientId::Trae), 1);
