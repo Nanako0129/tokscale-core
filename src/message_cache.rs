@@ -855,25 +855,37 @@ fn parser_version(client: ClientId) -> u32 {
         // zero turns. Cold-rebuild only, for the same reason as 5.
         ClientId::Codex => 6,
         ClientId::Jcode => 4,
-        ClientId::Copilot => 4,
-        ClientId::Grok => 3,
+        // 5: Copilot Desktop's `events.jsonl` metadata reader now reads past a
+        // non-UTF-8 line (`lossy_lines`) instead of stopping, and the desktop
+        // DB entry can be served for an unchanged fingerprint, so only the
+        // bump lets truncated metadata re-read.
+        ClientId::Copilot => 5,
+        // 4: session files are now read past a non-UTF-8 line instead of
+        // stopping at the first one (upstream `cfe1304a`, #1031). A Grok
+        // session file that is never appended to again keeps its fingerprint,
+        // so only this bump discards the truncated parse.
+        ClientId::Grok => 4,
+        // 3: `.jsonl.zst` archives (and the `.jsonl.deleted.<ts>.zst` /
+        // `.jsonl.reset.<ts>.zst` forms the scanner already matched) were read
+        // as plain text and cached as empty; they now decode (upstream #1285).
+        // Those archives never change on disk, so without the bump the empty
+        // entries would be served forever. The same bump covers dropping
+        // compaction checkpoint snapshots from discovery (upstream #1293).
+        ClientId::OpenClaw => 3,
         // 2: the shared Roo/Kilo/Cline task-log parser now takes each entry's
         // `modelInfo` model (and provider when `apiProtocol` is silent), so
         // Cline 4.x tasks stop resolving to `unknown/unknown` (upstream
         // #1340). All three clients share `parse_roo_kilo_file`, so all three
         // re-parse.
         ClientId::RooCode | ClientId::KiloCode | ClientId::Cline => 2,
-        // 2: These parser output shapes now preserve source cost provenance;
-        // Mux additionally splits mixed known/unknown token buckets.
         // 3: `Input (w/ Cache Write)` is read as the cache-write bucket instead
         // of being reduced by `Input (w/o Cache Write)`, and any numeric
         // exported Cost (including an explicit `$0.00`) is provider-reported
         // (upstream #1154). Cached rows hold the old tokens and cost source.
         ClientId::Cursor => 3,
-        ClientId::Amp
-        | ClientId::OpenClaw
-        | ClientId::MiMoCode
-        | ClientId::Mux => 2,
+        // 2: These parser output shapes now preserve source cost provenance;
+        // Mux additionally splits mixed known/unknown token buckets.
+        ClientId::Amp | ClientId::MiMoCode | ClientId::Mux => 2,
         // 2: Claude gained retention of history-only turns dropped by a
         // Claude Code transcript rewrite (see RET-CLAUDE-001 in
         // UPSTREAM.md). This records the parse-semantics change, not a
@@ -5735,15 +5747,14 @@ mod tests {
     fn test_parser_versions_are_identity_scoped() {
         assert_eq!(parser_version(ClientId::Codex), 6);
         assert_eq!(parser_version(ClientId::Jcode), 4);
-        assert_eq!(parser_version(ClientId::Copilot), 4);
-        assert_eq!(parser_version(ClientId::Grok), 3);
+        assert_eq!(parser_version(ClientId::Copilot), 5);
+        assert_eq!(parser_version(ClientId::Grok), 4);
         // 2 is the OpenCode 2.x `session_v2` join-table fallback: a database
         // fingerprint unchanged since the `session`-only parse must re-parse
         // instead of replaying the dropped-empty result.
         assert_eq!(parser_version(ClientId::OpenCode), 2);
         for client in [
             ClientId::Amp,
-            ClientId::OpenClaw,
             ClientId::MiMoCode,
             ClientId::Mux,
         ] {
@@ -5754,6 +5765,9 @@ mod tests {
                 client.as_str()
             );
         }
+        // 3 is the `.zst` archive decode plus checkpoint exclusion (#1285,
+        // #1293): unchanged archives must re-parse instead of replaying empty.
+        assert_eq!(parser_version(ClientId::OpenClaw), 3);
         // 3 reads Cursor's cache-write column as its own bucket (#1154).
         assert_eq!(parser_version(ClientId::Cursor), 3);
         for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {

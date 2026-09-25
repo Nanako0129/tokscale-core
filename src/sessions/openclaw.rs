@@ -8,8 +8,55 @@ use super::UnifiedMessage;
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+
+// Archived transcripts are immutable zstd files. Bound expansion before parsing
+// so a corrupt archive cannot allocate its advertised decoded size.
+const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_archive(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut decoder = zstd::stream::read::Decoder::new(file)?;
+    decoder.window_log_max(26)?;
+    let mut bytes = Vec::new();
+    decoder.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::other(
+            "decoded transcript exceeds archive limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Transcript lines, decoding `.zst` archives (upstream #1285). A plain file
+/// keeps the previous line reader; an archive that fails to decode or exceeds
+/// `MAX_ARCHIVE_BYTES` yields nothing rather than a partial transcript.
+fn transcript_lines(path: &Path) -> Option<Box<dyn Iterator<Item = String>>> {
+    if path.extension().is_some_and(|extension| extension == "zst") {
+        let bytes = read_archive(path, MAX_ARCHIVE_BYTES).ok()?;
+        let lines: Vec<String> = bytes
+            .split(|&byte| byte == b'\n')
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect();
+        return Some(Box::new(lines.into_iter()));
+    }
+    let file = std::fs::File::open(path).ok()?;
+    // A line that is not valid UTF-8 is skipped and the lines after it are
+    // still read, as before; an I/O error ends the file instead of retrying.
+    let mut reader = BufReader::new(file);
+    Some(Box::new(std::iter::from_fn(move || loop {
+        let mut raw = Vec::new();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {
+                if let Ok(line) = String::from_utf8(raw) {
+                    return Some(line);
+                }
+            }
+        }
+    })))
+}
 
 #[derive(Debug, Deserialize)]
 struct SessionIndex {
@@ -135,9 +182,8 @@ fn resolve_session_path(index_dir: &Path, entry: &SessionEntry) -> PathBuf {
 }
 
 fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedMessage> {
-    let file = match std::fs::File::open(session_path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
+    let Some(lines) = transcript_lines(session_path) else {
+        return Vec::new();
     };
 
     // Get file modification time as fallback for missing timestamps
@@ -148,18 +194,12 @@ fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedM
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    let reader = BufReader::new(file);
     let mut messages = Vec::with_capacity(64);
     let mut current_model: Option<String> = None;
     let mut current_provider: Option<String> = None;
     let mut buffer = Vec::with_capacity(4096);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -271,6 +311,66 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
         path.to_string_lossy().to_string()
+    }
+
+    // Ported from upstream #1285.
+    #[test]
+    fn compressed_archives_preserve_transcript_usage_and_session_identity() {
+        let dir = TempDir::new().unwrap();
+        let content = concat!(
+            "{\"type\":\"model_change\",\"provider\":\"anthropic\",\"modelId\":\"claude-sonnet-4-6\"}\r\n",
+            "\ninvalid json\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":100,\"output\":50,\"cacheRead\":200,\"cacheWrite\":10,\"cost\":{\"total\":0.05}},\"timestamp\":1788566869012}}\n",
+        );
+        let plain = create_test_session(&dir, "session.jsonl", content);
+        let expected = parse_openclaw_transcript(Path::new(&plain));
+        assert_eq!(expected.len(), 1);
+
+        for filename in [
+            "session.jsonl.zst",
+            "session.jsonl.deleted.2026-09-05T00-00-00.000Z.nonce.zst",
+            "session.jsonl.reset.2026-09-05T00-00-00.000Z.nonce.zst",
+        ] {
+            let path = dir.path().join(filename);
+            std::fs::write(&path, zstd::encode_all(content.as_bytes(), 0).unwrap()).unwrap();
+            assert_eq!(parse_openclaw_transcript(&path), expected, "{filename}");
+        }
+    }
+
+    // Ported from upstream #1285.
+    #[test]
+    fn compressed_archive_enforces_decoded_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl.zst");
+        std::fs::write(&path, zstd::encode_all(&b"12345"[..], 0).unwrap()).unwrap();
+        assert_eq!(read_archive(&path, 5).unwrap(), b"12345");
+        assert!(read_archive(&path, 4).is_err());
+    }
+
+    // Ported from upstream #1285.
+    #[test]
+    fn invalid_or_truncated_compressed_archive_does_not_emit_partial_usage() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl.deleted.timestamp.zst");
+        let content = br#"{"type":"message","message":{"role":"assistant","model":"example","usage":{"input":100},"timestamp":1700000000000}}"#;
+        let mut bytes = zstd::encode_all(&content[..], 0).unwrap();
+        bytes.pop();
+        std::fs::write(&path, bytes).unwrap();
+        assert!(parse_openclaw_transcript(&path).is_empty());
+        std::fs::write(&path, b"not a zstd stream").unwrap();
+        assert!(parse_openclaw_transcript(&path).is_empty());
+    }
+
+    #[test]
+    fn plain_transcript_keeps_reading_past_an_invalid_utf8_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":1},\"timestamp\":1700000000000}}\n");
+        bytes.extend_from_slice(b"\xff\xfe not utf-8\n");
+        bytes.extend_from_slice(b"{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":2},\"timestamp\":1700000001000}}\n");
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(parse_openclaw_transcript(&path).len(), 2);
     }
 
     #[test]
