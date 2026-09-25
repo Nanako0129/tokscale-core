@@ -300,6 +300,38 @@ fn is_kiro_ide_session_artifact(root: &Path, path: &Path) -> bool {
     )
 }
 
+/// Most workers a scan runs, however many cores the machine has (upstream
+/// #1153). Directory walks block on the filesystem rather than the CPU, so
+/// past a handful the extra workers park and contend instead of finding files.
+const SCAN_WORKER_CEILING: usize = 4;
+
+/// Walk every scan task in parallel on a pool capped at `SCAN_WORKER_CEILING`.
+/// A pool that fails to build falls back to the global pool: correct, just
+/// without the cap.
+fn run_scan_tasks<P: Send>(
+    tasks: Vec<(ClientId, P, &str)>,
+    root: impl Fn(&P) -> &Path + Sync,
+) -> Vec<(ClientId, Vec<PathBuf>)> {
+    let scan = |tasks: Vec<(ClientId, P, &str)>| -> Vec<(ClientId, Vec<PathBuf>)> {
+        tasks
+            .into_par_iter()
+            .map(|(client_id, path, pattern)| {
+                (client_id, scan_directory_path(root(&path), pattern))
+            })
+            .collect()
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(2, |cores| cores.get().min(SCAN_WORKER_CEILING));
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("tokscale-scan-{i}"))
+        .build()
+    {
+        Ok(pool) => pool.install(|| scan(tasks)),
+        Err(_) => scan(tasks),
+    }
+}
+
 /// Scan a single directory for session files
 pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
     scan_directory_path(Path::new(root), pattern)
@@ -310,9 +342,11 @@ fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
         return Vec::new();
     }
 
+    // Sequential on purpose (upstream #1164): every caller already runs this
+    // inside a parallel map over scan tasks (`run_scan_tasks`), and a nested
+    // `par_bridge` there deadlocked in futex waits on large directory trees.
     let mut paths: Vec<PathBuf> = WalkDir::new(root_path)
         .into_iter()
-        .par_bridge()
         .filter_map(|e| e.ok())
         .filter(|e| {
             let path = e.path();
@@ -1355,10 +1389,7 @@ fn scan_all_clients_resolved_inner(
         }
     }
 
-    let scan_results: Vec<(ClientId, Vec<PathBuf>)> = tasks
-        .into_par_iter()
-        .map(|(client_id, path, pattern)| (client_id, scan_directory_path(&path, pattern)))
-        .collect();
+    let scan_results = run_scan_tasks(tasks, |path| path.as_path());
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for (client_id, files) in scan_results {
         for file in files {
@@ -1894,14 +1925,7 @@ fn scan_all_clients_with_env_strategy_inner(
 
     retain_unexcluded_scan_tasks(&mut tasks, scanner_settings);
 
-    // Execute scans in parallel
-    let scan_results: Vec<(ClientId, Vec<PathBuf>)> = tasks
-        .into_par_iter()
-        .map(|(client_id, path, pattern)| {
-            let files = scan_directory_path(Path::new(&path), pattern);
-            (client_id, files)
-        })
-        .collect();
+    let scan_results = run_scan_tasks(tasks, |path| Path::new(path.as_str()));
 
     // Aggregate results, deduplicating physical files across overlapping roots.
     let mut seen: HashSet<PathBuf> = HashSet::new();
