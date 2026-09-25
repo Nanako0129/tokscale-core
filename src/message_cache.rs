@@ -855,8 +855,16 @@ fn parser_version(client: ClientId) -> u32 {
         // zero turns. Cold-rebuild only, for the same reason as 5.
         ClientId::Codex => 6,
         ClientId::Jcode => 4,
-        ClientId::Copilot => 4,
-        ClientId::Grok => 3,
+        // 5: Copilot Desktop's `events.jsonl` metadata reader now reads past a
+        // non-UTF-8 line (`lossy_lines`) instead of stopping, and the desktop
+        // DB entry can be served for an unchanged fingerprint, so only the
+        // bump lets truncated metadata re-read.
+        ClientId::Copilot => 5,
+        // 4: session files are now read past a non-UTF-8 line instead of
+        // stopping at the first one (upstream `cfe1304a`, #1031). A Grok
+        // session file that is never appended to again keeps its fingerprint,
+        // so only this bump discards the truncated parse.
+        ClientId::Grok => 4,
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
         ClientId::Amp
@@ -5725,8 +5733,8 @@ mod tests {
     fn test_parser_versions_are_identity_scoped() {
         assert_eq!(parser_version(ClientId::Codex), 6);
         assert_eq!(parser_version(ClientId::Jcode), 4);
-        assert_eq!(parser_version(ClientId::Copilot), 4);
-        assert_eq!(parser_version(ClientId::Grok), 3);
+        assert_eq!(parser_version(ClientId::Copilot), 5);
+        assert_eq!(parser_version(ClientId::Grok), 4);
         // 2 is the OpenCode 2.x `session_v2` join-table fallback: a database
         // fingerprint unchanged since the `session`-only parse must re-parse
         // instead of replaying the dropped-empty result.
