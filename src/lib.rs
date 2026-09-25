@@ -11574,7 +11574,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_cursor_parse_path_reprices_zero_cost_composer_1_5_rows() {
+    fn test_cursor_parse_path_reprices_missing_cost_composer_1_5_rows() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let _env = EnvGuard::set(&[
             ("HOME", cache_home.path().as_os_str()),
@@ -11585,7 +11585,7 @@ mod tests {
         std::fs::create_dir_all(&cursor_cache_dir).unwrap();
 
         let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
-"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","0""#;
+"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","Included""#;
         std::fs::write(cursor_cache_dir.join("usage.csv"), csv).unwrap();
 
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
@@ -11599,6 +11599,7 @@ mod tests {
         assert_eq!(messages[0].client, "cursor");
         assert_eq!(messages[0].model_id, "Composer 1.5");
         assert!(messages[0].cost > 0.0);
+        assert!(!messages[0].has_authoritative_cost());
     }
 
     fn write_kimi_repeated_status_fixture_at(session_dir: &Path) {
@@ -15241,7 +15242,7 @@ mod tests {
             std::fs::create_dir_all(&cursor_cache_dir).unwrap();
 
             let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
-"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","0""#;
+"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","Included""#;
             std::fs::write(cursor_cache_dir.join("usage.csv"), csv).unwrap();
 
             let mut litellm = HashMap::new();
