@@ -246,11 +246,16 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
         // record once per file. `responseId` is preferred; the entry id plus
         // the immutable event fields is the fallback. The lanes in `lib.rs`
         // drop repeats first-wins in scan order.
+        //
+        // Local deviation from upstream: the response key also carries the
+        // provider. `responseId` is issued by each provider, so two providers
+        // can hand out the same id, and first-wins would then drop a real
+        // message. A fork copy keeps its provider, so copies still collapse.
         let response_key = message
             .response_id
             .as_deref()
             .filter(|id| !id.trim().is_empty())
-            .map(|id| format!("pi:response:{id}"));
+            .map(|id| format!("pi:response:{}:{id}", unified.provider_id));
         unified.dedup_key = response_key.or_else(|| {
             entry
                 .id
@@ -532,7 +537,7 @@ not valid json
         let parent_key = parent_messages[0].dedup_key.as_deref().unwrap();
         let child_key = child_messages[0].dedup_key.as_deref().unwrap();
         assert_eq!(parent_key, child_key);
-        assert_eq!(parent_key, "pi:response:resp-demo-fork");
+        assert_eq!(parent_key, "pi:response:openai-codex:resp-demo-fork");
     }
 
     #[test]
@@ -553,8 +558,11 @@ not valid json
             .iter()
             .map(|message| message.dedup_key.as_deref().unwrap())
             .collect();
-        assert_eq!(child_keys[0], "pi:response:resp-demo-fork");
-        assert_eq!(child_keys[1], "pi:response:resp-demo-child-new");
+        assert_eq!(child_keys[0], "pi:response:openai-codex:resp-demo-fork");
+        assert_eq!(
+            child_keys[1],
+            "pi:response:openai-codex:resp-demo-child-new"
+        );
         assert!(child_keys[1] != child_keys[0]);
     }
 
@@ -602,5 +610,26 @@ not valid json
         let child_key = child_messages[0].dedup_key.as_deref().unwrap();
         assert_eq!(parent_key, child_key);
         assert!(parent_key.starts_with("pi:message:entry-no-resp:"));
+    }
+
+    #[test]
+    fn same_response_id_from_different_providers_stays_separate() {
+        // `responseId` is provider-issued; two providers can return the same
+        // id for unrelated messages, which must not collapse into one.
+        let make = |session: &str, provider: &str| {
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#
+            ) + "\n"
+                + &format!(
+                    r#"{{"type":"message","id":"entry-{provider}","parentId":"{session}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"{provider}","model":"gpt-6-astra","responseId":"resp-shared","usage":{{"input":100,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":120}}}}}}"#
+                )
+                + "\n"
+        };
+        let a = create_test_file(&make("session-a", "openai"));
+        let b = create_test_file(&make("session-b", "openrouter"));
+
+        let key_a = parse_pi_file(a.path())[0].dedup_key.clone().unwrap();
+        let key_b = parse_pi_file(b.path())[0].dedup_key.clone().unwrap();
+        assert_ne!(key_a, key_b);
     }
 }
