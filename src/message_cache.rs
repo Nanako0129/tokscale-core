@@ -866,8 +866,9 @@ fn parser_version(client: ClientId) -> u32 {
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
         // 3: `Input (w/ Cache Write)` is read as the cache-write bucket instead
-        // of being reduced by `Input (w/o Cache Write)` (upstream #1154), so
-        // cached rows under-count cache writes until re-parsed.
+        // of being reduced by `Input (w/o Cache Write)`, and any numeric
+        // exported Cost (including an explicit `$0.00`) is provider-reported
+        // (upstream #1154). Cached rows hold the old tokens and cost source.
         ClientId::Cursor => 3,
         ClientId::Amp
         | ClientId::OpenClaw
