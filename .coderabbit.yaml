@@ -4,8 +4,10 @@
 # Every instruction below restates a rule this repository already writes down in
 # AGENTS.md or CONTRIBUTING.md. Nothing here is a new policy.
 #
-# The one setting that is a choice rather than a restatement is
-# auto_pause_after_reviewed_commits, commented at its key.
+# Two settings here are choices rather than restatements, and both carry their
+# reasoning at their own key: reviews.auto_review.enabled, which routes this
+# repository to CodeRabbit and holds the decision record for that move, and
+# auto_pause_after_reviewed_commits.
 
 reviews:
   auto_review:
@@ -31,15 +33,34 @@ reviews:
     # after it; and on NyanCogs #45, #46 and #47 (4-5 stars), where its first
     # comment arrived 12 to 13 seconds after the pull request opened.
     #
-    # An earlier version of this comment said that under ten stars CodeRabbit's
-    # OSS tier requires manual triggering and that automatic review stops when
-    # an Advanced trial ends on 2026-10-02. Neither half is supported. The
-    # measurements above contradict the first, and coderabbit.ai/oss states
+    # THOSE MEASUREMENTS CANNOT SETTLE THE STAR-COUNT QUESTION, and an earlier
+    # version of this comment claimed they did. Every one of them was taken
+    # while this account was inside a paid Advanced trial that does not expire
+    # until 2026-10-02 (see the plan block below). A paid plan reviews
+    # automatically regardless of star count, so it explains the observations
+    # completely. Nothing above distinguishes "the OSS tier is automatic
+    # anyway" from "the paid trial is what made it automatic".
+    #
+    # What the earlier version said: that under ten stars the OSS tier requires
+    # manual triggering, and that automatic review stops when the trial ends.
+    # The first half is UNDECIDED here, not refuted. coderabbit.ai/oss does say
     # "every public repository gets CodeRabbit Review free the moment you
-    # install it", with no star threshold and no trial end date anywhere on
-    # the page. That claim was carried forward from the previous comment
-    # block without being checked; CodeRabbit itself flagged it on this pull
-    # request.
+    # install it", with no star threshold on the page, which points against it
+    # -- but a vendor marketing page is weaker evidence than a measurement, and
+    # the measurement is confounded.
+    #
+    # SO THERE IS A TEST TO RUN, and it has a date. On the first pull request
+    # after 2026-10-02, check whether CodeRabbit reviews it WITHOUT a manual
+    # trigger. That is the observation this file still needs. Checking the
+    # billing page is a separate errand and does not answer it.
+    #
+    # If it turns out automatic review does stop, the failure is quiet rather
+    # than loud, which is why this is written down: 'enabled: true' and this
+    # comment would both say the repository is covered, while
+    # coderabbit-review-wait's rule is to keep waiting when no completion
+    # marker appears. The poller would spend its whole timeout on a review
+    # that was never going to happen, and report TIMEOUT rather than "not
+    # configured". Found by an internal review pass, not by the external one.
     #
     # RE-RUNNING A REVIEW, and the difference between the two commands.
     # Measured on this pull request 2026-09-25, twice, and flagged by
@@ -50,15 +71,30 @@ reviews:
     #
     #   '@coderabbitai full review' is what reruns it.
     #
-    # 'full review' is also what gets past the similarity dedup. All four
+    # NEITHER COMMAND RELIABLY CLEARS THE SIMILARITY DEDUP. All four
     # repositories in this migration returned, on the same round,
     # "Files skipped from review as they are similar to previous changes (1)"
     # naming .coderabbit.yaml -- the only file each pull request changed. A
-    # clean verdict over the one file it says it did not read is not a verdict,
-    # and 'review' does not clear it; 'full review' does.
+    # clean verdict over the one file the reviewer says it did not read is not
+    # a verdict on the branch.
     #
-    # So: 'review' after a new commit, 'full review' to rerun the same commit
-    # or when the last verdict covered nothing.
+    # 'full review' did not fix that. It ran -- CodeRabbit replied "Full review
+    # finished" -- and three of the four still listed the same file as skipped.
+    # An earlier version of this comment claimed 'full review' gets past the
+    # dedup. One round later that was contradicted, and it is recorded here
+    # rather than quietly dropped.
+    #
+    # Not established, and left open rather than guessed: whether the skip is
+    # the dedup or a consequence of the included-review limit, which the same
+    # thread reported reaching -- "Your included review limit is currently
+    # reached under our Fair Usage Limits Policy". Both were true at the same
+    # moment and nothing observable here separates them.
+    #
+    # So: 'review' after a new commit. 'full review' to rerun the same commit,
+    # but it does not guarantee the skip is lifted -- and a verdict that
+    # covered no files is not a pass whichever command produced it. Treat that
+    # as unreviewed and say so, rather than reaching for a command that has
+    # already been observed not to clear it.
     #
     # There IS a trial, and it has a date. Verified 2026-09-25 from the
     # CodeRabbit billing page (app.coderabbit.ai, Plans & products), which is
