@@ -912,6 +912,17 @@ fn parser_version(client: ClientId) -> u32 {
         // Cold-cache verification passes either way, which is exactly why
         // the acceptance for this change is a warm-cache measurement.
         ClientId::Claude => 4,
+        // 2: Droid's cumulative session tokenUsage is now anchored on the
+        // settings file's mtime (floored at providerLockTimestamp, via
+        // parse_lock_timestamp/resolve_usage_timestamp) instead of the lock
+        // timestamp alone, and — when the sibling transcript has assistant
+        // replies — apportioned across them by context/output weight
+        // (apportion) instead of emitted as one record per session. A
+        // finished session's settings.json is never rewritten again, so its
+        // fingerprint stays valid forever and only this bump discards a v1
+        // entry's single lock-anchored record. Vendor-local numbering: never
+        // copy upstream's parser_version 7 (see UPSTREAM.md).
+        ClientId::Droid => 2,
         // 2: OpenCode 2.x renamed the session metadata table `session` ->
         // `session_v2`, so the v2 `session_message` parse now falls back to
         // the renamed join table. An unchanged database fingerprint whose
@@ -5790,6 +5801,9 @@ mod tests {
         // this number exists -- without the bump `get` treats a stale entry
         // as a hit and the new parse never runs.
         assert_eq!(parser_version(ClientId::Claude), 4);
+        // 2 is the transcript-weighted per-reply attribution split (vendor-local
+        // numbering; never upstream's 7 — see UPSTREAM.md).
+        assert_eq!(parser_version(ClientId::Droid), 2);
         assert_eq!(CacheIdentity::synthetic().parser_version, 1);
         for client in ClientId::iter() {
             if !matches!(
@@ -5809,6 +5823,7 @@ mod tests {
                     | ClientId::KiloCode
                     | ClientId::Cline
                     | ClientId::Pi
+                    | ClientId::Droid
             ) {
                 assert_eq!(
                     parser_version(client),
