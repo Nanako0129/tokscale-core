@@ -41,8 +41,24 @@ reviews:
     # block without being checked; CodeRabbit itself flagged it on this pull
     # request.
     #
-    # A top-level '@coderabbitai review' comment still works and is still the
-    # way to re-run a review on demand. It is just not a requirement here.
+    # RE-RUNNING A REVIEW, and the difference between the two commands.
+    # Measured on this pull request 2026-09-25, twice, and flagged by
+    # CodeRabbit itself citing this PR's own history:
+    #
+    #   '@coderabbitai review' is incremental. On a commit it has already
+    #   reviewed it declines and reruns nothing.
+    #
+    #   '@coderabbitai full review' is what reruns it.
+    #
+    # 'full review' is also what gets past the similarity dedup. All four
+    # repositories in this migration returned, on the same round,
+    # "Files skipped from review as they are similar to previous changes (1)"
+    # naming .coderabbit.yaml -- the only file each pull request changed. A
+    # clean verdict over the one file it says it did not read is not a verdict,
+    # and 'review' does not clear it; 'full review' does.
+    #
+    # So: 'review' after a new commit, 'full review' to rerun the same commit
+    # or when the last verdict covered nothing.
     #
     # There IS a trial, and it has a date. Verified 2026-09-25 from the
     # CodeRabbit billing page (app.coderabbit.ai, Plans & products), which is
