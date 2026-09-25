@@ -343,8 +343,11 @@ fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
     }
 
     // Sequential on purpose (upstream #1164): every caller already runs this
-    // inside a parallel map over scan tasks (`run_scan_tasks`), and a nested
-    // `par_bridge` there deadlocked in futex waits on large directory trees.
+    // inside a parallel map over scan tasks (`run_scan_tasks`). A nested
+    // `par_bridge` serialises `WalkDir::next()` under its own mutex and can
+    // convoy-stall on large trees; upstream measured the sequential walk
+    // faster (~130 ms vs ~250 ms on 31.5k files). Upstream's maintainer notes
+    // it is a stall, not a deadlock, and does not explain the #1153 hang.
     let mut paths: Vec<PathBuf> = WalkDir::new(root_path)
         .into_iter()
         .filter_map(|e| e.ok())
