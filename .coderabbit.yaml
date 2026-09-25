@@ -23,17 +23,32 @@ reviews:
     # moment, and no setting in this file restores any of them. NyanCogs
     # moved across on 2026-09-21 for that reason; the rest follow now.
     #
-    # WHAT ACTUALLY TRIGGERS A REVIEW HERE, which this flag alone does not say.
+    # WHAT TRIGGERS A REVIEW HERE. Measured 2026-09-25, not inherited.
     #
-    # Under ten stars CodeRabbit's OSS tier requires manual triggering, so
-    # enabled: true produces automatic review only until the Advanced trial
-    # ends on 2026-10-02, and nothing after that. A top-level
-    # '@coderabbitai review' comment works in both periods, so post it on any
-    # pull request rather than checking the date.
+    # Automatic, on pull request open. Observed on tokscale-core#41 (3 stars),
+    # where CodeRabbit's summary landed at 14:14:27 and the first manual
+    # '@coderabbitai review' comment was posted at 14:17:44, three minutes
+    # after it; and on NyanCogs #45, #46 and #47 (4-5 stars), where its first
+    # comment arrived 12 to 13 seconds after the pull request opened.
     #
-    # The flag is left true anyway. false would additionally suppress the
-    # automatic review that does still work today, and would have to be
-    # turned back on the moment the star count crosses ten.
+    # An earlier version of this comment said that under ten stars CodeRabbit's
+    # OSS tier requires manual triggering and that automatic review stops when
+    # an Advanced trial ends on 2026-10-02. Neither half is supported. The
+    # measurements above contradict the first, and coderabbit.ai/oss states
+    # "every public repository gets CodeRabbit Review free the moment you
+    # install it", with no star threshold and no trial end date anywhere on
+    # the page. That claim was carried forward from the previous comment
+    # block without being checked; CodeRabbit itself flagged it on this pull
+    # request.
+    #
+    # A top-level '@coderabbitai review' comment still works and is still the
+    # way to re-run a review on demand. It is just not a requirement here.
+    #
+    # What remains genuinely unverified: whether this account is on a trial
+    # whose expiry would change the above. Nothing observable from the
+    # repository says so, and the date 2026-10-02 has no source that could be
+    # found. If such a trial exists, record where that is visible rather than
+    # restating the date.
     #
     # The Copilot ruleset is set to enforcement=disabled through the API
     # rather than deleted, so two reviewers do not both run and re-enabling
