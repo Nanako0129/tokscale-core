@@ -3,12 +3,13 @@
 //! The macOS desktop app stores aggregate token totals in `~/.copilot/data.db`
 //! and per-session event metadata in `~/.copilot/session-state/{session_id}`.
 
+use super::utils::lossy_lines;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
 use chrono::{DateTime, NaiveDateTime};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -221,7 +222,7 @@ fn read_events_metadata(events_path: &Path) -> SessionStateMetadata {
     };
 
     let mut metadata = SessionStateMetadata::default();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in lossy_lines(BufReader::new(file)) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
