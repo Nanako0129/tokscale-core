@@ -1,6 +1,10 @@
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
+/// Base model id that every Antigravity `gemini-3.8-flash-*` route label folds
+/// onto.
+const ANTIGRAVITY_FLASH_BASE: &str = "gemini-3.8-flash";
+
 static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
     m.insert("big-pickle", "glm-4.7");
@@ -35,6 +39,13 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("model_placeholder_m133", "gemini-3.5-flash-high");
     m.insert("model_placeholder_m187", "gemini-3.5-flash-extra-low");
     m.insert("model_placeholder_m20", "gemini-3.5-flash-medium");
+    // Antigravity CLI route labels: the CLI reports one model under several
+    // `responseModel` names, and `chatModel.#20`'s `model_enum` names the model
+    // underneath them. The enum is what a row without a responseModel name falls
+    // back to, so map the enums — one base id per underlying model — instead of
+    // mapping each route label separately.
+    m.insert("model_placeholder_m318", "gemini-3.8-flash");
+    m.insert("model_placeholder_m322", "gemini-3.8-flash");
     m.insert("gemini-pro-default", "gemini-3.1-pro");
     m.insert("gemini-pro-agent", "gemini-3.1-pro");
     m.insert("gemini-3-flash-agent", "gemini-3.5-flash-high");
@@ -76,9 +87,26 @@ pub fn resolve_alias(model_id: &str) -> Option<&'static str> {
     MODEL_ALIASES.get(model_id.to_lowercase().as_str()).copied()
 }
 
+/// Fold an Antigravity flash *route label* onto its base model id.
+///
+/// The Antigravity CLI reports one underlying model under several
+/// `responseModel` names: everything after `gemini-3.8-flash-` is a route label
+/// (`-control`, `-high`, `-tiered`, `-low`, …) — different service paths onto the
+/// same model, which the per-row `chatModel.#20.model_enum` confirms
+/// (`MODEL_PLACEHOLDER_M318` for the plain/`-control`/`-high` paths, `M322` for
+/// the tiered one) — never a different model. Left unfolded, one model shows up
+/// as several rows in the model report. `gemini-3.8-live` and
+/// `gemini-3.8-live-extended-thinking` are *different* models and do not carry
+/// this prefix, so they are untouched.
+pub fn fold_antigravity_route_label(model_id: &str) -> Option<&'static str> {
+    model_id
+        .starts_with("gemini-3.8-flash-")
+        .then_some(ANTIGRAVITY_FLASH_BASE)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_alias;
+    use super::{fold_antigravity_route_label, resolve_alias};
 
     #[test]
     fn resolves_antigravity_placeholders() {
@@ -92,6 +120,8 @@ mod tests {
             ("model_placeholder_m133", "gemini-3.5-flash-high"),
             ("model_placeholder_m187", "gemini-3.5-flash-extra-low"),
             ("model_placeholder_m20", "gemini-3.5-flash-medium"),
+            ("MODEL_PLACEHOLDER_M318", "gemini-3.8-flash"),
+            ("model_placeholder_m322", "gemini-3.8-flash"),
             ("gemini-pro-default", "gemini-3.1-pro"),
             ("gemini-pro-agent", "gemini-3.1-pro"),
             ("gemini-3-flash-agent", "gemini-3.5-flash-high"),
@@ -131,5 +161,32 @@ mod tests {
         assert_eq!(medium, "gemini-3.5-flash-medium");
         assert_ne!(low, medium);
         assert_eq!(cli_medium, medium);
+    }
+
+    #[test]
+    fn folds_flash_route_labels_and_leaves_other_families_alone() {
+        assert_eq!(fold_antigravity_route_label("gemini-3.8-flash"), None);
+        assert_eq!(
+            fold_antigravity_route_label("gemini-3.8-flash-control"),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(
+            fold_antigravity_route_label("gemini-3.8-flash-high"),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(
+            fold_antigravity_route_label("gemini-3.8-flash-tiered"),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(
+            fold_antigravity_route_label("gemini-3.8-flash-anything-else"),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(fold_antigravity_route_label("gemini-3.8-live"), None);
+        assert_eq!(
+            fold_antigravity_route_label("gemini-3.8-live-extended-thinking"),
+            None
+        );
+        assert_eq!(fold_antigravity_route_label("gemini-3-flash-a"), None);
     }
 }

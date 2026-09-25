@@ -105,8 +105,10 @@ fn parse_usage_row(value: &Value, fallback_model: Option<&str>) -> Option<Unifie
     ))
 }
 
-fn infer_provider(model: &str) -> &'static str {
-    provider_identity::inferred_provider_from_model(model).unwrap_or("antigravity")
+/// Antigravity (IDE) is likewise a subscription channel, so the fallback hint
+/// is the channel id — same reason as `antigravity_cli.rs`.
+fn infer_provider(_model: &str) -> &'static str {
+    "antigravity"
 }
 
 fn to_safe_i64(value: Option<&Value>) -> i64 {
@@ -154,7 +156,7 @@ mod tests {
         let messages = parse_antigravity_file(path.path());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "claude-opus-4-6");
-        assert_eq!(messages[0].provider_id, "anthropic");
+        assert_eq!(messages[0].provider_id, "antigravity");
     }
 
     #[test]
@@ -169,8 +171,8 @@ mod tests {
         let messages = parse_antigravity_file(path.path());
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].model_id, "gemini-3-flash-preview");
-        assert_eq!(messages[0].provider_id, "google");
+        assert_eq!(messages[0].provider_id, "antigravity");
         assert_eq!(messages[1].model_id, "gemini-3.1-pro");
-        assert_eq!(messages[1].provider_id, "google");
+        assert_eq!(messages[1].provider_id, "antigravity");
     }
 }
