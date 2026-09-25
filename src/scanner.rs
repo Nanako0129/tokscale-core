@@ -300,6 +300,45 @@ fn is_kiro_ide_session_artifact(root: &Path, path: &Path) -> bool {
     )
 }
 
+/// Whether an OpenClaw transcript name is a compaction checkpoint snapshot.
+///
+/// OpenClaw writes these as `<session>.checkpoint.<uuid>.jsonl`; its archive
+/// cleanup can then append a reset/deleted suffix and optionally compress the
+/// result. Keep the UUID checks aligned with OpenClaw's classifier so ordinary
+/// sessions that merely contain `checkpoint` in their names remain visible.
+fn is_openclaw_compaction_checkpoint(file_name: &str) -> bool {
+    fn is_uuid(value: &str) -> bool {
+        if value.len() != 36 {
+            return false;
+        }
+
+        value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => matches!(byte, b'1'..=b'5'),
+            19 => matches!(byte.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
+            _ => byte.is_ascii_hexdigit(),
+        })
+    }
+
+    let normalized = file_name.strip_suffix(".zst").unwrap_or(file_name);
+    let stem = normalized.strip_suffix(".jsonl").or_else(|| {
+        [".jsonl.deleted.", ".jsonl.reset."]
+            .into_iter()
+            .filter_map(|marker| normalized.rfind(marker))
+            .max()
+            .map(|index| &normalized[..index])
+    });
+    let Some(stem) = stem else {
+        return false;
+    };
+
+    let lowercase = stem.to_ascii_lowercase();
+    let Some((session_id, checkpoint_id)) = lowercase.rsplit_once(".checkpoint.") else {
+        return false;
+    };
+    !session_id.is_empty() && is_uuid(checkpoint_id)
+}
+
 /// Scan a single directory for session files
 pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
     scan_directory_path(Path::new(root), pattern)
@@ -339,11 +378,17 @@ fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
                 "*.json|*.jsonl" => file_name.ends_with(".json") || file_name.ends_with(".jsonl"),
                 "*.jsonl" => file_name.ends_with(".jsonl"),
                 // OpenClaw: also match archived transcripts
-                // (<uuid>.jsonl.deleted.<ts>, <uuid>.jsonl.reset.<ts>)
+                // (<uuid>.jsonl.deleted.<ts>, <uuid>.jsonl.reset.<ts>) and
+                // zstd archives (<uuid>.jsonl.zst, upstream #1285). Compaction
+                // checkpoint snapshots are OpenClaw's own bookkeeping, not
+                // usage, and are excluded first so an archived checkpoint
+                // cannot slip in as a copy (upstream #1293).
                 "*.jsonl*" => {
-                    file_name.ends_with(".jsonl")
-                        || file_name.contains(".jsonl.deleted.")
-                        || file_name.contains(".jsonl.reset.")
+                    !is_openclaw_compaction_checkpoint(file_name)
+                        && (file_name.ends_with(".jsonl")
+                            || file_name.ends_with(".jsonl.zst")
+                            || file_name.contains(".jsonl.deleted.")
+                            || file_name.contains(".jsonl.reset."))
                 }
                 "*.csv" => file_name.ends_with(".csv"),
                 "usage*.csv" => {
@@ -4075,6 +4120,79 @@ mod tests {
         assert_eq!(result.get(ClientId::OpenClaw).len(), 1);
         assert!(result.get(ClientId::OpenClaw)[0]
             .ends_with("session-archived.jsonl.deleted.1700000000000"));
+    }
+
+    // Ported from upstream #1293.
+    #[test]
+    fn scan_openclaw_excludes_only_canonical_compaction_checkpoints() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".openclaw/agents/main/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let checkpoint = "11111111-1111-4111-8111-111111111111";
+
+        let kept = [
+            "primary.jsonl",
+            "primary.checkpoint.not-a-uuid.jsonl",
+            "primary.checkpoint.11111111-1111-0111-8111-111111111111.jsonl",
+            "named-checkpoint-session.jsonl.deleted.legacy-timestamp",
+            "primary.checkpoint.not-a-uuid.jsonl.reset.legacy-timestamp.zst",
+        ];
+        for name in kept {
+            fs::write(sessions.join(name), b"{}").unwrap();
+        }
+        for name in [
+            format!("primary.checkpoint.{checkpoint}.jsonl"),
+            format!("primary.checkpoint.{checkpoint}.jsonl.zst"),
+            format!("primary.checkpoint.{checkpoint}.jsonl.deleted.legacy-timestamp"),
+            format!("primary.checkpoint.{checkpoint}.jsonl.reset.legacy-timestamp.zst"),
+        ] {
+            fs::write(sessions.join(name), b"{}").unwrap();
+        }
+
+        let scan = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["openclaw".to_string()],
+            false,
+        );
+        let names: HashSet<_> = scan
+            .get(ClientId::OpenClaw)
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        assert_eq!(names, kept.into_iter().collect());
+    }
+
+    // Ported from upstream #1285.
+    #[test]
+    fn scan_openclaw_compressed_transcripts_reaches_the_parser() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".openclaw/agents/main/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let content = br#"{"type":"message","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","usage":{"input":100,"output":50},"timestamp":1788566869012}}"#;
+        for name in [
+            "plain-archive.jsonl.zst",
+            "deleted.jsonl.deleted.timestamp.nonce.zst",
+            "reset.jsonl.reset.timestamp.nonce.zst",
+        ] {
+            fs::write(
+                sessions.join(name),
+                zstd::encode_all(&content[..], 0).unwrap(),
+            )
+            .unwrap();
+        }
+        fs::write(sessions.join("unrelated.zst"), b"not a session").unwrap();
+
+        let scan = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["openclaw".to_string()],
+            false,
+        );
+        assert_eq!(scan.get(ClientId::OpenClaw).len(), 3);
+        for path in scan.get(ClientId::OpenClaw) {
+            let messages = crate::sessions::openclaw::parse_openclaw_transcript(path);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].tokens.total(), 150);
+        }
     }
 
     #[test]
