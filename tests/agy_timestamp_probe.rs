@@ -23,6 +23,7 @@ fn token_accumulator_saturates_on_clamped_buckets() {
         cache_read: i64::MAX,
         cache_write: i64::MAX,
         reasoning: i64::MAX,
+        cache_write_1h: 0,
     };
     assert_eq!(clamped.total(), i64::MAX);
     let once = accumulate_tokens(0, &clamped);
