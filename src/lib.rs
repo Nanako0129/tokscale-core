@@ -249,6 +249,27 @@ pub struct TokenBreakdown {
     pub cache_read: i64,
     pub cache_write: i64,
     pub reasoning: i64,
+    /// The 1-hour-TTL portion of `cache_write`, which Anthropic bills at 2x
+    /// base input where a 5-minute write is 1.25x.
+    ///
+    /// This is a **subset** of `cache_write`, never a bucket beside it:
+    /// `cache_write` stays the whole write and the invariant
+    /// `cache_write_1h <= cache_write` holds, which is why `total()` and
+    /// every total sum ignore this field. Pricing derives the 5-minute
+    /// portion by subtraction (`cache_write - cache_write_1h`) and reprices
+    /// this one; a consumer that adds this to a total, or prices it without
+    /// subtracting, double-counts those tokens.
+    ///
+    /// Zero means "no 1h portion reported", which covers both a turn that
+    /// wrote none and a transcript predating the split. Both price the whole
+    /// write at the 5-minute rate, as every turn did before the split existed.
+    ///
+    /// `default` because this type is also read from JSON, where a payload
+    /// written before the split simply lacks the key and must still decode.
+    /// It does nothing for bincode, whose positional layout is what
+    /// `CACHE_FORMAT_VERSION` 4 and `mod format3` exist to handle.
+    #[serde(default)]
+    pub cache_write_1h: i64,
 }
 
 impl TokenBreakdown {
@@ -746,6 +767,37 @@ pub struct HourlyUsage {
 pub struct HourlyReport {
     pub entries: Vec<HourlyUsage>,
     pub total_cost: f64,
+    pub processing_time_ms: u32,
+}
+
+/// One raw message inside a `get_window_usage` window. No bucketing: the
+/// consumer folds it however it needs, which is why this carries every field
+/// a fold might want rather than the pre-aggregated shape `HourlyUsage` uses.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowMessage {
+    pub timestamp: i64,
+    pub client: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub cost: f64,
+    pub is_turn_start: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowUsage {
+    pub messages: Vec<WindowMessage>,
+    /// Messages with no usable timestamp (`timestamp <= 0`). These cannot be
+    /// placed inside `[from_ms, until_ms)` at all, so they are counted here
+    /// instead of silently dropped — matching `HourlyUsage`'s convention that
+    /// `timestamp > 0` gates the "has a real timestamp" case elsewhere in
+    /// this file. Scoped to the whole corpus, not to the window, since an
+    /// undated message's membership in the window is unknowable.
+    pub undated_count: u32,
     pub processing_time_ms: u32,
 }
 
@@ -3404,6 +3456,116 @@ async fn get_hourly_report_inner(
     Ok(HourlyReport {
         entries,
         total_cost,
+        processing_time_ms: start.elapsed().as_millis() as u32,
+    })
+}
+
+/// Raw per-message rows inside `[from_ms, until_ms)`. See `WindowUsage` for
+/// why this returns individual rows rather than a pre-aggregated bucket.
+///
+/// No `modified_after` pruning: unlike the live tail, the window here is
+/// caller-chosen and can reach arbitrarily far back, so every source file has
+/// to be considered.
+///
+/// Deliberately rejects `since`/`until`/`year`: those select a different
+/// span, and silently honouring both would return a window that is not the
+/// window the caller asked for. An empty or inverted `[from_ms, until_ms)` is
+/// not rejected — it contains no messages, which is an answer, not a caller
+/// error.
+pub async fn get_window_usage(
+    options: ReportOptions,
+    from_ms: i64,
+    until_ms: i64,
+) -> Result<WindowUsage, String> {
+    get_window_usage_inner(None, options, from_ms, until_ms).await
+}
+
+pub async fn get_window_usage_with_source_context(
+    context: &ResolvedLocalSourceContext,
+    options: ReportOptions,
+    from_ms: i64,
+    until_ms: i64,
+) -> Result<WindowUsage, String> {
+    get_window_usage_inner(Some(context), options, from_ms, until_ms).await
+}
+
+async fn get_window_usage_inner(
+    context: Option<&ResolvedLocalSourceContext>,
+    options: ReportOptions,
+    from_ms: i64,
+    until_ms: i64,
+) -> Result<WindowUsage, String> {
+    let start = Instant::now();
+    if options.since.is_some() || options.until.is_some() || options.year.is_some() {
+        return Err("since/until/year are local-date filters and cannot be combined with an absolute window".to_string());
+    }
+
+    let home_dir = context
+        .map(|context| context.home_dir().to_string_lossy().into_owned())
+        .map(Ok)
+        .unwrap_or_else(|| get_home_dir_string(&options.home_dir))?;
+    // Same two-level filter get_hourly_report_inner uses: a cc-mirror/* id
+    // rides the claude lane during the scan, then the exact requested id is
+    // matched per message at fold time. Correct here for the same reason it
+    // is correct there — get_window_usage is a per-message report, so the
+    // rows must match the exact-id grouping, not the scan's built-in
+    // sweep-in-cc-mirror-variants behavior.
+    let (clients, exact) = split_report_client_filter(&options);
+
+    let pricing = load_pricing_for_local_parse_with_context(context).await;
+    let msg_filter = |m: &UnifiedMessage| -> bool { report_message_client_passes(&exact, m) };
+
+    let mut messages: Vec<WindowMessage> = Vec::new();
+    let mut undated_count: u32 = 0;
+    let mut fold = |msg: &UnifiedMessage| {
+        if msg.timestamp <= 0 {
+            undated_count = undated_count.saturating_add(1);
+            return;
+        }
+        if msg.timestamp < from_ms || msg.timestamp >= until_ms {
+            return;
+        }
+        messages.push(WindowMessage {
+            timestamp: msg.timestamp,
+            client: msg.client.clone(),
+            provider_id: msg.provider_id.clone(),
+            model_id: canonical_model_id(&msg.model_id),
+            input: msg.tokens.input,
+            output: msg.tokens.output,
+            cache_read: msg.tokens.cache_read,
+            cache_write: msg.tokens.cache_write,
+            reasoning: msg.tokens.reasoning,
+            cost: msg.cost,
+            is_turn_start: msg.is_turn_start,
+        });
+    };
+    if let Some(context) = context {
+        scan_messages_streaming_with_context(
+            context,
+            &clients,
+            pricing.as_deref(),
+            None,
+            &msg_filter,
+            &mut fold,
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        scan_messages_streaming(
+            &home_dir,
+            &clients,
+            pricing.as_deref(),
+            options.use_env_roots,
+            &options.scanner_settings,
+            &msg_filter,
+            &mut fold,
+        );
+    }
+
+    messages.sort_by_key(|m| m.timestamp);
+
+    Ok(WindowUsage {
+        messages,
+        undated_count,
         processing_time_ms: start.elapsed().as_millis() as u32,
     })
 }
@@ -6448,6 +6610,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
             cache_read: msg.cache_read,
             cache_write: msg.cache_write,
             reasoning: msg.reasoning,
+            cache_write_1h: 0,
         },
         cost,
         cost_source: CostSource::Unknown,
@@ -6468,7 +6631,7 @@ mod tests {
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
         canonical_model_id, clear_model_aliases, coverage_for_messages,
         dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
-        get_model_report, get_model_report_with_source_context, get_monthly_report,
+        get_model_report, get_model_report_with_source_context, get_monthly_report, get_window_usage,
         latest_source_mtime_ms, load_pricing_for_local_parse_with_context,
         local_source_change_token, local_source_change_token_with_source_context, message_cache,
         model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
@@ -6490,6 +6653,27 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// A payload written before the 1h/5m split lacks the key entirely, and a
+    /// reader that rejects it would break every stored snapshot at once. This
+    /// is separate from the bincode path, which `CACHE_FORMAT_VERSION` 4 and
+    /// `mod format3` handle by decoding the old layout rather than defaulting.
+    #[test]
+    fn token_breakdown_decodes_json_written_before_the_1h_split() {
+        let before = r#"{"input":1,"output":2,"cache_read":3,"cache_write":4,"reasoning":5}"#;
+        let decoded: TokenBreakdown =
+            serde_json::from_str(before).expect("pre-split JSON must still decode");
+        assert_eq!(decoded.cache_write, 4, "existing lanes must survive");
+        assert_eq!(
+            decoded.cache_write_1h, 0,
+            "a payload that predates the split reports no 1h portion"
+        );
+        assert_eq!(
+            decoded.total(),
+            15,
+            "total is unchanged: cache_write is still the whole write"
+        );
+    }
 
     struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
@@ -7068,6 +7252,97 @@ mod tests {
             &scanner::ScannerSettings::default(),
             None,
         )
+    }
+
+    fn write_gjc_fixture(source_home: &Path, model_id: &str, timestamp_ms: i64) {
+        let gjc_dir = source_home.join(".gjc/agent/sessions");
+        std::fs::create_dir_all(&gjc_dir).unwrap();
+        std::fs::write(
+            gjc_dir.join("test.jsonl"),
+            format!(
+                concat!(
+                    "{{\"type\":\"session\",\"id\":\"gjc_ses_001\",\"cwd\":\"/work/pi\"}}\n",
+                    "{{\"type\":\"message\",\"id\":\"m1\",\"message\":{{\"role\":\"assistant\",",
+                    "\"model\":\"{model_id}\",\"provider\":\"anthropic\",\"timestamp\":{timestamp_ms},",
+                    "\"usage\":{{\"input\":100,\"output\":50,\"cost\":{{\"total\":0.3}}}}}}}}\n",
+                ),
+                model_id = model_id,
+                timestamp_ms = timestamp_ms,
+            ),
+        )
+        .unwrap();
+    }
+
+    // Introduced by this change: an inverted/empty `[from_ms, until_ms)`
+    // window is an answer (no messages), not a caller error. Verified by
+    // hand-mutation: reintroducing `if until_ms <= from_ms { return
+    // Err(...) }` at the top of `get_window_usage_inner` turns this from a
+    // pass into a failure on the `.is_ok()` assertion below.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_window_usage_returns_empty_not_error_for_inverted_range() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        write_gjc_fixture(source_home.path(), "claude-sonnet-4", 1767225601000);
+
+        let options = ReportOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["gjc".to_string()]),
+            ..Default::default()
+        };
+
+        // from > until: no message's timestamp can ever satisfy the filter.
+        let usage = get_window_usage(options, 1_700_000_060_000, 1_700_000_000_000)
+            .await
+            .expect("an inverted window must be Ok, not an error");
+        assert!(usage.messages.is_empty());
+    }
+
+    // Regression pinned by this change: `40b73f5` routed every row's model id
+    // through `canonical_model_id` so window rows carry the same identities
+    // the aggregate reports do; the intermediate branch lost that (it used
+    // `msg.model_id.clone()`). Verified by hand-mutation: swapping
+    // `canonical_model_id(&msg.model_id)` for `msg.model_id.clone()` in
+    // `get_window_usage_inner` turns this from a pass into a failure on the
+    // `assert_eq!` below (raw id carries the `-20250101` date suffix that
+    // canonicalization strips).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_window_usage_canonicalizes_model_id() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let raw_model_id = "claude-sonnet-4-20250101";
+        let timestamp_ms: i64 = 1767225601000;
+        write_gjc_fixture(source_home.path(), raw_model_id, timestamp_ms);
+
+        let options = ReportOptions {
+            home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["gjc".to_string()]),
+            ..Default::default()
+        };
+
+        let usage = get_window_usage(options, timestamp_ms - 1, timestamp_ms + 1)
+            .await
+            .expect("window scan must succeed");
+        assert_eq!(usage.messages.len(), 1);
+        assert_eq!(
+            usage.messages[0].model_id,
+            canonical_model_id(raw_model_id)
+        );
+        assert_ne!(
+            usage.messages[0].model_id, raw_model_id,
+            "the fixture's raw id must actually change under canonicalization, or this test proves nothing"
+        );
     }
 
     fn collect_streamed_claude_fixture(source_home: &Path) -> Vec<UnifiedMessage> {
@@ -9749,6 +10024,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             Some(key.to_string()),
@@ -10202,6 +10478,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
         );
@@ -10230,6 +10507,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             dedup_key.map(str::to_string),
@@ -10543,6 +10821,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let raw_cost = service.calculate_cost_with_provider("claude-opus-4-8-cc", None, &tokens);
         let group_label_cost =
@@ -10611,6 +10890,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.25,
         )]);
@@ -10710,6 +10990,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let msg_a = UnifiedMessage::new(
             "claude",
@@ -10849,6 +11130,7 @@ mod tests {
             cache_read: 25,
             cache_write: 0,
             reasoning: 25,
+            cache_write_1h: 0,
         };
         timed.duration_ms = Some(400);
 
@@ -10867,6 +11149,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
 
         let entries = aggregate_model_usage_entries(vec![timed, untimed], &GroupBy::ClientModel);
@@ -11055,6 +11338,7 @@ mod tests {
                 cache_read: 2,
                 cache_write: 0,
                 reasoning: 1,
+                cache_write_1h: 0,
             },
             1.25,
         );
@@ -12108,6 +12392,7 @@ mod tests {
                     cache_read: 2,
                     cache_write: 1,
                     reasoning: 3,
+                    cache_write_1h: 0,
                 },
                 0.5,
                 agent.map(|a| a.to_string()),
@@ -12157,6 +12442,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )
@@ -12240,6 +12526,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             );
@@ -12278,6 +12565,7 @@ mod tests {
                         cache_read: 0,
                         cache_write: 0,
                         reasoning: 0,
+                        cache_write_1h: 0,
                     },
                     0.0,
                 )
@@ -12694,6 +12982,7 @@ mod tests {
                 cache_read: 5,
                 cache_write: 2,
                 reasoning: 1,
+                cache_write_1h: 0,
             },
             0.0,
             Some("message-v1".to_string()),
@@ -15024,6 +15313,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.42,
             Some("planner".to_string()),
@@ -15059,6 +15349,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15128,6 +15419,7 @@ mod tests {
                 cache_read: 3,
                 cache_write: 7,
                 reasoning: 2,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15194,6 +15486,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.42,
         );
@@ -15364,6 +15657,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15400,6 +15694,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15438,6 +15733,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15472,6 +15768,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 7,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15507,6 +15804,7 @@ mod tests {
                 cache_read: 7,
                 cache_write: 0,
                 reasoning: 3,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15541,6 +15839,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15583,6 +15882,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15625,6 +15925,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15669,6 +15970,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.123,
         );
@@ -15716,6 +16018,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 3,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15758,6 +16061,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15783,6 +16087,7 @@ mod tests {
                 cache_read: 50_000,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15818,6 +16123,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15852,6 +16158,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -15890,6 +16197,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
         );
@@ -17139,6 +17447,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 embedded_cost,
             )
@@ -18766,6 +19075,7 @@ mod tests {
                 cache_read: 60,
                 cache_write: 0,
                 reasoning: 5,
+                cache_write_1h: 0,
             }
         );
         assert!(selected.iter().any(|message| {
@@ -19566,6 +19876,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost,
             cost_source: crate::CostSource::Unknown,
@@ -20080,6 +20391,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )
@@ -20110,6 +20422,7 @@ mod tests {
                     cache_read: i64::MAX,
                     cache_write: 0,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 0.0,
             )
@@ -21522,96 +21835,4 @@ mod tests {
             }
         });
     }
-}
-
-// ============================================================================
-// PROTOTYPE — window usage. Throwaway; not for commit.
-// Returns the window's messages, one row each. No bucketing: a quota window is
-// a tiny slice of history (~1.5k messages for 5h against 180k total), so the
-// consumer can fold it however the UI wants without another round trip.
-// ============================================================================
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct WindowMessage {
-    pub timestamp: i64,
-    pub client: String,
-    pub provider_id: String,
-    pub model_id: String,
-    pub input: i64,
-    pub output: i64,
-    pub cache_read: i64,
-    pub cache_write: i64,
-    pub reasoning: i64,
-    pub cost: f64,
-    pub is_turn_start: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct WindowUsage {
-    pub messages: Vec<WindowMessage>,
-    /// Messages with no usable timestamp, so no window membership can be
-    /// decided. Counted, never silently dropped.
-    pub undated_count: u32,
-    pub processing_time_ms: u32,
-}
-
-pub async fn get_window_usage(
-    options: ReportOptions,
-    from_ms: i64,
-    until_ms: i64,
-) -> Result<WindowUsage, String> {
-    let start = Instant::now();
-    if until_ms <= from_ms {
-        return Err("until_ms must be greater than from_ms".to_string());
-    }
-    if options.since.is_some() || options.until.is_some() || options.year.is_some() {
-        return Err("since/until/year are local-date filters and cannot be combined with an absolute window".to_string());
-    }
-
-    let home_dir = get_home_dir_string(&options.home_dir)?;
-    let clients = resolve_report_clients(&options);
-    let pricing = load_pricing_for_local_parse().await;
-    let msg_filter = |_m: &UnifiedMessage| -> bool { true };
-
-    let mut messages: Vec<WindowMessage> = Vec::new();
-    let mut undated_count: u32 = 0;
-
-    scan_messages_streaming(
-        &home_dir,
-        &clients,
-        pricing.as_deref(),
-        options.use_env_roots,
-        &options.scanner_settings,
-        &msg_filter,
-        &mut |msg: &UnifiedMessage| {
-            if msg.timestamp <= 0 {
-                undated_count = undated_count.saturating_add(1);
-                return;
-            }
-            if msg.timestamp < from_ms || msg.timestamp >= until_ms {
-                return;
-            }
-            messages.push(WindowMessage {
-                timestamp: msg.timestamp,
-                client: msg.client.clone(),
-                provider_id: msg.provider_id.clone(),
-                model_id: canonical_model_id(&msg.model_id),
-                input: msg.tokens.input,
-                output: msg.tokens.output,
-                cache_read: msg.tokens.cache_read,
-                cache_write: msg.tokens.cache_write,
-                reasoning: msg.tokens.reasoning,
-                cost: msg.cost,
-                is_turn_start: msg.is_turn_start,
-            });
-        },
-    );
-
-    messages.sort_by_key(|m| m.timestamp);
-
-    Ok(WindowUsage {
-        messages,
-        undated_count,
-        processing_time_ms: start.elapsed().as_millis() as u32,
-    })
 }

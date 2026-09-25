@@ -179,6 +179,7 @@ pub fn parse_octofriend_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                         cache_read: cache_read.max(0),
                         cache_write: cache_write.max(0),
                         reasoning: reasoning.max(0),
+                        cache_write_1h: 0,
                     },
                     cost.max(0.0),
                 );
@@ -224,6 +225,7 @@ pub fn parse_octofriend_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                             cache_read: 0,
                             cache_write: 0,
                             reasoning: 0,
+                            cache_write_1h: 0,
                         },
                         0.0,
                     );

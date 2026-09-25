@@ -155,6 +155,7 @@ pub fn parse_qwen_file(path: &Path) -> Vec<UnifiedMessage> {
                 cache_read,
                 cache_write,
                 reasoning,
+                cache_write_1h: 0,
             },
             0.0, // Cost calculated later by pricing resolver
             dedup_key,

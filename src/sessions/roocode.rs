@@ -75,6 +75,7 @@ pub(crate) fn parse_roo_kilo_file(path: &Path, source: &str) -> Vec<UnifiedMessa
                 cache_read: payload.cache_reads,
                 cache_write: payload.cache_writes,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             payload.cost,
             agent.clone(),

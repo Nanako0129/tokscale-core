@@ -232,6 +232,7 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
                 cache_read: usage.cache_read.unwrap_or(0).max(0),
                 cache_write: usage.cache_write.unwrap_or(0).max(0),
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             0.0,
             agent.clone(),

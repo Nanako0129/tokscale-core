@@ -78,6 +78,7 @@ fn tokens_from_usage(usage: &JcodeTokenUsage) -> TokenBreakdown {
         cache_read: usage.cache_read_input_tokens.unwrap_or(0).max(0),
         cache_write: usage.cache_creation_input_tokens.unwrap_or(0).max(0),
         reasoning: usage.reasoning_output_tokens.unwrap_or(0).max(0),
+        cache_write_1h: 0,
     }
 }
 

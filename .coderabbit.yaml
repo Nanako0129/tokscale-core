@@ -1,0 +1,128 @@
+# CodeRabbit configuration.
+# Schema: https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# Every instruction below restates a rule this repository already writes down in
+# AGENTS.md or CONTRIBUTING.md. Nothing here is a new policy.
+#
+# The one setting that is a choice rather than a restatement is
+# auto_pause_after_reviewed_commits, commented at its key.
+
+reviews:
+  auto_review:
+    # This repository is reviewed by GitHub Copilot, not CodeRabbit.
+    #
+    # CodeRabbit's OSS tier requires a public repository with fewer than 10
+    # stars to have its reviews triggered by hand, and this one has 3. So
+    # automatic review here stops on 2026-10-02 when the Advanced trial ends,
+    # whatever this file says. Turning it off now states the arrangement
+    # rather than letting it lapse into it, and avoids two reviewers on the
+    # same pull request for the remaining trial days.
+    #
+    # An on-demand '@coderabbitai review' comment still works.
+    #
+    # HOW TO GO BACK, once this repository reaches 10 stars.
+    #
+    # Nothing here reverts on its own -- the star count is CodeRabbit's
+    # constraint, not a trigger, and crossing it changes what is permitted,
+    # not what is configured. A configuration that cannot state its own exit
+    # condition becomes permanent by default, so the exit is written down:
+    #
+    #   1. Confirm the threshold has actually been crossed:
+    #      gh api repos/OWNER/NAME -q .stargazers_count
+    #   2. Set enabled: true here, in a pull request like any other change.
+    #   3. Disable the Copilot ruleset so two reviewers do not both run:
+    #      gh api repos/OWNER/NAME/rulesets            # find copilot-auto-review
+    #      gh api repos/OWNER/NAME/rulesets/ID -X PUT -f enforcement=disabled
+    #      Disable rather than delete: re-enabling is one field, rebuilding
+    #      is not, and this repository has crossed back before.
+    #   4. Confirm on the next pull request that CodeRabbit reviews it and
+    #      Copilot does not.
+    #
+    # Everything below stays as it is through that switch. The path
+    # instructions and code_guidelines already apply to a manually triggered
+    # review today, and apply unchanged to an automatic one afterwards.
+    enabled: false
+    # Inert while enabled is false; kept so re-enabling does not silently
+    # fall back to the default of 5. 0 disables the pause entirely, which is the schema's documented sentinel
+    # ("Set to 0 to disable"), not a large number chosen by hand. At the default
+    # of 5, automatic review stops silently once a pull request has five
+    # reviewed commits, and a poller waiting on the verdict reads that pause as
+    # a timeout rather than as a stop. Measured: sepia#250 ran four rounds.
+    auto_pause_after_reviewed_commits: 0
+
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        Ownership boundary (AGENTS.md): this repository owns parser, scanner,
+        cache, pricing and aggregation only. App FFI and consumer integration
+        belong to the consuming repository. Flag a change that pulls FFI or
+        consumer wiring in here, and flag semantic changes mixed into ownership
+        or extraction work.
+
+        Toolchain: Rust 1.96.1 is pinned by rust-toolchain.toml and Cargo.lock
+        is committed. A change must pass the locked build, test and
+        clippy -- -D warnings on both macOS and Windows.
+
+    - path: "src/**/cache*.rs"
+      instructions: |
+        Cache invalidation (CONTRIBUTING.md, "Cache invalidation"). A change to
+        parser output that does not invalidate the cache reaches nobody:
+        existing users keep the old numbers until each source file happens to
+        change on its own. A test that parses a fresh source proves nothing
+        about this.
+
+        Ask whose payload can no longer be decoded, not "which counter":
+        - one client's parse semantics or its own serialized state
+          -> parser_version(client)
+        - the synthetic namespace's parse output
+          -> the parser_version inside CacheIdentity::synthetic()
+        - the envelope itself, or a type shared by every namespace
+          (CachedSourceEntry, UnifiedMessage, TokenBreakdown)
+          -> CACHE_FORMAT_VERSION
+
+        Reach for parser_version first and justify a global bump, never the
+        other way round. CACHE_FORMAT_VERSION has the wider blast radius and
+        for one namespace it is not recoverable.
+
+        Claude is not merely cold. For the namespace covered by
+        retained_history_key_filter, the cache holds turns the live file no
+        longer contains, and re-parsing will not reproduce them. A
+        CACHE_FORMAT_VERSION bump still deletes them, because its gate runs
+        before the namespace is looked at. If a change forces one, say so
+        plainly in the PR rather than letting it be discovered afterwards.
+
+    - path: "tests/**"
+      instructions: |
+        Verification (CONTRIBUTING.md, "Tests"). Build JSON with
+        serde_json::json!, never by interpolating a path into a hand-written
+        JSON string. On Windows the backslashes in an absolute path become invalid
+        JSON escapes, the fixture fails to parse, and the test goes silently
+        inert. Only the Windows runner sees it.
+
+        A parser-output change that invalidates wants a same-fingerprint
+        stale-cache regression, proving an entry already in the cache picks up
+        the new behaviour. Cold-parse tests cannot show that, and the stale case
+        is the one real users are in.
+
+        Prefer an assertion on observed behaviour over a scan of source text. A
+        property that can be moved to another line or another function will be
+        moved around a text scan, and the scan will keep passing.
+
+    - path: "UPSTREAM.md"
+      instructions: |
+        This repository carries selective patches over upstream rather than a
+        wholesale fork, and UPSTREAM.md records every local divergence. A change
+        that diverges from upstream must add a row describing what changed,
+        which files carry it, its upstream status, and the re-apply instruction
+        naming the file whose re-vendor would otherwise drop it.
+
+        A patch missing from the ledger is a patch a future re-vendor deletes
+        silently, with a clean build and passing tests.
+
+knowledge_base:
+  code_guidelines:
+    filePatterns:
+      - "AGENTS.md"
+      - "CONTRIBUTING.md"
+      - "UPSTREAM.md"
+      - "README.md"

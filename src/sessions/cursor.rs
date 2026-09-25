@@ -187,6 +187,7 @@ pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
                 cache_read: cache_read.max(0),
                 cache_write, // Already clamped above with .max(0)
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             cost.max(0.0),
         );

@@ -214,6 +214,7 @@ fn tokens_from_usage(usage: &Value) -> TokenBreakdown {
             usage,
             &["reasoningTokens", "reasoningOutputTokens", "thinkingTokens"],
         ),
+        cache_write_1h: 0,
     }
 }
 

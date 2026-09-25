@@ -205,6 +205,7 @@ pub fn parse_gjc_file(path: &Path) -> Vec<UnifiedMessage> {
             cache_read: usage.cache_read.unwrap_or(0).max(0),
             cache_write: usage.cache_write.unwrap_or(0).max(0),
             reasoning: 0,
+            cache_write_1h: 0,
         };
 
         let (cost, cost_source) = embedded_cost(&usage);
@@ -467,6 +468,7 @@ not valid json at all
             cache_read: 2,
             cache_write: 1,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let line = r#"{"type":"message","message":{"role":"assistant","model":"gpt-4o","provider":"openai","timestamp":1767225601000,"usage":{"input":10,"output":5}}}"#;
         let changed_line = r#"{"type":"message","message":{"role":"assistant","model":"gpt-4o","provider":"openai","timestamp":1767225601000,"usage":{"input":10,"output":5},"metadata":"distinct"}}"#;

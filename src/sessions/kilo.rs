@@ -144,6 +144,7 @@ pub fn parse_kilo_sqlite_with_fallback(
                 cache_read: tokens.cache.read.max(0),
                 cache_write: tokens.cache.write.max(0),
                 reasoning: tokens.reasoning.unwrap_or(0).max(0),
+                cache_write_1h: 0,
             },
             provider_cost.unwrap_or(0.0),
             agent,

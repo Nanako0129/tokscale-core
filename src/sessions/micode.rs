@@ -298,6 +298,7 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                 cache_read,
                 cache_write,
                 reasoning,
+                cache_write_1h: 0,
             },
             cost,
             agent,
