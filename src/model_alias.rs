@@ -27,6 +27,12 @@
 //! [`snapshot_grouping_aliases`] at the start and reuse it for every message so
 //! a concurrent reload cannot split one report across two alias maps.
 //! Message-cache schema stays 31 because aliases are report-time only.
+//!
+//! One built-in rule runs before the configured map, so grouping is not a pure
+//! identity when no aliases are installed: [`builtin_grouping`] folds Grok
+//! Build's `grok-<version>-build` usage key into the `grok-<version>` label the
+//! same sessions carry in their metadata (Syrtis #118). Same presentation-only
+//! seam, same guarantees: raw ids still reach pricing, the cache and graph keys.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -122,10 +128,33 @@ impl ModelAliasResolver {
     /// alias chains collapse one step and cycles are structurally impossible.
     /// Returns `name` unchanged on a miss.
     fn apply(&self, name: String) -> String {
+        let name = builtin_grouping(name);
         match self.map.get(&match_key(&name)) {
             Some(canonical) => canonical.clone(),
             None => name,
         }
+    }
+}
+
+/// Built-in grouping rule, applied before any configured alias.
+///
+/// Grok Build reports turn usage under `grok-<version>-build` (the
+/// `modelUsage` key) while the same session's metadata names `grok-<version>`,
+/// so one model's history splits across two rows. Folds exactly
+/// `grok-` + version + `-build`, where the version is ASCII digits and dots
+/// starting with a digit; everything else, including `grok-unknown` and other
+/// `-build` names, is returned unchanged. Idempotent and single-hop.
+fn builtin_grouping(name: String) -> String {
+    let version = name
+        .strip_prefix("grok-")
+        .and_then(|rest| rest.strip_suffix("-build"))
+        .filter(|v| {
+            v.starts_with(|c: char| c.is_ascii_digit())
+                && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+        });
+    match version {
+        Some(version) => format!("grok-{version}"),
+        None => name,
     }
 }
 
@@ -304,6 +333,42 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
         }
+    }
+
+    /// The case table Syrtis's Swift helper and FFI test read too
+    /// (`Tests/fixtures/model-grouping-cases.json` in Syrtis); keep them equal.
+    const BUILTIN_CASES: &[(&str, &str)] = &[
+        ("grok-4.6-build", "grok-4.6"),
+        ("grok-4.7-build", "grok-4.7"),
+        ("grok-4.5-build", "grok-4.5"),
+        ("grok-5-build", "grok-5"),
+        ("grok-4.6", "grok-4.6"),
+        ("grok-4.5-build-preview", "grok-4.5-build-preview"),
+        ("grok-4.5-mini-build", "grok-4.5-mini-build"),
+        ("my-grok-4.5-build", "my-grok-4.5-build"),
+        ("grok--build", "grok--build"),
+        ("grok-build", "grok-build"),
+        ("grok-.5-build", "grok-.5-build"),
+        ("grok-code-fast-1", "grok-code-fast-1"),
+        ("grok-unknown", "grok-unknown"),
+        ("gpt-5.4", "gpt-5.4"),
+        ("claude-fable-5-1", "claude-fable-5-1"),
+    ];
+
+    #[test]
+    fn builtin_grok_build_rule_matches_the_case_table() {
+        let empty = resolver(&[]);
+        for (input, expected) in BUILTIN_CASES {
+            let once = empty.apply(crate::normalize_syntactic(input));
+            assert_eq!(&once, expected, "input {input}");
+            assert_eq!(empty.apply(once.clone()), once, "idempotent for {input}");
+        }
+    }
+
+    #[test]
+    fn builtin_rule_runs_before_configured_aliases() {
+        let r = resolver(&[("grok-4.6", "grok-4.6-family")]);
+        assert_eq!(r.apply("grok-4.6-build".to_string()), "grok-4.6-family");
     }
 
     #[test]
