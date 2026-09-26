@@ -124,10 +124,17 @@ impl ModelAliasResolver {
 
     /// Resolve one model name. `name` must already be `normalize_syntactic`'d (it
     /// is, since the only caller is [`crate::normalize_model_for_grouping`]).
-    /// Resolution is single-hop — the canonical value is never re-resolved — so
-    /// alias chains collapse one step and cycles are structurally impossible.
-    /// Returns `name` unchanged on a miss.
+    /// A configured alias keyed on the raw name wins first, so an alias a user
+    /// wrote for `grok-4.6-build` before the built-in rule existed keeps
+    /// working. Otherwise [`builtin_grouping`] runs and the configured map is
+    /// consulted once more for the folded name. Configured canonical values are
+    /// never re-resolved, so alias chains collapse at most one configured step
+    /// and cycles are structurally impossible. A name no rule touches comes
+    /// back unchanged.
     fn apply(&self, name: String) -> String {
+        if let Some(canonical) = self.map.get(&match_key(&name)) {
+            return canonical.clone();
+        }
         let name = builtin_grouping(name);
         match self.map.get(&match_key(&name)) {
             Some(canonical) => canonical.clone(),
@@ -141,16 +148,17 @@ impl ModelAliasResolver {
 /// Grok Build reports turn usage under `grok-<version>-build` (the
 /// `modelUsage` key) while the same session's metadata names `grok-<version>`,
 /// so one model's history splits across two rows. Folds exactly
-/// `grok-` + version + `-build`, where the version is ASCII digits and dots
-/// starting with a digit; everything else, including `grok-unknown` and other
-/// `-build` names, is returned unchanged. Idempotent and single-hop.
+/// `grok-` + version + `-build`, where the version is one or more
+/// dot-separated runs of ASCII digits (`4`, `4.6`, `4.6.1`; not `4.`, `.5` or
+/// `4..6`); everything else, including `grok-unknown` and other `-build`
+/// names, is returned unchanged. Idempotent.
 fn builtin_grouping(name: String) -> String {
     let version = name
         .strip_prefix("grok-")
         .and_then(|rest| rest.strip_suffix("-build"))
         .filter(|v| {
-            v.starts_with(|c: char| c.is_ascii_digit())
-                && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+            v.split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
         });
     match version {
         Some(version) => format!("grok-{version}"),
@@ -214,14 +222,14 @@ fn notify_usage_data_invalidation() {
 /// Always reloads — later calls replace earlier ones. Bumps
 /// [`model_alias_generation`] and fires every registered usage-data invalidation
 /// hook so the next report sees the new grouping. Until the first non-empty
-/// install (and after [`clear_model_aliases`]), grouping is a strict identity
-/// no-op relative to [`crate::canonical_model_id`].
+/// install (and after [`clear_model_aliases`]), grouping equals
+/// [`crate::canonical_model_id`] plus the built-in [`builtin_grouping`] rule.
 pub fn set_model_aliases(config: &ModelAliasMap) {
     install(config.clone());
 }
 
-/// Clear all process-wide grouping aliases (identity no-op) and invalidate
-/// usage-data consumers.
+/// Clear all process-wide grouping aliases (leaving only the built-in
+/// [`builtin_grouping`] rule) and invalidate usage-data consumers.
 pub fn clear_model_aliases() {
     install(ModelAliasMap::default());
 }
@@ -282,7 +290,7 @@ pub struct GroupingAliasSnapshot {
 
 impl GroupingAliasSnapshot {
     /// Single-hop alias fold for an already-[`crate::normalize_syntactic`]'d
-    /// model name. Misses are identity. Canonical values are returned verbatim
+    /// model name, with [`ModelAliasResolver::apply`]'s precedence. Canonical values are returned verbatim
     /// (never re-resolved), matching [`apply_global`].
     pub fn fold(&self, syntactic_name: String) -> String {
         self.resolver.apply(syntactic_name)
@@ -293,7 +301,7 @@ impl GroupingAliasSnapshot {
 ///
 /// Cheap relative to scanning messages: one `RwLock` read and a HashMap clone
 /// (capped at [`MAX_MODEL_ALIASES`] entries). Empty/unset aliases yield an
-/// identity snapshot.
+/// snapshot that applies only the built-in [`builtin_grouping`] rule.
 pub fn snapshot_grouping_aliases() -> GroupingAliasSnapshot {
     let resolver = state()
         .read()
@@ -335,8 +343,10 @@ mod tests {
         }
     }
 
-    /// The case table Syrtis's Swift helper and FFI test read too
-    /// (`Tests/fixtures/model-grouping-cases.json` in Syrtis); keep them equal.
+    /// Engine-local cases for the built-in rule. Syrtis keeps its own table
+    /// (`Tests/fixtures/model-grouping-cases.json`) and checks it against this
+    /// engine's `normalize_model_for_grouping` in its FFI test, so a change here
+    /// that its table does not follow fails there at the next pin advance.
     const BUILTIN_CASES: &[(&str, &str)] = &[
         ("grok-4.6-build", "grok-4.6"),
         ("grok-4.7-build", "grok-4.7"),
@@ -349,6 +359,8 @@ mod tests {
         ("grok--build", "grok--build"),
         ("grok-build", "grok-build"),
         ("grok-.5-build", "grok-.5-build"),
+        ("grok-4.-build", "grok-4.-build"),
+        ("grok-4..6-build", "grok-4..6-build"),
         ("grok-code-fast-1", "grok-code-fast-1"),
         ("grok-unknown", "grok-unknown"),
         ("gpt-5.4", "gpt-5.4"),
@@ -366,9 +378,17 @@ mod tests {
     }
 
     #[test]
-    fn builtin_rule_runs_before_configured_aliases() {
-        let r = resolver(&[("grok-4.6", "grok-4.6-family")]);
-        assert_eq!(r.apply("grok-4.6-build".to_string()), "grok-4.6-family");
+    fn configured_aliases_see_both_the_raw_and_the_folded_name() {
+        // An alias on the folded label still catches the -build id...
+        let folded = resolver(&[("grok-4.6", "grok-4.6-family")]);
+        assert_eq!(
+            folded.apply("grok-4.6-build".to_string()),
+            "grok-4.6-family"
+        );
+        // ...and one keyed on the raw -build id keeps winning over the rule.
+        let raw = resolver(&[("grok-4.6-build", "grok-build-only")]);
+        assert_eq!(raw.apply("grok-4.6-build".to_string()), "grok-build-only");
+        assert_eq!(raw.apply("grok-4.6".to_string()), "grok-4.6");
     }
 
     #[test]

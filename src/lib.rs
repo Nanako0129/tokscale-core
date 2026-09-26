@@ -98,7 +98,9 @@ pub fn canonical_model_id(model_id: &str) -> String {
 /// The alias fold is **presentation only** and must never reach the
 /// submit/upload/export/persist path (those use [`canonical_model_id`]), pricing
 /// (which resolves the raw message `model_id`), or the message-cache key space.
-/// An empty/unset alias config makes this identical to [`canonical_model_id`].
+/// With no aliases installed this is [`canonical_model_id`] plus the one
+/// built-in rule in [`model_alias`] (Grok Build `grok-<version>-build` →
+/// `grok-<version>`).
 pub fn normalize_model_for_grouping(model_id: &str) -> String {
     model_alias::apply_global(normalize_syntactic(model_id))
 }
