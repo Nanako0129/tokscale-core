@@ -4,46 +4,140 @@
 # Every instruction below restates a rule this repository already writes down in
 # AGENTS.md or CONTRIBUTING.md. Nothing here is a new policy.
 #
-# The one setting that is a choice rather than a restatement is
-# auto_pause_after_reviewed_commits, commented at its key.
+# Two settings here are choices rather than restatements, and both carry their
+# reasoning at their own key: reviews.auto_review.enabled, which routes this
+# repository to CodeRabbit and holds the decision record for that move, and
+# auto_pause_after_reviewed_commits.
 
 reviews:
   auto_review:
-    # This repository is reviewed by GitHub Copilot, not CodeRabbit.
+    # This repository is reviewed by CodeRabbit, not GitHub Copilot.
     #
-    # CodeRabbit's OSS tier requires a public repository with fewer than 10
-    # stars to have its reviews triggered by hand, and this one has 3. So
-    # automatic review here stops on 2026-10-02 when the Advanced trial ends,
-    # whatever this file says. Turning it off now states the arrangement
-    # rather than letting it lapse into it, and avoids two reviewers on the
-    # same pull request for the remaining trial days.
+    # Switched on 2026-09-25 because Copilot stopped reviewing, not because
+    # anything about this repository changed. It is still at 3 stars. On
+    # NyanCogs#44 Copilot answered with:
     #
-    # An on-demand '@coderabbitai review' comment still works.
+    #   Copilot was unable to review this pull request because the user who
+    #   requested the review has reached their quota limit.
     #
-    # HOW TO GO BACK, once this repository reaches 10 stars.
+    # That quota is per requesting user, not per repository, so it took out
+    # every repository on the Copilot side of the routing table at the same
+    # moment, and no setting in this file restores any of them. NyanCogs
+    # moved across on 2026-09-21 for that reason; the rest follow now.
     #
-    # Nothing here reverts on its own -- the star count is CodeRabbit's
-    # constraint, not a trigger, and crossing it changes what is permitted,
-    # not what is configured. A configuration that cannot state its own exit
-    # condition becomes permanent by default, so the exit is written down:
+    # WHAT TRIGGERS A REVIEW HERE. Measured 2026-09-25, not inherited.
     #
-    #   1. Confirm the threshold has actually been crossed:
-    #      gh api repos/OWNER/NAME -q .stargazers_count
-    #   2. Set enabled: true here, in a pull request like any other change.
-    #   3. Disable the Copilot ruleset so two reviewers do not both run:
-    #      gh api repos/OWNER/NAME/rulesets            # find copilot-auto-review
-    #      gh api repos/OWNER/NAME/rulesets/ID -X PUT -f enforcement=disabled
-    #      Disable rather than delete: re-enabling is one field, rebuilding
-    #      is not, and this repository has crossed back before.
-    #   4. Confirm on the next pull request that CodeRabbit reviews it and
-    #      Copilot does not.
+    # Automatic, on pull request open. Observed on tokscale-core#41 (3 stars),
+    # where CodeRabbit's summary landed at 14:14:27 and the first manual
+    # '@coderabbitai review' comment was posted at 14:17:44, three minutes
+    # after it; and on NyanCogs #45, #46 and #47 (4-5 stars), where its first
+    # comment arrived 12 to 13 seconds after the pull request opened.
     #
-    # Everything below stays as it is through that switch. The path
-    # instructions and code_guidelines already apply to a manually triggered
-    # review today, and apply unchanged to an automatic one afterwards.
-    enabled: false
-    # Inert while enabled is false; kept so re-enabling does not silently
-    # fall back to the default of 5. 0 disables the pause entirely, which is the schema's documented sentinel
+    # THOSE MEASUREMENTS CANNOT SETTLE THE STAR-COUNT QUESTION, and an earlier
+    # version of this comment claimed they did. Every one of them was taken
+    # while this account was inside a paid Advanced trial that does not expire
+    # until 2026-10-02 (see the plan block below). A paid plan reviews
+    # automatically regardless of star count, so it explains the observations
+    # completely. Nothing above distinguishes "the OSS tier is automatic
+    # anyway" from "the paid trial is what made it automatic".
+    #
+    # What the earlier version said: that under ten stars the OSS tier requires
+    # manual triggering, and that automatic review stops when the trial ends.
+    # The first half is UNDECIDED here, not refuted. coderabbit.ai/oss does say
+    # "every public repository gets CodeRabbit Review free the moment you
+    # install it", with no star threshold on the page, which points against it
+    # -- but a vendor marketing page is weaker evidence than a measurement, and
+    # the measurement is confounded.
+    #
+    # SO THERE IS A TEST TO RUN, and it has a date. On the first pull request
+    # after 2026-10-02, check whether CodeRabbit reviews it WITHOUT a manual
+    # trigger. That is the observation this file still needs. Checking the
+    # billing page is a separate errand and does not answer it.
+    #
+    # If it turns out automatic review does stop, the failure is quiet rather
+    # than loud, which is why this is written down: 'enabled: true' and this
+    # comment would both say the repository is covered, while
+    # coderabbit-review-wait's rule is to keep waiting when no completion
+    # marker appears. The poller would spend its whole timeout on a review
+    # that was never going to happen, and report TIMEOUT rather than "not
+    # configured". Found by an internal review pass, not by the external one.
+    #
+    # RE-RUNNING A REVIEW, and the difference between the two commands.
+    # Measured on this pull request 2026-09-25, twice, and flagged by
+    # CodeRabbit itself citing this PR's own history:
+    #
+    #   '@coderabbitai review' is incremental. On a commit it has already
+    #   reviewed it declines and reruns nothing.
+    #
+    #   '@coderabbitai full review' is what reruns it.
+    #
+    # NEITHER COMMAND RELIABLY CLEARS THE SIMILARITY DEDUP. All four
+    # repositories in this migration returned, on the same round,
+    # "Files skipped from review as they are similar to previous changes (1)"
+    # naming .coderabbit.yaml -- the only file each pull request changed. A
+    # clean verdict over the one file the reviewer says it did not read is not
+    # a verdict on the branch.
+    #
+    # 'full review' did not fix that. It ran -- CodeRabbit replied "Full review
+    # finished" -- and three of the four still listed the same file as skipped.
+    # An earlier version of this comment claimed 'full review' gets past the
+    # dedup. One round later that was contradicted, and it is recorded here
+    # rather than quietly dropped.
+    #
+    # Not established, and left open rather than guessed: whether the skip is
+    # the dedup or a consequence of the included-review limit, which the same
+    # thread reported reaching -- "Your included review limit is currently
+    # reached under our Fair Usage Limits Policy". Both were true at the same
+    # moment and nothing observable here separates them.
+    #
+    # So: 'review' after a new commit. 'full review' to rerun the same commit,
+    # but it does not guarantee the skip is lifted -- and a verdict that
+    # covered no files is not a pass whichever command produced it. Treat that
+    # as unreviewed and say so, rather than reaching for a command that has
+    # already been observed not to clear it.
+    #
+    # There IS a trial, and it has a date. Verified 2026-09-25 from the
+    # CodeRabbit billing page (app.coderabbit.ai, Plans & products), which is
+    # the only place it is visible -- nothing in this repository, in the bot's
+    # comments, or on coderabbit.ai/oss shows it:
+    #
+    #   Plan: Advanced, monthly, on trial. 8 seats. Trial ends 02 Oct 2026.
+    #   Estimated monthly cost after that: USD 720. Credits: 0.
+    #
+    # So the date the earlier comment named was real. What was wrong about it
+    # was the reason: it tied the date to a star-count rule that does not
+    # exist. The trial is an account-level plan, so its expiry lands on every
+    # repository at once and has nothing to do with this one's star count.
+    #
+    # WATCH THIS, because it is a charge and not a cut-off. 'Usage-based
+    # reviews' is Active on the same page at USD 0.25 per reviewed file, and
+    # its own description is "continue reviewing after your plan's included
+    # limits are reached". Reviews may therefore keep working past 02 Oct and
+    # bill per file rather than stopping. coderabbit.ai/oss separately states
+    # reviews are free on every public repository, which would cover this one,
+    # but the interaction between that and an expired paid plan with
+    # usage-based billing switched on has NOT been observed here. Check the
+    # billing page after the first review in October rather than assuming
+    # either outcome.
+    #
+    # The Copilot ruleset is set to enforcement=disabled through the API
+    # rather than deleted, so two reviewers do not both run and re-enabling
+    # is one field:
+    #
+    #   gh api repos/OWNER/NAME/rulesets            # find copilot-auto-review
+    #   gh api repos/OWNER/NAME/rulesets/ID -X PUT -f enforcement=disabled
+    #
+    # HOW TO GO BACK TO COPILOT, if the quota is restored and that is wanted.
+    #
+    # Nothing here reverts on its own. Set enabled: false, re-enable the
+    # ruleset with enforcement=active, and confirm on the next pull request
+    # that Copilot reviews it and CodeRabbit does not.
+    #
+    # Everything below stays as it is either way. The path instructions and
+    # code_guidelines already govern a manually triggered review today, and
+    # govern an automatic one unchanged.
+    enabled: true
+    # 0 disables the pause entirely, which is the schema's documented sentinel
     # ("Set to 0 to disable"), not a large number chosen by hand. At the default
     # of 5, automatic review stops silently once a pull request has five
     # reviewed commits, and a poller waiting on the verdict reads that pause as
