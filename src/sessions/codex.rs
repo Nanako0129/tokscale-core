@@ -541,14 +541,16 @@ fn parse_codex_reader<R: BufRead>(
                 // fallback today, so leaving it alone keeps that path bit for
                 // bit as it was and this change cannot move a single token.
                 //
-                // Deliberately no `last_accepted_token_timestamp_ms` reset
-                // either. The sibling resets it because `turn_context` does not
-                // always precede the reply; that is equally true here (measured
-                // on one day of real rollouts: 15 of 78 turns had no preceding
-                // `turn_context`), but those replies already anchor to the
-                // previous turn's last token time today. Fixing the anchor
-                // would move messages between days, which is a separate defect
-                // with a separate blast radius, tracked on its own.
+                // The start-anchor cursor is reset only when no `turn_context`
+                // has re-anchored it since the last accepted token, i.e. when
+                // the cursor has moved off `current_turn_start_ms`. Without the
+                // reset the reply anchors to the previous turn's last token
+                // time and its duration spans the human's idle gap (#326).
+                // Unlike the `user_message` sibling this is conditional: on the
+                // maintainer's corpus 5,375 of these items follow a
+                // `turn_context` by 0–8.4 s (median 5 ms), and resetting there
+                // would shift every normal turn's timestamp and duration for
+                // no correction.
                 if entry.entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("item_completed")
                 {
@@ -556,6 +558,11 @@ fn parse_codex_reader<R: BufRead>(
                     {
                         if codex_message_is_human_turn(Some(&text)) {
                             state.pending_turn_start = true;
+                            if state.last_accepted_token_timestamp_ms != state.current_turn_start_ms
+                            {
+                                state.last_accepted_token_timestamp_ms =
+                                    parse_codex_entry_timestamp(entry.timestamp.as_deref());
+                            }
                         }
                     }
                 }
@@ -1647,6 +1654,38 @@ mod tests {
                 Some("/Users/alice/codex-demo")
             ]
         );
+    }
+
+    /// #326: a `UserMessage` reply with no `turn_context` since the previous
+    /// turn's last token anchors to the human input, not across the idle gap.
+    /// The first turn is the control: its item follows a `turn_context`, so its
+    /// anchor must stay on the `turn_context` time, not move to the item's.
+    #[test]
+    fn test_user_message_item_without_turn_context_anchors_to_human_input() {
+        let file = create_test_file(concat!(
+            r#"{"timestamp":"2026-01-01T23:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T23:00:02Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"first"}]}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T23:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":3},"last_token_usage":{"input_tokens":10,"output_tokens":3}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-02T01:00:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"second"}]}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-02T01:00:07Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":8},"last_token_usage":{"input_tokens":20,"output_tokens":5}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.is_turn_start));
+        // 2026-01-01T23:00:00Z: the turn_context, not the item two seconds later.
+        assert_eq!(messages[0].timestamp, 1_767_308_400_000);
+        assert_eq!(messages[0].duration_ms, Some(5_000));
+        // 2026-01-02T01:00:00Z: the human input. Before the fix this was the
+        // previous token at 23:00:05 on the previous day, with a ~2 h duration.
+        assert_eq!(messages[1].timestamp, 1_767_315_600_000);
+        assert_eq!(messages[1].duration_ms, Some(7_000));
     }
 
     #[test]

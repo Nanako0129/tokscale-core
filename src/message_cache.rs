@@ -853,7 +853,13 @@ fn parser_version(client: ClientId) -> u32 {
         // matching version as a hit, and a rollout whose fingerprint has not
         // changed is never re-parsed, so every existing user would keep seeing
         // zero turns. Cold-rebuild only, for the same reason as 5.
-        ClientId::Codex => 6,
+        // 7: a reply whose human `UserMessage` item has no `turn_context`
+        // since the previous turn's last token now anchors to that human
+        // input instead of the previous turn's last token time (#326), so its
+        // timestamp and duration change and it can cross a day boundary. An
+        // unchanged rollout keeps its version-6 shard without this bump.
+        // Cold-rebuild only, for the same reason as 5.
+        ClientId::Codex => 7,
         ClientId::Jcode => 4,
         // 5: Copilot Desktop's `events.jsonl` metadata reader now reads past a
         // non-UTF-8 line (`lossy_lines`) instead of stopping, and the desktop
@@ -4621,9 +4627,9 @@ mod tests {
         .unwrap();
 
         let current = CacheIdentity::for_client(ClientId::Codex);
-        assert_eq!(
-            current.parser_version, 6,
-            "this regression is pinned to the identity the fix ships under"
+        assert!(
+            current.parser_version >= 6,
+            "this regression is pinned to the identity the fix shipped under"
         );
         let stale = CacheIdentity {
             namespace: current.namespace,
@@ -4693,6 +4699,121 @@ mod tests {
         assert!(
             rebuilt[0].is_turn_start,
             "the cold rebuild is what carries the correction to an existing user"
+        );
+        cache.insert(CachedSourceEntry::new(
+            current,
+            &source,
+            fingerprint,
+            rebuilt.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let loaded = SourceMessageCache::load();
+        assert_eq!(loaded.get(current, &source).unwrap().messages, rebuilt);
+        restore_cache_env(prev_env);
+    }
+
+    /// Codex parser identity 6 -> 7 (#326): a reply whose `UserMessage` item
+    /// has no preceding `turn_context` now anchors to that item. The rollout
+    /// on disk is unchanged, so only the identity bump can move an existing
+    /// user's cached timestamp off the previous turn's last token time.
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_parser_v6_same_fingerprint_rebuilds_reply_anchor() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source_dir = TempDir::new().unwrap();
+        let source = source_dir
+            .path()
+            .join("rollout-2026-01-01T00-00-00-abc.jsonl");
+        std::fs::write(
+            &source,
+            concat!(
+                r#"{"timestamp":"2026-01-01T23:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T23:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":3},"last_token_usage":{"input_tokens":10,"output_tokens":3}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-02T01:00:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"again"}]}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-02T01:00:07Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":8},"last_token_usage":{"input_tokens":20,"output_tokens":5}}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let current = CacheIdentity::for_client(ClientId::Codex);
+        assert_eq!(
+            current.parser_version, 7,
+            "this regression is pinned to the identity the fix ships under"
+        );
+        let stale = CacheIdentity {
+            namespace: current.namespace,
+            parser_version: 6,
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+
+        // What a version-6 parse produced for the second reply: anchored to
+        // the previous day's 23:00:05 token.
+        let stale_message = UnifiedMessage::new(
+            "codex",
+            "gpt-5.2",
+            "openai",
+            "abc",
+            1_767_308_405_000,
+            TokenBreakdown {
+                input: 20,
+                output: 5,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let stale_entry = CachedSourceEntry::new(
+            stale,
+            &source,
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        );
+        let payload = bincode::options().serialize(&vec![stale_entry]).unwrap();
+        let stale_key = CacheKey::new(current, &source).shard();
+        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        let stale_envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: stale.namespace.to_string(),
+            parser_version: stale.parser_version,
+            payload,
+        };
+        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &stale_envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            SourceFingerprint::from_path(&source).unwrap(),
+            fingerprint,
+            "the source is untouched, so only the identity can force a rebuild"
+        );
+        assert!(matches!(
+            read_shard(&stale_path, current),
+            ShardReadStatus::Stale
+        ));
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(current, &source).is_none(),
+            "a version-6 entry must not be served to a version-7 reader"
+        );
+
+        let rebuilt = crate::sessions::codex::parse_codex_file(&source);
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(
+            rebuilt[1].timestamp, 1_767_315_600_000,
+            "the cold rebuild anchors the reply to 2026-01-02T01:00:00Z"
         );
         cache.insert(CachedSourceEntry::new(
             current,
@@ -5760,7 +5881,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_parser_versions_are_identity_scoped() {
-        assert_eq!(parser_version(ClientId::Codex), 6);
+        assert_eq!(parser_version(ClientId::Codex), 7);
         assert_eq!(parser_version(ClientId::Jcode), 4);
         assert_eq!(parser_version(ClientId::Copilot), 5);
         assert_eq!(parser_version(ClientId::Grok), 4);
