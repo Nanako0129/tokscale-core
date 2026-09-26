@@ -98,7 +98,9 @@ pub fn canonical_model_id(model_id: &str) -> String {
 /// The alias fold is **presentation only** and must never reach the
 /// submit/upload/export/persist path (those use [`canonical_model_id`]), pricing
 /// (which resolves the raw message `model_id`), or the message-cache key space.
-/// An empty/unset alias config makes this identical to [`canonical_model_id`].
+/// With no aliases installed this is [`canonical_model_id`] plus the one
+/// built-in rule in [`model_alias`] (Grok Build `grok-<version>-build` →
+/// `grok-<version>`).
 pub fn normalize_model_for_grouping(model_id: &str) -> String {
     model_alias::apply_global(normalize_syntactic(model_id))
 }
@@ -10758,6 +10760,69 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect::<BTreeMap<_, _>>(),
         }
+    }
+
+    /// Syrtis #118: with no aliases installed, Grok Build's `grok-4.6-build`
+    /// usage key and the bare `grok-4.6` merge into one model-report row whose
+    /// tokens, messages and cost are the exact sums; the raw identity path and
+    /// an unrelated model are untouched.
+    #[test]
+    fn grok_build_rows_group_under_the_bare_version_without_aliases() {
+        let _guard = crate::model_alias::lock_global_alias_tests();
+        clear_model_aliases();
+
+        let message = |model: &str, input: i64, output: i64, cost: f64| {
+            let mut m = UnifiedMessage::new(
+                "grok",
+                model,
+                "xai",
+                "s1",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input,
+                    output,
+                    cache_read: 7,
+                    cache_write: 0,
+                    reasoning: 3,
+                    cache_write_1h: 0,
+                },
+                cost,
+            );
+            m.mark_estimated_cost();
+            m
+        };
+        let entries = aggregate_model_usage_entries(
+            vec![
+                message("grok-4.6-build", 100, 20, 0.25),
+                message("grok-4.6", 50, 10, 0.5),
+                message("grok-code-fast-1", 9, 1, 0.125),
+            ],
+            &GroupBy::Model,
+        );
+
+        let mut rows: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.model.as_str(),
+                    e.input,
+                    e.output,
+                    e.cache_read,
+                    e.reasoning,
+                    e.message_count,
+                    e.cost,
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            rows,
+            vec![
+                ("grok-4.6", 150, 30, 14, 6, 2, 0.75),
+                ("grok-code-fast-1", 9, 1, 7, 3, 1, 0.125),
+            ]
+        );
+        assert_eq!(canonical_model_id("grok-4.6-build"), "grok-4.6-build");
     }
 
     #[test]
