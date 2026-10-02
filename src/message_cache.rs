@@ -886,6 +886,7 @@ fn parser_version(client: ClientId) -> u32 {
         // 2: Pi messages now carry a cross-session dedup key (upstream #1323),
         // and a cached v1 entry has none, so fork copies would keep counting
         // once per session file until re-parsed.
+        // Pi shares `parse_pi_format_file` with Kimchi; bump both together.
         ClientId::Pi => 2,
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
@@ -955,6 +956,11 @@ fn parser_version(client: ClientId) -> u32 {
         // 1: Hindsight's usage-ledger parser (upstream `parse_hindsight_file`
         // plus the vendor-local `split_cached_input`).
         ClientId::Hindsight => 1,
+        // 1: Kimchi's Pi-format parser (`parse_pi_format_file`, session-scoped
+        // keys). Kimchi shares that parser with Pi: a parse change that bumps
+        // `ClientId::Pi` must bump this arm too, or warm Kimchi caches keep
+        // the old output.
+        ClientId::Kimchi => 1,
         _ => 1,
     }
 }

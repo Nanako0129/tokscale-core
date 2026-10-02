@@ -1762,6 +1762,33 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // Kimchi: Pi format under its own root, session-scoped dedup keys.
+    let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Kimchi)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Kimchi),
+                &source_cache,
+                pricing,
+                sessions::kimchi::parse_kimchi_file,
+            )
+        })
+        .collect();
+    let mut kimchi_seen: HashSet<String> = HashSet::new();
+    for outcome in kimchi_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut kimchi_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let kimi_outcomes: Vec<(bool, CachedParseOutcome)> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
@@ -4466,6 +4493,7 @@ where
         sessions::openclaw::parse_openclaw_transcript
     );
     simple_lane!(ClientId::Pi, sessions::pi::parse_pi_file);
+    simple_lane!(ClientId::Kimchi, sessions::kimchi::parse_kimchi_file);
     simple_lane!(
         ClientId::Kimi,
         parse_kimi_source,
@@ -6277,6 +6305,21 @@ fn parse_local_clients_inner(
     let pi_count = pi_msgs.len() as i32;
     counts.set(ClientId::Pi, pi_count);
     messages.extend(pi_msgs);
+
+    let kimchi_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Kimchi)
+        .par_iter()
+        .flat_map(|path| sessions::kimchi::parse_kimchi_file(path))
+        .collect();
+    let mut kimchi_seen: HashSet<String> = HashSet::new();
+    let kimchi_msgs: Vec<ParsedMessage> = kimchi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut kimchi_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let kimchi_count = summed_parsed_message_count(&kimchi_msgs);
+    counts.set(ClientId::Kimchi, kimchi_count);
+    messages.extend(kimchi_msgs);
 
     let kimi_outcomes: Vec<(bool, Vec<UnifiedMessage>)> = scan_result
         .get(ClientId::Kimi)
@@ -23137,5 +23180,123 @@ mod tests {
         assert_eq!(hourly.entries[0].message_count, i32::MAX);
         let agents = runtime.block_on(get_agents_report(options)).unwrap();
         assert_eq!(agents.total_messages, i32::MAX);
+    }
+
+    // ---- Kimchi: Pi format under its own root; pair fixtures ----
+    fn write_pi_format_session(dir: &Path, file: &str, session: &str, message_id: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(file),
+            format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"type":"session","id":"{session}","timestamp":"2026-08-01T12:00:00.000Z","cwd":"/tmp/p"}}"#
+                ),
+                format_args!(
+                    r#"{{"type":"message","id":"{message_id}","timestamp":"2026-08-01T12:00:01.000Z","message":{{"role":"assistant","model":"kimi-k2.6","provider":"kimchi-dev","usage":{{"input":100,"output":10}}}}}}"#
+                ),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// (client, session) of every message, per lane, sorted.
+    fn client_sessions_per_lane(home: &str, clients: &[String]) -> [Vec<(String, String)>; 3] {
+        let sorted = |mut v: Vec<(String, String)>| {
+            v.sort();
+            v
+        };
+        let materialized = parse_all_messages_with_pricing(home, clients, None)
+            .into_iter()
+            .map(|m| (m.client, m.session_id))
+            .collect();
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |m| streamed.push((m.client.clone(), m.session_id.clone())),
+        );
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            ..Default::default()
+        })
+        .unwrap()
+        .messages
+        .into_iter()
+        .map(|m| (m.client, m.session_id))
+        .collect();
+        [sorted(materialized), sorted(streamed), sorted(counted)]
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_kimchi_and_pi_each_count_only_their_own_root() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let home = source_home.path();
+        write_pi_format_session(
+            &home.join(".pi/agent/sessions/--p--"),
+            "a.jsonl",
+            "pi_ses",
+            "m1",
+        );
+        write_pi_format_session(
+            &home.join(".config/kimchi/harness/sessions/--p--"),
+            "a.jsonl",
+            "kimchi_ses",
+            "m1",
+        );
+        // A copy of the Kimchi session file counts once (same session, same id).
+        write_pi_format_session(
+            &home.join(".config/kimchi/harness/sessions/--p--"),
+            "copy.jsonl",
+            "kimchi_ses",
+            "m1",
+        );
+
+        let clients = ["pi".to_string(), "kimchi".to_string()];
+        let expected = vec![
+            ("kimchi".to_string(), "kimchi_ses".to_string()),
+            ("pi".to_string(), "pi_ses".to_string()),
+        ];
+        for lane in client_sessions_per_lane(home.to_str().unwrap(), &clients) {
+            assert_eq!(lane, expected);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_pi_format_files_under_the_cline_cli_root_reach_no_lane() {
+        // Upstream's Kimchi commit also added standalone Cline CLI sessions
+        // (`~/.cline/data/sessions`); that half is not vendored, so a Pi-format
+        // file there must not be read by Cline, Kimchi or Pi.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let home = source_home.path();
+        write_pi_format_session(
+            &home.join(".cline/data/sessions"),
+            "s.jsonl",
+            "cline_cli_ses",
+            "m1",
+        );
+        write_pi_format_session(
+            &home.join(".config/kimchi/harness/sessions/--p--"),
+            "a.jsonl",
+            "kimchi_ses",
+            "m1",
+        );
+
+        let clients = ["pi".to_string(), "kimchi".to_string(), "cline".to_string()];
+        for lane in client_sessions_per_lane(home.to_str().unwrap(), &clients) {
+            assert_eq!(lane, vec![("kimchi".to_string(), "kimchi_ses".to_string())]);
+        }
     }
 }

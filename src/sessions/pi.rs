@@ -113,8 +113,34 @@ fn pi_subagent_name(session_name: &str) -> Option<String> {
     (!without_id.is_empty()).then(|| without_id.to_string())
 }
 
+/// How a Pi-format parser keys messages for the lanes' first-wins dedup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PiDedup {
+    /// Session-independent keys (`{client}:response:…` / `{client}:message:…`):
+    /// Pi-family branch/fork copies a parent's assistant records verbatim
+    /// into a new session file (upstream #1306), so a session-scoped key
+    /// would count every copy once per file.
+    CrossSession,
+    /// `{client}:{session_id}:{entry_id}`, as upstream keys Kimchi
+    /// (`parse_pi_format_file_with_dedup`).
+    SessionScoped,
+}
+
 /// Parse a Pi JSONL session file
 pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
+    parse_pi_format_file(path, "pi", PiDedup::CrossSession)
+}
+
+/// Parse a JSONL session file written in the Pi record format.
+///
+/// `client` is stamped on every message, namespaces its dedup key, and is the
+/// provider of last resort when the message names none and the model is not
+/// recognizable. Pi uses it as `pi`; Kimchi as `kimchi` (`sessions::kimchi`).
+pub(crate) fn parse_pi_format_file(
+    path: &Path,
+    client: &str,
+    dedup: PiDedup,
+) -> Vec<UnifiedMessage> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
@@ -224,8 +250,8 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
         let provider = match message.provider {
             Some(p) if !p.is_empty() => p,
             _ => inferred_provider_from_model(&model)
-                .unwrap_or("pi")
-                .to_string(),
+                .map(str::to_string)
+                .unwrap_or_else(|| client.to_string()),
         };
 
         let recorded_timestamp = entry
@@ -235,7 +261,7 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
         let timestamp = recorded_timestamp.unwrap_or(fallback_timestamp);
 
         let mut unified = UnifiedMessage::new_with_agent(
-            "pi",
+            client,
             model,
             provider,
             session_id.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -267,27 +293,35 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
             .response_id
             .as_deref()
             .filter(|id| !id.trim().is_empty())
-            .map(|id| format!("pi:response:{}:{id}", unified.provider_id));
-        unified.dedup_key = response_key.or_else(|| {
-            entry
+            .map(|id| format!("{client}:response:{}:{id}", unified.provider_id));
+        unified.dedup_key = match dedup {
+            PiDedup::SessionScoped => entry
                 .id
                 .as_deref()
                 .filter(|id| !id.trim().is_empty())
-                .map(|id| {
-                    let stable_timestamp = recorded_timestamp
-                        .map(|timestamp| timestamp.to_string())
-                        .unwrap_or_else(|| "missing".to_string());
-                    format!(
-                        "pi:message:{id}:{stable_timestamp}:{}:{}:{}:{}:{}:{}",
-                        unified.provider_id,
-                        unified.model_id,
-                        unified.tokens.input,
-                        unified.tokens.output,
-                        unified.tokens.cache_read,
-                        unified.tokens.cache_write,
-                    )
-                })
-        });
+                .map(|id| format!("{client}:{}:{id}", unified.session_id)),
+            // Cross-session (Pi): see the comment on `response_key` above.
+            PiDedup::CrossSession => response_key.or_else(|| {
+                entry
+                    .id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(|id| {
+                        let stable_timestamp = recorded_timestamp
+                            .map(|timestamp| timestamp.to_string())
+                            .unwrap_or_else(|| "missing".to_string());
+                        format!(
+                            "{client}:message:{id}:{stable_timestamp}:{}:{}:{}:{}:{}:{}",
+                            unified.provider_id,
+                            unified.model_id,
+                            unified.tokens.input,
+                            unified.tokens.output,
+                            unified.tokens.cache_read,
+                            unified.tokens.cache_write,
+                        )
+                    })
+            }),
+        };
         unified.set_workspace(workspace_key.clone(), workspace_label.clone());
         messages.push(unified);
     }
