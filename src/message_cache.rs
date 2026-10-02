@@ -886,9 +886,14 @@ fn parser_version(client: ClientId) -> u32 {
         // 2: Pi messages now carry a cross-session dedup key (upstream #1323),
         // and a cached v1 entry has none, so fork copies would keep counting
         // once per session file until re-parsed.
-        // Pi shares `parse_pi_format_file` with Kimchi and Senpi; bump all of
-        // them together.
-        ClientId::Pi => 2,
+        // 3: the `pi` lane no longer scans `~/.omp/agent/sessions` (that root
+        // is the `omp` client's now). Pi's parse is unchanged; the bump makes
+        // existing Pi shards stale so entries cached for OMP files stop being
+        // loaded on every scan and are dropped when the shards are rewritten.
+        // Costs one cold re-parse of `~/.pi`.
+        // Pi shares `parse_pi_format_file` with Kimchi, Senpi and Omp; a parse
+        // change bumps all of them together.
+        ClientId::Pi => 3,
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
         ClientId::Amp | ClientId::MiMoCode | ClientId::Mux => 2,
@@ -963,8 +968,12 @@ fn parser_version(client: ClientId) -> u32 {
         // the old output.
         ClientId::Kimchi => 1,
         // 1: Senpi's Pi-format parser (`parse_pi_format_file`, cross-session
-        // keys). Shared with Pi and Kimchi: bump all three together.
+        // keys). Shared with Pi, Kimchi and Omp: a parse change bumps all four.
         ClientId::Senpi => 1,
+        // 1: Oh My Pi's Pi-format parser (`parse_pi_format_file`,
+        // cross-session keys). Shared with Pi, Kimchi and Senpi: bump all four
+        // together.
+        ClientId::Omp => 1,
         _ => 1,
     }
 }
@@ -3899,6 +3908,48 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_pi_v2_shard_for_an_omp_file_is_no_longer_loaded() {
+        // Pi v2 cached files under `~/.omp/agent/sessions` while the `pi`
+        // lane still scanned that root. The v3 bump must make such a shard
+        // stale, so it is neither served nor kept in memory.
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"omp transcript\n");
+        let current = CacheIdentity::for_client(ClientId::Pi);
+        assert_eq!(current.parser_version, 3);
+        let stale = CacheIdentity {
+            namespace: current.namespace,
+            parser_version: 2,
+        };
+
+        let stale_key = CacheKey::new(current, source.path()).shard();
+        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        let stale_envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: stale.namespace.to_string(),
+            parser_version: stale.parser_version,
+            payload: b"old Pi payload for an OMP file".to_vec(),
+        };
+        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &stale_envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert!(matches!(
+            read_shard(&stale_path, current),
+            ShardReadStatus::Stale
+        ));
+        let loaded = SourceMessageCache::load();
+        assert!(loaded.get(current, source.path()).is_none());
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_mux_v1_shard_is_rejected_before_new_parser_identity_can_hit() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
@@ -5820,8 +5871,9 @@ mod tests {
         assert_eq!(parser_version(ClientId::OpenClaw), 3);
         // 3 reads Cursor's cache-write column as its own bucket (#1154).
         assert_eq!(parser_version(ClientId::Cursor), 3);
-        // 2 carries the cross-session Pi dedup key (#1323).
-        assert_eq!(parser_version(ClientId::Pi), 2);
+        // 3 drops Pi entries cached for OMP files once `omp` owns that root
+        // (2 carried the cross-session Pi dedup key, #1323).
+        assert_eq!(parser_version(ClientId::Pi), 3);
         for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {
             // 2: per-message `modelInfo` identity (#1340).
             assert_eq!(parser_version(client), 2, "{}", client.as_str());

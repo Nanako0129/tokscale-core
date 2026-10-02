@@ -166,7 +166,9 @@ const REMOTE_DOMAIN: &[u8] = b"tokenbar-remote-source-context-v1";
 /// already changes the descriptor through the client list and needs no bump.
 ///
 /// 2: Kimi Work scan roots under the desktop app-data tree (upstream #1170).
-const RESOLVER_CONTRACT_VERSION: u32 = 2;
+/// 3: the `pi` client no longer derives `~/.omp/agent/sessions` as a scan
+///    root; that tree belongs to the new `omp` client (upstream #1161).
+const RESOLVER_CONTRACT_VERSION: u32 = 3;
 
 const ENV_HOME: &str = "HOME";
 const ENV_XDG_DATA_HOME: &str = "XDG_DATA_HOME";
@@ -2655,12 +2657,12 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:d8e3895dc91df1f635547d4019543a0bd80de5e3282333c222e5aa41db49729d"
+            "sc1:bba71130b6547ae8c440601472e2e80cbce9f513793627acdf7e7ff427e19c5c"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:e69d1c0e5c9c63838b69701e615d67896e39505a7e64eb15fbde9045cde0cc9b"
+            "sc1:82b7119899076871ea5b93947b24d01d17b31ee2e5ed96365350ea16a8ca6299"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely

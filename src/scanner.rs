@@ -1330,13 +1330,6 @@ fn scan_all_clients_resolved_inner(
             push(ClientId::OpenClaw, path, ClientId::OpenClaw.data().pattern);
         }
     }
-    if enabled.contains(&ClientId::Pi) {
-        push(
-            ClientId::Pi,
-            home_dir.join(".omp/agent/sessions"),
-            ClientId::Pi.data().pattern,
-        );
-    }
     if include_synthetic {
         let candidate = xdg_data.join("octofriend/sqlite.db");
         if candidate.exists() {
@@ -1813,12 +1806,6 @@ fn scan_all_clients_with_env_strategy_inner(
             ClientId::OpenClaw,
             moldbot_path,
         );
-    }
-
-    // Oh My Pi fork (https://github.com/can1357/oh-my-pi) — same JSONL format, different root
-    if enabled.contains(&ClientId::Pi) {
-        let omp_path = format!("{}/.omp/agent/sessions", home_dir);
-        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Pi, omp_path);
     }
 
     if include_synthetic {
@@ -3909,28 +3896,68 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_all_clients_omp_scanned_as_pi() {
+    fn test_scan_all_clients_omp_scanned_as_omp() {
         let dir = TempDir::new().unwrap();
         let home = dir.path();
         setup_mock_omp_dir(home);
 
         let result =
-            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
-        assert_eq!(result.get(ClientId::Pi).len(), 1);
-        assert!(result.get(ClientId::Pi)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl"));
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["omp".to_string()], false);
+        assert_eq!(result.get(ClientId::Omp).len(), 1);
+        assert!(result.get(ClientId::Omp)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl"));
+        assert!(result.get(ClientId::Pi).is_empty());
         assert!(result.get(ClientId::OpenCode).is_empty());
     }
 
     #[test]
-    fn test_scan_all_clients_pi_from_both_paths() {
+    fn test_scan_all_clients_omp_not_scanned_as_pi() {
         let dir = TempDir::new().unwrap();
         let home = dir.path();
         setup_mock_pi_dir(home);
         setup_mock_omp_dir(home);
 
-        let result =
-            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
-        assert_eq!(result.get(ClientId::Pi).len(), 2);
+        // Pi alone: no `omp` lane is enabled to claim the root first, so
+        // this is where a stray Pi scan of the OMP root would show.
+        let clients = ["pi".to_string()];
+        let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, false);
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.to_path_buf()),
+            false,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
+        for result in [legacy, resolved] {
+            assert_eq!(result.get(ClientId::Pi).len(), 1);
+            assert!(result.get(ClientId::Pi)[0].ends_with("1733011200000_pi_ses_001.jsonl"));
+            assert!(result.get(ClientId::Omp).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_scan_all_clients_pi_and_omp_each_scan_only_their_own_root() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_pi_dir(home);
+        setup_mock_omp_dir(home);
+        let clients = ["pi".to_string(), "omp".to_string()];
+
+        let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, false);
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.to_path_buf()),
+            false,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
+        for result in [legacy, resolved] {
+            assert_eq!(result.get(ClientId::Pi).len(), 1);
+            assert!(result.get(ClientId::Pi)[0].ends_with("1733011200000_pi_ses_001.jsonl"));
+            assert_eq!(result.get(ClientId::Omp).len(), 1);
+            assert!(
+                result.get(ClientId::Omp)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl")
+            );
+        }
     }
 
     #[test]
