@@ -381,6 +381,9 @@ impl PricingLookup {
         borrow_missing_long_context_tiers(&mut result.pricing, donor);
     }
 
+    /// The canonical LiteLLM row that may lend 272K tiers to the row keyed
+    /// `matched_key`, or `None` when the model is not a request-wide identity,
+    /// has no canonical row, or is that row.
     fn canonical_tier_donor(&self, matched_key: &str) -> Option<&ModelPricing> {
         let terminal = matched_key
             .rsplit('/')
@@ -397,6 +400,8 @@ impl PricingLookup {
         self.litellm.get(key)
     }
 
+    /// The pricing pipeline itself, before the hinted-row tier borrow that
+    /// `lookup_with_source_and_provider_and_terminal_custom` applies.
     fn resolve_with_source_and_provider<F>(
         &self,
         model_id: &str,
@@ -6875,6 +6880,7 @@ mod tests {
         }
     }
 
+    /// A LiteLLM-style row with a 272K tier on input, output and cache read.
     fn tiered_272k(input: f64, output: f64, cache_read: f64) -> ModelPricing {
         ModelPricing {
             input_cost_per_token: Some(input),
@@ -6887,6 +6893,7 @@ mod tests {
         }
     }
 
+    /// A row with base rates and no long-context tier.
     fn base_only(input: f64, output: f64, cache_read: f64) -> ModelPricing {
         ModelPricing {
             input_cost_per_token: Some(input),
@@ -6896,6 +6903,7 @@ mod tests {
         }
     }
 
+    /// Usage with only input, output and cache-read tokens.
     fn usage_prompt(input: i64, output: i64, cache_read: i64) -> TokenBreakdown {
         TokenBreakdown {
             input,
