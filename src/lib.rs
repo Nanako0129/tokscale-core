@@ -4047,12 +4047,14 @@ where
             use_env_roots,
         )
     };
+    // Lazy: each lane below loads its namespace before its first lookup (which
+    // also prunes that namespace's missing sources) and releases it after its
+    // last, so a warm scan does not hold every cached namespace at once.
     let mut source_cache = if let Some(context) = context {
-        message_cache::SourceMessageCache::load_from_root(context.source_cache_dir())
+        message_cache::SourceMessageCache::open_from_root(context.source_cache_dir())
     } else {
-        message_cache::SourceMessageCache::load()
+        message_cache::SourceMessageCache::open()
     };
-    source_cache.prune_missing_files();
 
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
@@ -4144,6 +4146,8 @@ where
     // one path and touches no shared state.
     let mut deferred_retained: Vec<UnifiedMessage> = Vec::new();
     for chunk in scan_result.get(ClientId::Claude).chunks(PARSE_BATCH_SIZE) {
+        // Never released: Claude entries can hold retained history.
+        source_cache.ensure_namespace_loaded(claude_identity);
         let stage_a: Vec<ClaudeStageA> = chunk
             .par_iter()
             .map(|path| claude_stage_a(path, &source_cache, &claude_home))
@@ -4260,6 +4264,7 @@ where
     let codex_identity = message_cache::CacheIdentity::for_client(ClientId::Codex);
     let mut codex_seen: HashSet<String> = HashSet::new();
     for chunk in scan_result.get(ClientId::Codex).chunks(PARSE_BATCH_SIZE) {
+        source_cache.ensure_namespace_loaded(codex_identity);
         let stage_a: Vec<CodexStageA> = chunk
             .par_iter()
             .map(|path| codex_stage_a(path, &source_cache))
@@ -4325,6 +4330,9 @@ where
         }
     }
 
+    // Released only after every chunk's stage B: stage B re-reads stage A's hits.
+    source_cache.release_clean_namespace(codex_identity);
+
     // ---- Simple file-backed lanes (per-lane dedup set, cache-aware) ----
     // Cache hit  → iterate cached.messages by reference (one clone per message),
     //              refresh_derived_fields, apply pricing, dedup, filter, sink.
@@ -4369,6 +4377,8 @@ where
             // Separate paths into cache-hit (emit immediately) vs cache-miss (par-parse).
             let mut miss_paths: Vec<&PathBuf> = Vec::new();
             for path in $paths {
+                source_cache
+                    .ensure_namespace_loaded(message_cache::CacheIdentity::for_client($client_id));
                 let fp = $fingerprint_fn(path);
                 let cache_hit = fp.as_ref().and_then(|fp| {
                     source_cache
@@ -4428,11 +4438,18 @@ where
                     }
                 }
             }
+            source_cache
+                .release_clean_namespace(message_cache::CacheIdentity::for_client($client_id));
         }};
     }
     // ---- Copilot OTEL + Desktop aggregate (whole-session OTEL authority) ----
     {
         let otel_paths = scan_result.get(ClientId::Copilot);
+        if !otel_paths.is_empty() || scan_result.copilot_desktop_db.is_some() {
+            source_cache.ensure_namespace_loaded(message_cache::CacheIdentity::for_client(
+                ClientId::Copilot,
+            ));
+        }
         let mut raw_by_path: Vec<Option<Vec<UnifiedMessage>>> =
             (0..otel_paths.len()).map(|_| None).collect();
         let mut miss_paths: Vec<(usize, &PathBuf)> = Vec::new();
@@ -4535,6 +4552,8 @@ where
             }
         }
     }
+    source_cache
+        .release_clean_namespace(message_cache::CacheIdentity::for_client(ClientId::Copilot));
     simple_lane!(ClientId::Cursor, sessions::cursor::parse_cursor_file);
     simple_lane!(ClientId::Warp, sessions::warp::parse_warp_file);
     simple_lane!(ClientId::Amp, sessions::amp::parse_amp_file);
@@ -4598,6 +4617,10 @@ where
     // global unified log can suppress legacy rows from any session file.
     {
         let grok_paths = scan_result.get(ClientId::Grok);
+        if !grok_paths.is_empty() {
+            source_cache
+                .ensure_namespace_loaded(message_cache::CacheIdentity::for_client(ClientId::Grok));
+        }
         let mut raw_by_path: Vec<Option<Vec<UnifiedMessage>>> =
             (0..grok_paths.len()).map(|_| None).collect();
         let mut miss_paths: Vec<(usize, &PathBuf)> = Vec::new();
@@ -4662,6 +4685,7 @@ where
             }
         }
     }
+    source_cache.release_clean_namespace(message_cache::CacheIdentity::for_client(ClientId::Grok));
     // micode is WAL-mode SQLite; fingerprint via from_sqlite_path so a `-wal`
     // write invalidates the cache. MiMo Code records an authoritative per-message
     // cost (usage.cost), so this lane is cost-guarded (`true`): apply_pricing
@@ -4697,6 +4721,10 @@ where
     // restore the cached snapshot.
     {
         let kiro_paths = scan_result.get(ClientId::Kiro);
+        if !kiro_paths.is_empty() {
+            source_cache
+                .ensure_namespace_loaded(message_cache::CacheIdentity::for_client(ClientId::Kiro));
+        }
         let mut raw_by_path: Vec<Option<Vec<UnifiedMessage>>> =
             (0..kiro_paths.len()).map(|_| None).collect();
         let mut miss_paths: Vec<(usize, &PathBuf)> = Vec::new();
@@ -4765,6 +4793,8 @@ where
         }
     }
 
+    source_cache.release_clean_namespace(message_cache::CacheIdentity::for_client(ClientId::Kiro));
+
     // ---- Gemini (cache-aware with invalidate_cache semantics) ----
     // Uses load_or_parse_source_with_fingerprint_and_policy equivalent:
     // cacheable=false → remove stale cache entry (invalidate_cache).
@@ -4774,6 +4804,9 @@ where
         let mut seen_keys: HashSet<String> = HashSet::new();
         let mut gemini_miss_paths: Vec<&PathBuf> = Vec::new();
         for path in scan_result.get(ClientId::Gemini) {
+            source_cache.ensure_namespace_loaded(message_cache::CacheIdentity::for_client(
+                ClientId::Gemini,
+            ));
             let fp = message_cache::SourceFingerprint::from_path_samples_only(path);
             let cache_hit = fp.as_ref().and_then(|fp| {
                 source_cache
@@ -4846,6 +4879,9 @@ where
             }
         }
     }
+
+    source_cache
+        .release_clean_namespace(message_cache::CacheIdentity::for_client(ClientId::Gemini));
 
     // ---- Kilo SQLite ----
     if let Some(db_path) = &scan_result.kilo_db {
@@ -4939,6 +4975,8 @@ where
 
     // ---- Zed SQLite (cache-aware reference-iterate) ----
     for db_path in scan_result.zed_db_paths() {
+        source_cache
+            .ensure_namespace_loaded(message_cache::CacheIdentity::for_client(ClientId::Zed));
         let fp = message_cache::SourceFingerprint::from_sqlite_path(&db_path);
         let cache_hit = fp.as_ref().and_then(|fp| {
             source_cache
@@ -4979,6 +5017,8 @@ where
             }
         }
     }
+
+    source_cache.release_clean_namespace(message_cache::CacheIdentity::for_client(ClientId::Zed));
 
     // ---- Kiro SQLite ----
     if let Some(db_path) = &scan_result.kiro_db {
@@ -5055,6 +5095,7 @@ where
         .as_ref()
         .filter(|_| include_synthetic)
     {
+        source_cache.ensure_namespace_loaded(message_cache::CacheIdentity::synthetic());
         let fp = message_cache::SourceFingerprint::from_sqlite_path(db_path);
         let cache_hit = fp.as_ref().and_then(|fp| {
             source_cache
@@ -5100,6 +5141,8 @@ where
             }
         }
     }
+
+    source_cache.release_clean_namespace(message_cache::CacheIdentity::synthetic());
 
     // ---- Flush trae keep-latest (after all other lanes) ----
     for mut m in trae_latest.into_values() {
@@ -23508,5 +23551,179 @@ mod tests {
                 .map(|m| m.tokens.total())
                 .sum();
         assert_eq!(new_total, 2 * old_total);
+    }
+
+    /// Lazy cache namespaces (M1108-B): a home with Claude, Codex and Pi
+    /// sources, so a warm streaming scan crosses a never-released namespace,
+    /// the two-stage Codex lane and a `simple_lane!` with two files.
+    fn write_lazy_cache_fixture(source_home: &Path) -> (PathBuf, PathBuf) {
+        let claude_dir = source_home.join(".claude/projects/lazy");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("session-lazy.jsonl");
+        std::fs::write(
+            &transcript,
+            format!("{LAZY_CLAUDE_TURN_A}\n{LAZY_CLAUDE_TURN_B}\n"),
+        )
+        .unwrap();
+        let codex_dir = scanner_fixture_path(source_home, ".codex/sessions");
+        let codex_one = write_codex_session(
+            &codex_dir,
+            "a.jsonl",
+            &codex_plain_fixture("lazy-codex-1", "gpt-5.4", "2026-01-01T00:00:00Z", 10, 5),
+        );
+        write_codex_session(
+            &codex_dir,
+            "b.jsonl",
+            &codex_plain_fixture("lazy-codex-2", "gpt-5.4", "2026-01-02T00:00:00Z", 20, 7),
+        );
+        let pi_dir = source_home.join(".pi/agent/sessions/--p--");
+        write_pi_format_session(&pi_dir, "a.jsonl", "lazy-pi-1", "m1");
+        write_pi_format_session(&pi_dir, "b.jsonl", "lazy-pi-2", "m2");
+        (transcript, codex_one)
+    }
+
+    const LAZY_CLAUDE_TURN_A: &str = r#"{"type":"assistant","sessionId":"session-lazy","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_lazy_a","message":{"id":"msg_lazy_a","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+    const LAZY_CLAUDE_TURN_B: &str = r#"{"type":"assistant","sessionId":"session-lazy","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_lazy_b","message":{"id":"msg_lazy_b","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+
+    /// (client, session, total tokens) of every streamed message, sorted.
+    fn streamed_rows(source_home: &Path, clients: &[String]) -> Vec<(String, String, i64)> {
+        let mut rows = Vec::new();
+        scan_messages_streaming(
+            source_home.to_str().unwrap(),
+            clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |m| rows.push((m.client.clone(), m.session_id.clone(), m.tokens.total())),
+        );
+        rows.sort();
+        rows
+    }
+
+    /// Every shard file with its length and modification time.
+    fn shard_snapshot(cache_home: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push((path, metadata.len(), metadata.modified().unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&cache_home.join("cache/source-message-cache-v2"), &mut out);
+        out.sort();
+        out
+    }
+
+    fn lazy_cache_env(cache_home: &Path) -> EnvGuard {
+        EnvGuard::set(&[
+            ("HOME", cache_home.as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.as_os_str()),
+        ])
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_streaming_warm_scan_serves_hits_without_rewriting_the_cache() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = lazy_cache_env(cache_home.path());
+        write_lazy_cache_fixture(source_home.path());
+
+        let cold = streamed_rows(source_home.path(), &[]);
+        for client in ["claude", "codex", "pi"] {
+            assert_eq!(
+                cold.iter().filter(|row| row.0 == client).count(),
+                2,
+                "{client}: {cold:?}"
+            );
+        }
+        let before = shard_snapshot(cache_home.path());
+        assert!(!before.is_empty());
+
+        // Stage B of the Codex lane and the second Pi file both need their
+        // namespace still loaded; a miss would re-parse and rewrite a shard.
+        let warm = streamed_rows(source_home.path(), &[]);
+        assert_eq!(warm, cold);
+        assert_eq!(shard_snapshot(cache_home.path()), before);
+
+        let [materialized, streamed, counted] =
+            client_sessions_per_lane(source_home.path().to_str().unwrap(), &[]);
+        assert_eq!(materialized, streamed);
+        assert_eq!(counted, streamed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_streaming_scan_drops_a_deleted_source_from_the_cache() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = lazy_cache_env(cache_home.path());
+        let (_, codex_one) = write_lazy_cache_fixture(source_home.path());
+        let codex = message_cache::CacheIdentity::for_client(ClientId::Codex);
+
+        streamed_rows(source_home.path(), &[]);
+        assert!(message_cache::SourceMessageCache::load()
+            .get(codex, &codex_one)
+            .is_some());
+        std::fs::remove_file(&codex_one).unwrap();
+        streamed_rows(source_home.path(), &[]);
+
+        let reloaded = message_cache::SourceMessageCache::load();
+        assert!(reloaded.get(codex, &codex_one).is_none());
+        // Control: the surviving Codex file keeps its entry.
+        assert!(reloaded
+            .get(codex, &codex_one.with_file_name("b.jsonl"))
+            .is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_streaming_one_client_warm_scan_reads_only_that_namespace() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = lazy_cache_env(cache_home.path());
+        write_lazy_cache_fixture(source_home.path());
+        streamed_rows(source_home.path(), &[]);
+
+        message_cache::take_namespace_reads();
+        let pi_only = streamed_rows(source_home.path(), &["pi".to_string()]);
+        assert_eq!(pi_only.len(), 2);
+        assert_eq!(message_cache::take_namespace_reads(), vec!["pi"]);
+
+        streamed_rows(source_home.path(), &[]);
+        let mut reads = message_cache::take_namespace_reads();
+        reads.sort_unstable();
+        assert_eq!(
+            reads,
+            vec!["claude", "codex", "pi"],
+            "each read exactly once"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_streaming_claude_miss_still_sees_retained_history_with_lazy_namespaces() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = lazy_cache_env(cache_home.path());
+        let (transcript, _) = write_lazy_cache_fixture(source_home.path());
+        streamed_rows(source_home.path(), &[]);
+
+        // A compacting rewrite drops turn A from the live file.
+        std::fs::write(&transcript, format!("{LAZY_CLAUDE_TURN_B}\n")).unwrap();
+        let after = streamed_rows(source_home.path(), &[]);
+        let claude: Vec<i64> = after
+            .iter()
+            .filter(|row| row.0 == "claude")
+            .map(|row| row.2)
+            .collect();
+        assert_eq!(claude.len(), 2, "turn A must be retained: {after:?}");
+        assert_eq!(claude.iter().sum::<i64>(), 150 + 260);
     }
 }
