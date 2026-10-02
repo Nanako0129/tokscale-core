@@ -722,4 +722,174 @@ not valid json
         let key_b = parse_pi_file(b.path())[0].dedup_key.clone().unwrap();
         assert_ne!(key_a, key_b);
     }
+
+    /// Pi's emitted messages, every field except the local-timezone `date`,
+    /// captured before `parse_pi_file`
+    /// was generalized into `parse_pi_format_file` for the Pi-family clients.
+    /// The refactor must leave Pi's output byte-identical.
+    const PI_OUTPUT_SNAPSHOT: &str = r##"[
+    UnifiedMessage {
+        client: "pi",
+        model_id: "claude-sonnet-4-5",
+        provider_id: "anthropic",
+        session_id: "pi_ses_snap",
+        workspace_key: Some(
+            "/tmp/snap-project",
+        ),
+        workspace_label: Some(
+            "snap-project",
+        ),
+        timestamp: 1785585602000,
+        tokens: TokenBreakdown {
+            input: 100,
+            output: 20,
+            cache_read: 30,
+            cache_write: 5,
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        cost: 0.0,
+        cost_source: Unknown,
+        duration_ms: None,
+        message_count: 1,
+        agent: Some(
+            "reviewer",
+        ),
+        dedup_key: Some(
+            "pi:response:anthropic:resp_1",
+        ),
+        dedup_aliases: [],
+        is_turn_start: false,
+    },
+    UnifiedMessage {
+        client: "pi",
+        model_id: "gpt-5",
+        provider_id: "openai",
+        session_id: "pi_ses_snap",
+        workspace_key: Some(
+            "/tmp/snap-project",
+        ),
+        workspace_label: Some(
+            "snap-project",
+        ),
+        timestamp: 1785585603000,
+        tokens: TokenBreakdown {
+            input: 10,
+            output: 2,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        cost: 0.0,
+        cost_source: Unknown,
+        duration_ms: None,
+        message_count: 1,
+        agent: Some(
+            "reviewer",
+        ),
+        dedup_key: Some(
+            "pi:message:m2:1785585603000:openai:gpt-5:10:2:0:0",
+        ),
+        dedup_aliases: [],
+        is_turn_start: false,
+    },
+    UnifiedMessage {
+        client: "pi",
+        model_id: "mystery-model",
+        provider_id: "pi",
+        session_id: "pi_ses_snap",
+        workspace_key: Some(
+            "/tmp/snap-project",
+        ),
+        workspace_label: Some(
+            "snap-project",
+        ),
+        timestamp: 1785585604000,
+        tokens: TokenBreakdown {
+            input: 0,
+            output: 7,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        cost: 0.0,
+        cost_source: Unknown,
+        duration_ms: None,
+        message_count: 1,
+        agent: Some(
+            "reviewer",
+        ),
+        dedup_key: None,
+        dedup_aliases: [],
+        is_turn_start: false,
+    },
+    UnifiedMessage {
+        client: "pi",
+        model_id: "gpt-5",
+        provider_id: "openai",
+        session_id: "pi_ses_snap",
+        workspace_key: Some(
+            "/tmp/snap-project",
+        ),
+        workspace_label: Some(
+            "snap-project",
+        ),
+        timestamp: 1785600000000,
+        tokens: TokenBreakdown {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        cost: 0.0,
+        cost_source: Unknown,
+        duration_ms: None,
+        message_count: 1,
+        agent: Some(
+            "reviewer",
+        ),
+        dedup_key: Some(
+            "pi:message:m4:missing:openai:gpt-5:1:1:0:0",
+        ),
+        dedup_aliases: [],
+        is_turn_start: false,
+    },
+]"##;
+
+    #[test]
+    fn pi_output_is_unchanged_by_the_pi_family_refactor() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"\xef\xbb\xbf").unwrap();
+        for line in [
+            r#"{"type":"title","title":"t"}"#,
+            r#"{"type":"session","id":"pi_ses_snap","timestamp":"2026-08-01T12:00:00.000Z","cwd":"/tmp/snap-project"}"#,
+            r#"{"type":"session_info","name":"subagent-reviewer-1a2b3c4d"}"#,
+            r#"{"type":"message","id":"u1","timestamp":"2026-08-01T12:00:01.000Z","message":{"role":"user"}}"#,
+            r#"{"type":"message","id":"m1","timestamp":"2026-08-01T12:00:02.000Z","message":{"role":"assistant","model":"claude-sonnet-4-5","provider":"anthropic","responseId":"resp_1","usage":{"input":100,"output":20,"cacheRead":30,"cacheWrite":5,"totalTokens":155}}}"#,
+            r#"{"type":"message","id":"m2","timestamp":"2026-08-01T12:00:03.000Z","message":{"role":"assistant","model":"gpt-5","usage":{"input":10,"output":2}}}"#,
+            r#"{"type":"message","timestamp":"2026-08-01T12:00:04.000Z","message":{"role":"assistant","model":"mystery-model","provider":"","usage":{"input":-3,"output":7}}}"#,
+            r#"{"type":"message","id":"m4","timestamp":"not-a-time","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":1,"output":1}}}"#,
+        ] {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+        // The record without a parseable timestamp falls back to the file's
+        // mtime, so pin it.
+        file.as_file()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_600_000))
+            .unwrap();
+
+        // `date` is derived from `timestamp` in the local timezone; drop it so
+        // the snapshot holds in every timezone (`timestamp` is still compared).
+        let actual = format!("{:#?}", parse_pi_file(file.path()))
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("date: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(actual, PI_OUTPUT_SNAPSHOT, "Pi output changed:\n{actual}");
+    }
 }
