@@ -107,9 +107,13 @@ pub fn parse_reasonix_file(path: &Path) -> Vec<UnifiedMessage> {
             // An explicit nonzero cache miss is Reasonix's authoritative
             // ordinary-input bucket. Older records omit it, so derive that
             // bucket from prompt tokens and cache hits in that case.
+            // Clamped: a row whose cache hits exceed its prompt (no
+            // `cache_miss`) would otherwise yield negative input, which the
+            // remote report fold rejects for the whole bundle. Upstream
+            // leaves it unclamped.
             let input = match record.cache_miss {
                 Some(cache_miss) if cache_miss != 0 => non_negative(cache_miss),
-                _ => raw_input.saturating_sub(cache_read),
+                _ => non_negative(raw_input.saturating_sub(cache_read)),
             };
             let reasoning = non_negative(record.reasoning).min(non_negative(record.completion));
             let tokens = TokenBreakdown {
@@ -370,5 +374,21 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.total(), 0);
         assert_eq!(messages[0].message_count, 2);
+    }
+
+    #[test]
+    fn cache_hits_above_prompt_never_yield_negative_input() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"{"ts":"2026-08-04T09:10:11Z","model":"deepseek/chat","prompt":0,"completion":2,"cache_hit":1,"total":3,"requests":1}"#,
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let messages = parse_reasonix_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 0);
+        assert_eq!(messages[0].tokens.cache_read, 1);
     }
 }
