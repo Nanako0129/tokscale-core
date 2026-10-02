@@ -533,6 +533,19 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Augment Code / Auggie CLI stores per-session JSON snapshots under
+    // `~/.augment/sessions/<sessionId>.json` with per-turn token_usage on
+    // exchange.response_nodes. Upstream numbers this client 40 — intervening
+    // clients differ in our vendor numbering.
+    Augment = 34 => {
+        id: "augment",
+        root: PathRoot::Home,
+        relative: ".augment/sessions",
+        pattern: "*.json",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -622,7 +635,21 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 34);
+        assert_eq!(ClientId::COUNT, 35);
+    }
+
+    #[test]
+    fn test_augment_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("augment").expect("augment client should be registered");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/.augment/sessions"
+        );
+        assert_eq!(client.data().relative_path, ".augment/sessions");
+        assert_eq!(client.data().pattern, "*.json");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
     }
 
     #[test]

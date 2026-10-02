@@ -1848,6 +1848,32 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let augment_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Augment)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Augment),
+                &source_cache,
+                pricing,
+                sessions::augment::parse_augment_file,
+            )
+        })
+        .collect();
+    let mut augment_seen: HashSet<String> = HashSet::new();
+    for outcome in augment_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut augment_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // Parse Qwen files
     let qwen_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Qwen)
@@ -4362,6 +4388,7 @@ where
         ClientId::OpenCodeReview,
         sessions::opencodereview::parse_opencodereview_file
     );
+    simple_lane!(ClientId::Augment, sessions::augment::parse_augment_file);
     simple_lane!(ClientId::Qwen, sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
     // sibling api_conversation_history.json (which parse_roo_kilo_file reads for
@@ -6213,6 +6240,21 @@ fn parse_local_clients_inner(
     let opencodereview_count = summed_parsed_message_count(&opencodereview_msgs);
     counts.set(ClientId::OpenCodeReview, opencodereview_count);
     messages.extend(opencodereview_msgs);
+
+    let augment_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Augment)
+        .par_iter()
+        .flat_map(|path| sessions::augment::parse_augment_file(path))
+        .collect();
+    let mut augment_seen: HashSet<String> = HashSet::new();
+    let augment_msgs: Vec<ParsedMessage> = augment_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut augment_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let augment_count = summed_parsed_message_count(&augment_msgs);
+    counts.set(ClientId::Augment, augment_count);
+    messages.extend(augment_msgs);
 
     // Parse Qwen JSONL files in parallel
     let qwen_msgs: Vec<ParsedMessage> = scan_result
@@ -22304,5 +22346,71 @@ mod tests {
             2,
             "an old db.sqlite with a newer -wal must survive modified-after pruning"
         );
+    }
+
+    // ---- Augment: a session snapshot copied to a second file counts once ----
+    // Auggie keys every turn as `augment:<sessionId>:req:<requestId>`, so a
+    // second snapshot of the same session (a backup copy, a renamed file) must
+    // collapse in the materialized, streaming and count lanes alike.
+    #[test]
+    #[serial_test::serial]
+    fn test_augment_duplicate_session_snapshot_counts_once_in_every_lane() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let sessions_dir = source_home.path().join(".augment/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session = r#"{
+            "sessionId": "sess-aug",
+            "agentState": { "modelId": "claude-sonnet-4-5" },
+            "chatHistory": [
+                { "completed": true, "finishedAt": "2026-01-15T12:01:00.000Z", "sequenceId": 1,
+                  "exchange": { "request_id": "req-1", "response_nodes": [
+                      { "token_usage": { "input_tokens": 100, "output_tokens": 10,
+                                         "cache_read_input_tokens": 50,
+                                         "cache_creation_input_tokens": 5 } } ] } },
+                { "completed": true, "finishedAt": "2026-01-15T12:02:00.000Z", "sequenceId": 2,
+                  "exchange": { "request_id": "req-2", "response_nodes": [
+                      { "token_usage": { "input_tokens": 200, "output_tokens": 20 } } ] } }
+            ]
+        }"#;
+        std::fs::write(sessions_dir.join("sess-aug.json"), session).unwrap();
+        std::fs::write(sessions_dir.join("sess-aug-copy.json"), session).unwrap();
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["augment".to_string()];
+
+        let shape = |messages: &[UnifiedMessage]| {
+            let mut shape: Vec<_> = messages
+                .iter()
+                .map(|m| (m.dedup_key.clone(), m.timestamp, m.tokens.clone()))
+                .collect();
+            shape.sort_by(|a, b| a.0.cmp(&b.0));
+            shape
+        };
+
+        let materialized = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(materialized.len(), 2, "the copied snapshot must collapse");
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert_eq!(shape(&streamed), shape(&materialized));
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Augment), 2);
+        assert_eq!(counted.messages.len(), 2);
     }
 }
