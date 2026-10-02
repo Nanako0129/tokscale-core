@@ -934,6 +934,8 @@ fn parser_version(client: ClientId) -> u32 {
         // explicit arm so the next ZCode parser change has a local counter
         // to increment instead of sharing the default.
         ClientId::Zcode => 1,
+        // 1: Augment's session-snapshot parser (upstream `parse_augment_file`).
+        ClientId::Augment => 1,
         _ => 1,
     }
 }
