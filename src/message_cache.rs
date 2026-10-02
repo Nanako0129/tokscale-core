@@ -936,6 +936,10 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Zcode => 1,
         // 1: Augment's session-snapshot parser (upstream `parse_augment_file`).
         ClientId::Augment => 1,
+        // 1: Muse Code's session parser (upstream `parse_muse_file` at
+        // `fe72e1f9`, which already carries #1355's provider metadata;
+        // upstream's own counter is 3 — vendor-local numbering).
+        ClientId::Muse => 1,
         // 2: CLI sessions carrying Kiro credits now hold a provider-reported
         // cost, and IDE turns take their request count from `requestIds`
         // (upstream #1342, credits and message_count only; token counts

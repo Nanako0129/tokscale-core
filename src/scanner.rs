@@ -467,6 +467,9 @@ fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
                 "kiro-ide-session" => is_kiro_ide_session_artifact(root_path, path),
                 "sessions.json" => file_name == "sessions.json",
                 "wire.jsonl" => file_name == "wire.jsonl",
+                // Muse Code: one `session.jsonl` per session directory at any
+                // depth under `muse/sessions/`, including `subagent/<uuid>/`.
+                "session.jsonl" => file_name == "session.jsonl",
                 "events.jsonl" => file_name == "events.jsonl",
                 // Grok Build ACP session updates and unified inference log.
                 "updates.jsonl" => file_name == "updates.jsonl",
@@ -2537,6 +2540,19 @@ mod tests {
         let mut file = File::create(kimi_session.join("wire.jsonl")).unwrap();
         file.write_all(b"{\"type\": \"metadata\", \"protocol_version\": \"1.3\"}\n")
             .unwrap();
+    }
+
+    fn setup_mock_muse_dir(base: &std::path::Path) {
+        // Mirror the real layout: ~/.local/share/muse/sessions/YYYY/MM/DD/<uuid>/
+        // with a subagent transcript nested beside the parent session.
+        let session_dir = base.join(".local/share/muse/sessions/2026/09/18/session-fixture");
+        fs::create_dir_all(&session_dir).unwrap();
+        File::create(session_dir.join("session.jsonl")).unwrap();
+        let subagent_dir = session_dir.join("subagent/child-fixture");
+        fs::create_dir_all(&subagent_dir).unwrap();
+        File::create(subagent_dir.join("session.jsonl")).unwrap();
+        File::create(session_dir.join("cli-fixture.log")).unwrap();
+        File::create(session_dir.join("events.jsonl")).unwrap();
     }
 
     fn setup_mock_kimi_code_dir(base: &std::path::Path) -> PathBuf {
@@ -4630,6 +4646,37 @@ mod tests {
 
         let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codex".to_string()]);
         assert_eq!(result.get(ClientId::Codex).len(), 2);
+    }
+
+    /// Ported from upstream `d409ee07`: nested subagent transcripts are found,
+    /// and only files named exactly `session.jsonl` count (a sibling `.log`
+    /// and another `.jsonl` do not).
+    #[test]
+    fn test_scan_all_clients_muse() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_muse_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["muse".to_string()],
+            false,
+        );
+        let files = result.get(ClientId::Muse);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|path| path.ends_with("session.jsonl")));
+        assert!(files.iter().any(|path| path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("session-fixture")));
+        assert!(files.iter().any(|path| path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("child-fixture")));
+        assert!(result.get(ClientId::OpenCode).is_empty());
+        assert!(result.get(ClientId::Claude).is_empty());
     }
 
     #[test]
