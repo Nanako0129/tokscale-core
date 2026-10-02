@@ -1874,6 +1874,33 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // Hindsight: request ids are a stable cross-file dedup key.
+    let hindsight_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Hindsight)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Hindsight),
+                &source_cache,
+                pricing,
+                sessions::hindsight::parse_hindsight_file,
+            )
+        })
+        .collect();
+    let mut hindsight_seen: HashSet<String> = HashSet::new();
+    for outcome in hindsight_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut hindsight_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // Parse Qwen files
     let qwen_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Qwen)
@@ -4389,6 +4416,10 @@ where
         sessions::opencodereview::parse_opencodereview_file
     );
     simple_lane!(ClientId::Augment, sessions::augment::parse_augment_file);
+    simple_lane!(
+        ClientId::Hindsight,
+        sessions::hindsight::parse_hindsight_file
+    );
     simple_lane!(ClientId::Qwen, sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
     // sibling api_conversation_history.json (which parse_roo_kilo_file reads for
@@ -6255,6 +6286,21 @@ fn parse_local_clients_inner(
     let augment_count = summed_parsed_message_count(&augment_msgs);
     counts.set(ClientId::Augment, augment_count);
     messages.extend(augment_msgs);
+
+    let hindsight_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Hindsight)
+        .par_iter()
+        .flat_map(|path| sessions::hindsight::parse_hindsight_file(path))
+        .collect();
+    let mut hindsight_seen: HashSet<String> = HashSet::new();
+    let hindsight_msgs: Vec<ParsedMessage> = hindsight_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut hindsight_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let hindsight_count = summed_parsed_message_count(&hindsight_msgs);
+    counts.set(ClientId::Hindsight, hindsight_count);
+    messages.extend(hindsight_msgs);
 
     // Parse Qwen JSONL files in parallel
     let qwen_msgs: Vec<ParsedMessage> = scan_result
@@ -22682,5 +22728,69 @@ mod tests {
         .unwrap();
         assert_eq!(counted.counts.get(ClientId::Augment), 2);
         assert_eq!(counted.messages.len(), 2);
+    }
+
+    // ---- Hindsight: ledger rows across monthly files, three lanes ----
+    // A row re-synced into a second monthly file shares its request id and
+    // must count once; OpenAI-shape rows must sum to their stated totals.
+    #[test]
+    #[serial_test::serial]
+    fn test_hindsight_ledger_lanes_agree_and_conserve_stated_totals() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let usage_dir = source_home.path().join(".hindsight/usage");
+        std::fs::create_dir_all(&usage_dir).unwrap();
+        let row_a = r#"{"id":"a","trace_id":"t1","provider":"openai","model":"openai/gpt-6-luna","started_at":"2026-09-30T23:59:00+00:00","input_tokens":3939,"output_tokens":620,"cached_tokens":2618,"total_tokens":4559,"bank":"hermes"}"#;
+        let row_b = r#"{"id":"b","trace_id":"t2","provider":"openai","model":"openai/gpt-6-luna","started_at":"2026-10-01T08:26:27+00:00","input_tokens":1000,"output_tokens":100,"cached_tokens":null,"total_tokens":1100,"bank":"hermes"}"#;
+        std::fs::write(usage_dir.join("2026-09.jsonl"), format!("{row_a}\n")).unwrap();
+        std::fs::write(
+            usage_dir.join("2026-10.jsonl"),
+            format!("{row_a}\n{row_b}\n"),
+        )
+        .unwrap();
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["hindsight".to_string()];
+
+        let shape = |messages: &[UnifiedMessage]| {
+            let mut shape: Vec<_> = messages
+                .iter()
+                .map(|m| (m.dedup_key.clone(), m.timestamp, m.tokens.clone()))
+                .collect();
+            shape.sort_by(|a, b| a.0.cmp(&b.0));
+            shape
+        };
+
+        let materialized = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(materialized.len(), 2, "the re-synced row must count once");
+        let total: i64 = materialized.iter().map(|m| m.tokens.total()).sum();
+        assert_eq!(total, 4559 + 1100, "lanes must sum to the stated totals");
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_| true,
+            &mut |message| streamed.push(message.clone()),
+        );
+        assert_eq!(shape(&streamed), shape(&materialized));
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Hindsight), 2);
+        let counted_total: i64 = counted
+            .messages
+            .iter()
+            .map(|m| m.input + m.output + m.cache_read + m.cache_write + m.reasoning)
+            .sum();
+        assert_eq!(counted_total, 4559 + 1100);
     }
 }

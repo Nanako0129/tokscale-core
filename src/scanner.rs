@@ -4856,6 +4856,57 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_scan_all_clients_discovers_hindsight_usage_files() {
+        let mut env = EnvGuard::capture(&["HINDSIGHT_HOME"]);
+        env.remove("HINDSIGHT_HOME");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let usage_root = home.join(".hindsight/usage");
+        fs::create_dir_all(&usage_root).unwrap();
+        let expected = usage_root.join("2026-09.jsonl");
+        File::create(&expected).unwrap();
+        File::create(usage_root.join("ignore.txt")).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["hindsight".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            result.get(ClientId::Hindsight).as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(result.total_files(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_honors_hindsight_home() {
+        let dir = TempDir::new().unwrap();
+        let custom_root = dir.path().join("custom-hindsight");
+        let usage_root = custom_root.join("usage");
+        fs::create_dir_all(&usage_root).unwrap();
+        let expected = usage_root.join("2026-09.jsonl");
+        File::create(&expected).unwrap();
+        let mut env = EnvGuard::capture(&["HINDSIGHT_HOME"]);
+        env.set("HINDSIGHT_HOME", custom_root.to_str().unwrap());
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["hindsight".to_string()],
+            true,
+        );
+
+        assert_eq!(
+            result.get(ClientId::Hindsight).as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(result.total_files(), 1);
+    }
+
+    #[test]
     fn test_scan_all_clients_discovers_zcode_v2_sqlite() {
         let dir = TempDir::new().unwrap();
         let home = dir.path().to_path_buf();
