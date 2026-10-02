@@ -440,6 +440,13 @@ impl PricingLookup {
             if let Some(result) = guarded_custom(lower_ref) {
                 return Some(result);
             }
+            // A Cursor-specific alias names a Cursor tier, so it prices from
+            // the Cursor catalog even when an upstream row shares the target.
+            if force_source.is_none() && aliases::uses_cursor_pricing(raw_ref) {
+                if let Some(result) = self.exact_match_cursor(lower_ref) {
+                    return Some(result);
+                }
+            }
         }
         let routed_terminal = strip_generic_provider_prefix(raw_ref);
         let unknown_router_path = routed_terminal.is_some() && !has_known_provider_prefix(raw_ref);
@@ -4725,6 +4732,30 @@ mod tests {
             routed.pricing.cache_creation_input_token_cost,
             direct.pricing.cache_creation_input_token_cost
         );
+    }
+
+    #[test]
+    fn cursor_specific_aliases_explicitly_select_cursor_pricing() {
+        // `cursor-grok-4.6-*` names a Cursor tier; an upstream row for the
+        // shared target `grok-4.6` must not take it over.
+        let pricing = |input: f64| ModelPricing {
+            input_cost_per_token: Some(input),
+            ..Default::default()
+        };
+        let mut cursor = HashMap::new();
+        cursor.insert("grok-4.6".into(), pricing(2e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("x-ai/grok-4.6".into(), pricing(1e-6));
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, cursor);
+
+        let result = lookup
+            .lookup("cursor-grok-4.6-high")
+            .expect("the Cursor tier alias must price");
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "grok-4.6");
+
+        // The bare id is not a Cursor alias and keeps upstream precedence.
+        assert_eq!(lookup.lookup("grok-4.6").unwrap().source, "OpenRouter");
     }
 
     #[test]
