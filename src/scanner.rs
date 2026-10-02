@@ -834,6 +834,62 @@ fn discover_crush_dbs(home_dir: &str, use_env_roots: bool) -> Vec<CrushDbSource>
     dbs
 }
 
+/// Kimi Work (Kimi Desktop's embedded daimon runtime) keeps Kimi Code
+/// `wire.jsonl` sessions under the desktop app-data tree (upstream #1170).
+const KIMI_WORK_SUFFIX: &str = "kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions";
+
+/// Join a `/`-separated relative path one component at a time, so the result
+/// uses native separators on every platform.
+fn join_segments(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .fold(root.to_path_buf(), |path, segment| path.join(segment))
+}
+
+/// Kimi Desktop's optional relocated Work share directory, read from
+/// `<app-data>/kimi-desktop/daimon-storage.json`'s `shareDir`.
+fn kimi_work_share_dir_root(app_data: &Path) -> Option<PathBuf> {
+    let content =
+        std::fs::read_to_string(app_data.join("kimi-desktop").join("daimon-storage.json")).ok()?;
+    let config: Value = serde_json::from_str(&content).ok()?;
+    let share_dir = config.get("shareDir")?.as_str()?;
+    if share_dir.trim().is_empty() {
+        return None;
+    }
+    Some(join_segments(
+        Path::new(share_dir),
+        "daimon/runtime/kimi-code/home/sessions",
+    ))
+}
+
+/// Candidate Kimi Work session roots. There is no Work build for Linux. macOS
+/// uses the home's app-data root. Windows always includes the home-relative
+/// root, plus — when environment roots are enabled and `app_data` is given —
+/// the relocated `shareDir` if one is configured, else `<app_data>`'s root.
+fn kimi_work_roots(home_dir: &Path, app_data: Option<&Path>) -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return vec![join_segments(
+            &home_dir.join("Library").join("Application Support"),
+            KIMI_WORK_SUFFIX,
+        )];
+    }
+    if cfg!(target_os = "windows") {
+        let mut roots = vec![join_segments(
+            &home_dir.join("AppData").join("Roaming"),
+            KIMI_WORK_SUFFIX,
+        )];
+        if let Some(app_data) = app_data {
+            roots.push(
+                kimi_work_share_dir_root(app_data)
+                    .unwrap_or_else(|| join_segments(app_data, KIMI_WORK_SUFFIX)),
+            );
+        }
+        return roots;
+    }
+    Vec::new()
+}
+
 fn cline_additional_vscode_task_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from(home_dir)
         .join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks")];
@@ -1159,6 +1215,14 @@ fn scan_all_clients_resolved_inner(
             home.join("sessions"),
             ClientId::Kimi.data().pattern,
         );
+        let app_data = if cfg!(target_os = "windows") && use_env_roots {
+            context.source_env_path("APPDATA")
+        } else {
+            None
+        };
+        for root in kimi_work_roots(home_dir, app_data) {
+            push(ClientId::Kimi, root, ClientId::Kimi.data().pattern);
+        }
     }
 
     let mut grok_unified_paths = Vec::new();
@@ -1555,6 +1619,16 @@ fn scan_all_clients_with_env_strategy_inner(
             ClientId::Kimi,
             format!("{}/sessions", kimi_code_home),
         );
+        let app_data = if cfg!(target_os = "windows") && use_env_roots {
+            std::env::var_os("APPDATA")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        } else {
+            None
+        };
+        for root in kimi_work_roots(Path::new(home_dir), app_data.as_deref()) {
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Kimi, root);
+        }
     }
 
     let mut grok_unified_paths = Vec::new();
@@ -4583,6 +4657,138 @@ mod tests {
         assert!(result.get(ClientId::Claude).is_empty());
     }
 
+    /// Kimi Work lays sessions out under the desktop app-data root exactly like
+    /// Kimi Code: `<work-root>/wd_<workspace>_<hash>/<conv-*|ctitle-*>/agents/main/wire.jsonl`.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn kimi_work_test_wire(home: &std::path::Path, session_id: &str) -> PathBuf {
+        let app_data = if cfg!(target_os = "macos") {
+            home.join("Library").join("Application Support")
+        } else {
+            home.join("AppData").join("Roaming")
+        };
+        kimi_work_wire_from_root(&app_data, session_id)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn kimi_work_wire_from_root(app_data: &std::path::Path, session_id: &str) -> PathBuf {
+        super::join_segments(
+            app_data,
+            &format!(
+                "{KIMI_WORK_SUFFIX}/wd_workspace_c107cac82a87/{session_id}/agents/main/wire.jsonl"
+            ),
+        )
+    }
+
+    /// Ported from upstream #1170: conversation and title-generation sessions
+    /// under the Work root are both discovered as Kimi.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn test_scan_all_clients_kimi_work_discovers_conv_and_ctitle_sessions() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let conv = kimi_work_test_wire(home, "conv-4e171339d10b9954d0fc24da");
+        let ctitle = kimi_work_test_wire(home, "ctitle-01a01fe5-e170-765c-a1b3-c4daad0cda13");
+        for path in [&conv, &ctitle] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            File::create(path).unwrap();
+        }
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
+        let kimi_files = result.get(ClientId::Kimi);
+        assert_eq!(kimi_files.len(), 2);
+        assert!(kimi_files.contains(&conv));
+        assert!(kimi_files.contains(&ctitle));
+    }
+
+    /// Ported from upstream #1170: the home-relative Work root is always
+    /// scanned; the `%APPDATA%` root (or its relocated `shareDir`) only when
+    /// environment roots are enabled.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "windows")]
+    fn test_scan_all_clients_kimi_work_respects_env_roots() {
+        let mut env = EnvGuard::capture(&[
+            "APPDATA",
+            "KIMI_CODE_HOME",
+            "TOKSCALE_EXTRA_DIRS",
+            "TOKSCALE_HEADLESS_DIR",
+        ]);
+        env.remove("KIMI_CODE_HOME");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        env.remove("TOKSCALE_HEADLESS_DIR");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let work_literal = kimi_work_test_wire(&home, "conv-session-work-1");
+        fs::create_dir_all(work_literal.parent().unwrap()).unwrap();
+        File::create(&work_literal).unwrap();
+
+        let app_data = dir.path().join("conflicting-appdata");
+        let app_data_wire = kimi_work_wire_from_root(&app_data, "ctitle-session-work-2");
+        fs::create_dir_all(app_data_wire.parent().unwrap()).unwrap();
+        File::create(&app_data_wire).unwrap();
+        env.set("APPDATA", &app_data);
+
+        let scan = |use_env_roots| {
+            scan_all_clients_with_env_strategy(
+                home.to_str().unwrap(),
+                &["kimi".to_string()],
+                use_env_roots,
+            )
+            .get(ClientId::Kimi)
+            .to_vec()
+        };
+        assert_eq!(scan(false), vec![work_literal.clone()]);
+        let with_env = scan(true);
+        assert_eq!(with_env.len(), 2);
+        assert!(with_env.contains(&work_literal));
+        assert!(with_env.contains(&app_data_wire));
+
+        let share_dir = dir.path().join("custom-share");
+        let config_path = app_data.join("kimi-desktop").join("daimon-storage.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({"shareDir": share_dir.to_string_lossy()}).to_string(),
+        )
+        .unwrap();
+        let configured_wire = super::join_segments(
+            &share_dir,
+            "daimon/runtime/kimi-code/home/sessions/wd_workspace_c107cac82a87/conv-configured-share/agents/main/wire.jsonl",
+        );
+        fs::create_dir_all(configured_wire.parent().unwrap()).unwrap();
+        File::create(&configured_wire).unwrap();
+
+        let relocated = scan(true);
+        assert_eq!(relocated.len(), 2);
+        assert!(relocated.contains(&work_literal));
+        assert!(relocated.contains(&configured_wire));
+        assert!(!relocated.contains(&app_data_wire));
+    }
+
+    /// Ported from upstream #1170: there is no Work build for Linux, so a
+    /// similarly named tree under a Linux home is not scanned.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_all_clients_kimi_work_is_not_discovered_on_linux() {
+        let dir = TempDir::new().unwrap();
+        let wire = super::join_segments(
+            &dir.path().join("Library/Application Support"),
+            &format!("{KIMI_WORK_SUFFIX}/wd_workspace_c107cac82a87/conv-linux-session/agents/main/wire.jsonl"),
+        );
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        File::create(&wire).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
+        assert!(result.get(ClientId::Kimi).is_empty());
+    }
+
     #[test]
     #[serial]
     fn test_scan_all_clients_kimi_code_home_obeys_env_strategy() {
@@ -4596,7 +4802,8 @@ mod tests {
         fs::create_dir_all(override_wire.parent().unwrap()).unwrap();
         File::create(&override_wire).unwrap();
 
-        let mut env = EnvGuard::capture(&["KIMI_CODE_HOME"]);
+        let mut env = EnvGuard::capture(&["KIMI_CODE_HOME", "APPDATA"]);
+        env.remove("APPDATA");
         env.set("KIMI_CODE_HOME", &override_home);
         let with_env =
             scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["kimi".to_string()], true);

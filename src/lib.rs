@@ -12091,6 +12091,127 @@ mod tests {
         assert_eq!(streamed[0].tokens.input, 100);
     }
 
+    // Kimi Work (upstream #1170) is a second Kimi Code root, not a new client.
+    // The same session reachable from both the Kimi Code and the Work root
+    // must count once on every lane, through both the legacy scan and the
+    // source-context scan; a Work-only session still counts.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn test_kimi_work_and_kimi_code_copies_count_once_on_every_lane() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let app_data = if cfg!(target_os = "macos") {
+            source_home
+                .path()
+                .join("Library")
+                .join("Application Support")
+        } else {
+            source_home.path().join("AppData").join("Roaming")
+        };
+        let work_sessions = app_data
+            .join("kimi-desktop")
+            .join("daimon-share")
+            .join("daimon")
+            .join("runtime")
+            .join("kimi-code")
+            .join("home")
+            .join("sessions");
+        let code_sessions = source_home.path().join(".kimi-code").join("sessions");
+        let wire = |root: &Path, session: &str, input: i64| {
+            let path = root
+                .join("wd_workspace_c107cac82a87")
+                .join(session)
+                .join("agents")
+                .join("main")
+                .join("wire.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"type":"usage.record","model":"k2d6-agent","usage":{{"inputOther":{input},"output":10,"inputCacheRead":20,"inputCacheCreation":0}},"usageScope":"turn","time":1780319377010}}"#
+                ),
+            )
+            .unwrap();
+        };
+        wire(&code_sessions, "conv-shared", 100);
+        wire(&work_sessions, "conv-shared", 100);
+        wire(&work_sessions, "conv-work-only", 7);
+
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["kimi".to_string()];
+        let inputs = |mut values: Vec<i64>| {
+            values.sort_unstable();
+            values
+        };
+        let expected = vec![7, 100];
+
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_eq!(
+            inputs(materialized.iter().map(|m| m.tokens.input).collect()),
+            expected
+        );
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+        );
+        assert_eq!(
+            inputs(streamed.iter().map(|m| m.tokens.input).collect()),
+            expected
+        );
+
+        let local_options = || LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            ..Default::default()
+        };
+        let counted = parse_local_clients(local_options()).unwrap();
+        assert_eq!(counted.counts.get(ClientId::Kimi), 2);
+        assert_eq!(
+            inputs(counted.messages.iter().map(|m| m.input).collect()),
+            expected
+        );
+
+        let context = ResolvedLocalSourceContext::capture(
+            Some(source_home.path().to_path_buf()),
+            false,
+            scanner::ScannerSettings::default(),
+        )
+        .unwrap();
+        let in_context = parse_local_clients_with_source_context(
+            &context,
+            LocalParseOptions {
+                home_dir: None,
+                ..local_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(in_context.counts.get(ClientId::Kimi), 2);
+        assert_eq!(
+            inputs(in_context.messages.iter().map(|m| m.input).collect()),
+            expected
+        );
+    }
+
     // Upstream #1134 recovers BOM-prefixed Pi transcripts without a Pi
     // `parser_version` bump. That holds only because a zero-message parse is
     // never cached (`load_or_parse_source` builds no entry for it, and an
