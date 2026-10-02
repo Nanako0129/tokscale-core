@@ -99,6 +99,14 @@ pub fn parse_hindsight_file(path: &Path) -> Vec<UnifiedMessage> {
                 .ok()?
                 .timestamp_millis();
 
+            // The module doc promises rows with empty identities are skipped;
+            // upstream's code never checked. A blank id would give every such
+            // row the same `hindsight:` dedup key, so first-wins dedup would
+            // keep one and silently drop the rest.
+            if record.id.trim().is_empty() {
+                return None;
+            }
+
             let session_id = record
                 .trace_id
                 .filter(|t| !t.trim().is_empty())
@@ -421,5 +429,26 @@ mod tests {
             (oversized.tokens.input, oversized.tokens.cache_read),
             (30, 40)
         );
+    }
+
+    #[test]
+    fn blank_ids_are_skipped_not_collapsed_into_one_key() {
+        let mut file = NamedTempFile::new().unwrap();
+        for input in [100, 200, 300] {
+            writeln!(
+                file,
+                r#"{{"id":"  ","provider":"p","model":"m","started_at":"2026-10-01T08:26:27+00:00","input_tokens":{input},"output_tokens":1,"total_tokens":{}}}"#,
+                input + 1
+            )
+            .unwrap();
+        }
+        writeln!(
+            file,
+            r#"{{"id":"kept","provider":"p","model":"m","started_at":"2026-10-01T08:26:27+00:00","input_tokens":5,"output_tokens":1,"total_tokens":6}}"#
+        )
+        .unwrap();
+        let messages = parse_hindsight_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].dedup_key.as_deref(), Some("hindsight:kept"));
     }
 }
