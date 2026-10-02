@@ -20758,6 +20758,155 @@ mod tests {
         }
     }
 
+    // Upstream #1342, credits half: Kiro credits become a provider-reported
+    // cost that token pricing must neither replace nor add to on the
+    // materialized and streaming lanes -- for the credited turn and for an
+    // uncredited turn of the same conversation -- from both the CLI files and
+    // the SQLite database. The count lane carries no cost; it reports summed
+    // request counts. A v1 cache entry of the unchanged CLI file (cost 0,
+    // request count 1) must be re-parsed, not replayed; the SQLite source is
+    // never cached.
+    #[test]
+    #[serial_test::serial]
+    fn kiro_credit_cost_survives_pricing_and_replaces_a_v1_entry() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let cli_dir = source_home.path().join(".kiro/sessions/cli");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::write(
+            cli_dir.join("credited.json"),
+            r#"{"session_id":"credited","cwd":"/tmp/project","session_state":{"rts_model_state":{"model_info":{"model_id":"claude-sonnet-4-5","context_window_tokens":1000}},"conversation_metadata":{"user_turn_metadatas":[{"input_token_count":0,"output_token_count":0,"total_request_count":3,"message_ids":["a-1"],"context_usage_percentage":10.0,"metering_usage":[{"value":0.25,"unit":"credit"}]},{"input_token_count":0,"output_token_count":0,"message_ids":["a-2"]}]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli_dir.join("credited.jsonl"),
+            concat!(
+                r#"{"version":"v1","kind":"Prompt","data":{"message_id":"p-1","content":[{"kind":"text","data":"hello"}],"meta":{"timestamp":1770983426.0}}}"#,
+                "\n",
+                r#"{"version":"v1","kind":"AssistantMessage","data":{"message_id":"a-1","content":[{"kind":"text","data":"response text"}]}}"#,
+                "\n",
+                r#"{"version":"v1","kind":"Prompt","data":{"message_id":"p-2","content":[{"kind":"text","data":"more"}],"meta":{"timestamp":1770983500.0}}}"#,
+                "\n",
+                r#"{"version":"v1","kind":"AssistantMessage","data":{"message_id":"a-2","content":[{"kind":"text","data":"done"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let db_dir = source_home.path().join(".local/share/kiro-cli");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let connection = rusqlite::Connection::open(db_dir.join("data.sqlite3")).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE conversations_v2 (key TEXT, conversation_id TEXT, value TEXT)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO conversations_v2 (key, conversation_id, value) VALUES (?1, ?2, ?3)",
+                (
+                    "/tmp/project",
+                    "conv-1",
+                    r#"{"model_info":{"model_id":"claude-sonnet-4-5","context_window_tokens":1000},"user_turn_metadata":{"usage_info":[{"value":0.5,"unit":"credit"}]},"history":[{"request_metadata":{"context_usage_percentage":10,"response_size":40,"request_start_timestamp_ms":1770983426000,"request_count":2}},{"request_metadata":{"response_size":8,"request_start_timestamp_ms":1770983428000}}]}"#,
+                ),
+            )
+            .unwrap();
+        drop(connection);
+        let mut pricing_data = HashMap::new();
+        pricing_data.insert(
+            "claude-sonnet-4-5".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1.0),
+                output_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let pricing_service = pricing::PricingService::new(pricing_data, HashMap::new());
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["kiro".to_string()];
+        let materialized = || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                home,
+                &clients,
+                Some(&pricing_service),
+                false,
+                &scanner::ScannerSettings::default(),
+                None,
+            )
+        };
+        let streamed = || {
+            let mut streamed = Vec::new();
+            scan_messages_streaming(
+                home,
+                &clients,
+                Some(&pricing_service),
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |message| streamed.push(message.clone()),
+            );
+            streamed
+        };
+        let assert_credit = |mut messages: Vec<UnifiedMessage>, lane: &str| {
+            messages.sort_by(|a, b| a.dedup_key.cmp(&b.dedup_key));
+            let view: Vec<_> = messages
+                .iter()
+                .map(|m| {
+                    (
+                        m.dedup_key.clone().unwrap(),
+                        m.cost,
+                        m.has_authoritative_cost(),
+                        m.message_count,
+                        m.tokens.input,
+                        m.tokens.output,
+                    )
+                })
+                .collect();
+            // Token pricing would give each message (input + output) * 1.0.
+            assert_eq!(
+                view,
+                vec![
+                    ("conv-1:0".to_string(), 0.5 * 0.04, true, 2, 100, 10),
+                    ("conv-1:1".to_string(), 0.0, true, 1, 0, 2),
+                    ("credited:0".to_string(), 0.25 * 0.04, true, 3, 100, 4),
+                    ("credited:1".to_string(), 0.0, true, 1, 1, 1),
+                ],
+                "{lane}"
+            );
+        };
+
+        assert_credit(materialized(), "materialized, cold");
+        assert_credit(streamed(), "streaming, warm");
+        let counted = parse_local_clients(m15a_local_options(source_home.path())).unwrap();
+        assert_eq!(counted.counts.get(ClientId::Kiro), 3 + 1 + 2 + 1);
+
+        // What a v1 build cached for the same, unchanged CLI file.
+        let plant_v1_entry = || {
+            let identity = message_cache::CacheIdentity::for_client(ClientId::Kiro);
+            let mut cache = message_cache::SourceMessageCache::load();
+            assert_eq!(cache.entries.len(), 1, "only the CLI file is cached");
+            let mut entry = cache.entries.values().next().unwrap().clone();
+            for message in entry.messages.iter_mut() {
+                message.cost = 0.0;
+                message.cost_source = sessions::CostSource::Unknown;
+                message.message_count = 1;
+            }
+            cache.insert(entry);
+            cache.save_if_dirty();
+            message_cache::set_shard_parser_version_for_test(identity, 1);
+        };
+
+        plant_v1_entry();
+        assert_credit(streamed(), "streaming over a v1 entry");
+        plant_v1_entry();
+        assert_credit(materialized(), "materialized over a v1 entry");
+    }
+
     fn m15a_report_options(home: &Path) -> ReportOptions {
         ReportOptions {
             home_dir: Some(home.to_string_lossy().into_owned()),

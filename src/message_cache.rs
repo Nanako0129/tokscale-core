@@ -936,6 +936,14 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Zcode => 1,
         // 1: Augment's session-snapshot parser (upstream `parse_augment_file`).
         ClientId::Augment => 1,
+        // 2: CLI sessions carrying Kiro credits now hold a provider-reported
+        // cost, and IDE turns take their request count from `requestIds`
+        // (upstream #1342, credits and message_count only; token counts
+        // unchanged). A finished session's files never change again, so
+        // without the bump its v1 entry would keep cost 0 and message_count 1
+        // forever. The SQLite source gets the same changes but is parsed on
+        // every scan, never cached. Vendor-local numbering.
+        ClientId::Kiro => 2,
         _ => 1,
     }
 }
@@ -5810,6 +5818,9 @@ mod tests {
         // 2 is the transcript-weighted per-reply attribution split (vendor-local
         // numbering; never upstream's 7 — see UPSTREAM.md).
         assert_eq!(parser_version(ClientId::Droid), 2);
+        // 2 carries Kiro credits as provider-reported cost and source request
+        // counts (#1342, credits half).
+        assert_eq!(parser_version(ClientId::Kiro), 2);
         assert_eq!(CacheIdentity::synthetic().parser_version, 1);
         for client in ClientId::iter() {
             if !matches!(
@@ -5830,6 +5841,7 @@ mod tests {
                     | ClientId::Cline
                     | ClientId::Pi
                     | ClientId::Droid
+                    | ClientId::Kiro
             ) {
                 assert_eq!(
                     parser_version(client),
