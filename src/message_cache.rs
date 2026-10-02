@@ -57,6 +57,19 @@ thread_local! {
 #[cfg(test)]
 static RETAINED_SHARD_DECODE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Namespaces a lazy cache tried to read on this thread, in order.
+    static NAMESPACE_READS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drains this thread's lazy namespace-read log.
+#[cfg(test)]
+pub(crate) fn take_namespace_reads() -> Vec<&'static str> {
+    NAMESPACE_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+}
+
 fn cache_dir() -> Option<PathBuf> {
     if crate::paths::is_config_dir_overridden()
         || dirs::config_dir().is_some()
@@ -1473,13 +1486,115 @@ pub(crate) struct SourceMessageCache {
     rewrite_shards: HashSet<CacheShardKey>,
     cache_root: Option<PathBuf>,
     cache_root_is_resolved: bool,
+    /// Set by [`Self::open`]: namespaces are read on first use through
+    /// [`Self::ensure_namespace_loaded`] instead of all at construction.
+    lazy: bool,
+    /// Namespaces already read (or attempted, so a failing read is not
+    /// retried per file) by a lazy cache.
+    loaded_namespaces: HashSet<&'static str>,
 }
 
 impl SourceMessageCache {
+    /// A lazy cache for the streaming report path: reads no shard here.
+    ///
+    /// Each lane calls [`Self::ensure_namespace_loaded`] before its first
+    /// lookup and [`Self::release_clean_namespace`] after its last, so a scan
+    /// holds only the namespaces it is still reading, not every namespace the
+    /// machine has cached (local patch modelled on upstream #1108).
+    pub(crate) fn open() -> Self {
+        Self::open_with_root(cache_dir(), false)
+    }
+
+    pub(crate) fn open_from_root(cache_root: Option<&Path>) -> Self {
+        Self::open_with_root(cache_root.map(Path::to_path_buf), true)
+    }
+
+    fn open_with_root(cache_root: Option<PathBuf>, cache_root_is_resolved: bool) -> Self {
+        Self {
+            cache_root,
+            cache_root_is_resolved,
+            lazy: true,
+            ..Self::default()
+        }
+    }
+
+    /// Reads `identity`'s namespace the first time a lazy cache needs it, then
+    /// prunes that namespace's entries whose source is gone. A no-op for an
+    /// eager cache, which [`Self::load`] already filled.
+    pub(crate) fn ensure_namespace_loaded(&mut self, identity: CacheIdentity) {
+        if !self.lazy || !self.loaded_namespaces.insert(identity.namespace) {
+            return;
+        }
+        #[cfg(test)]
+        NAMESPACE_READS.with(|reads| reads.borrow_mut().push(identity.namespace));
+        let Some(root) = self.cache_root.clone() else {
+            return;
+        };
+        let shard_root = root.join(CACHE_SHARD_DIRNAME);
+        let lock_path = root.join(CACHE_LOCK_FILENAME);
+        if let Err(error) = ensure_cache_dir(&shard_root) {
+            warn_cache_failure_once(
+                "source message cache directory is unavailable",
+                &shard_root,
+                &error,
+            );
+            return;
+        }
+        let lock_file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                warn_cache_failure_once(
+                    "source message cache lock is unavailable",
+                    &lock_path,
+                    &error,
+                );
+                return;
+            }
+        };
+        if let Err(error) = fs2::FileExt::lock_shared(&lock_file) {
+            warn_cache_failure_once("source message cache lock failed", &lock_path, &error);
+            return;
+        }
+        self.read_namespace(&shard_root, identity, MAX_CACHE_SHARD_BYTES);
+        drop(lock_file);
+        self.prune_missing_files_in(Some(identity.namespace));
+    }
+
+    /// Drops a lazy cache's clean entries for `identity`'s namespace once its
+    /// lane has finished. Dirty entries stay for `save_if_dirty`, which re-reads
+    /// every shard it rewrites from disk, so nothing clean is needed again. A
+    /// namespace that retains history (Claude) is never released: its entries
+    /// can hold the only copy of turns the live file no longer has.
+    pub(crate) fn release_clean_namespace(&mut self, identity: CacheIdentity) {
+        if !self.lazy || retained_history_key_filter(identity.namespace).is_some() {
+            return;
+        }
+        let dirty_keys = &self.dirty_keys;
+        self.entries
+            .retain(|key, _| key.namespace != identity.namespace || dirty_keys.contains(key));
+    }
+
+    /// A lookup in a lazy cache before its namespace was loaded would read
+    /// nothing and silently fall back to a cold re-parse.
+    fn debug_assert_loaded(&self, identity: CacheIdentity) {
+        debug_assert!(
+            !self.lazy || self.loaded_namespaces.contains(identity.namespace),
+            "namespace {} looked up before ensure_namespace_loaded",
+            identity.namespace
+        );
+    }
+
     pub(crate) fn load() -> Self {
         Self::load_with_root_and_limit(cache_dir(), MAX_CACHE_SHARD_BYTES, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn load_from_root(cache_root: Option<&Path>) -> Self {
         Self::load_with_root_and_limit(
             cache_root.map(Path::to_path_buf),
@@ -1548,64 +1663,69 @@ impl SourceMessageCache {
             ..Self::default()
         };
         for identity in CacheIdentity::all() {
-            let parser_dir = shard_root.join(identity.namespace);
-            let read_dir = match fs::read_dir(&parser_dir) {
-                Ok(read_dir) => read_dir,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    warn_cache_failure_once(
-                        "source message cache parser directory is unreadable",
-                        &parser_dir,
-                        &error,
-                    );
-                    continue;
-                }
-            };
-
-            for dir_entry in read_dir.filter_map(Result::ok) {
-                let Some(index) = parse_shard_filename(&dir_entry.file_name()) else {
-                    continue;
-                };
-                let shard_key = CacheShardKey {
-                    namespace: identity.namespace.to_string(),
-                    index,
-                };
-                let path = dir_entry.path();
-                match read_shard_with_limit(&path, identity, max_shard_bytes) {
-                    ShardReadStatus::Loaded(entries) => {
-                        for entry in entries {
-                            let key = CacheKey::from_entry(&entry);
-                            // A migratable entry is kept: `get` hides it from
-                            // readers that want a whole source, and it holds
-                            // the only copy of turns compaction took out of
-                            // the file. Keeping it leaves the shard clean.
-                            if key.shard() == shard_key
-                                && (entry.identity_is_current() || entry.is_migratable())
-                            {
-                                cache.entries.insert(key, entry);
-                            } else {
-                                cache.rewrite_shards.insert(shard_key.clone());
-                            }
-                        }
-                    }
-                    ShardReadStatus::Missing => {}
-                    ShardReadStatus::Stale => {
-                        cache.rewrite_shards.insert(shard_key);
-                    }
-                    ShardReadStatus::Invalid(error) => {
-                        warn_cache_failure_once(
-                            "source message cache shard is invalid",
-                            &path,
-                            &error,
-                        );
-                        cache.rewrite_shards.insert(shard_key);
-                    }
-                }
-            }
+            cache.read_namespace(&shard_root, identity, max_shard_bytes);
         }
 
         cache.dirty = !cache.rewrite_shards.is_empty();
         cache
+    }
+
+    /// Reads one namespace's shards into `entries`; the caller holds the shared
+    /// cache lock. Shared by the eager [`Self::load`] and the lazy
+    /// [`Self::ensure_namespace_loaded`] so both admit exactly the same
+    /// entries (current or migratable).
+    fn read_namespace(&mut self, shard_root: &Path, identity: CacheIdentity, max_shard_bytes: u64) {
+        let parser_dir = shard_root.join(identity.namespace);
+        let read_dir = match fs::read_dir(&parser_dir) {
+            Ok(read_dir) => read_dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                warn_cache_failure_once(
+                    "source message cache parser directory is unreadable",
+                    &parser_dir,
+                    &error,
+                );
+                return;
+            }
+        };
+
+        for dir_entry in read_dir.filter_map(Result::ok) {
+            let Some(index) = parse_shard_filename(&dir_entry.file_name()) else {
+                continue;
+            };
+            let shard_key = CacheShardKey {
+                namespace: identity.namespace.to_string(),
+                index,
+            };
+            let path = dir_entry.path();
+            match read_shard_with_limit(&path, identity, max_shard_bytes) {
+                ShardReadStatus::Loaded(entries) => {
+                    for entry in entries {
+                        let key = CacheKey::from_entry(&entry);
+                        // A migratable entry is kept: `get` hides it from
+                        // readers that want a whole source, and it holds
+                        // the only copy of turns compaction took out of
+                        // the file. Keeping it leaves the shard clean.
+                        if key.shard() == shard_key
+                            && (entry.identity_is_current() || entry.is_migratable())
+                        {
+                            self.entries.insert(key, entry);
+                        } else {
+                            self.rewrite_shards.insert(shard_key.clone());
+                        }
+                    }
+                }
+                ShardReadStatus::Missing => {}
+                ShardReadStatus::Stale => {
+                    self.rewrite_shards.insert(shard_key);
+                }
+                ShardReadStatus::Invalid(error) => {
+                    warn_cache_failure_once("source message cache shard is invalid", &path, &error);
+                    self.rewrite_shards.insert(shard_key);
+                }
+            }
+        }
+        self.dirty |= !self.rewrite_shards.is_empty();
     }
 
     pub(crate) fn insert(&mut self, entry: CachedSourceEntry) {
@@ -1617,6 +1737,7 @@ impl SourceMessageCache {
     }
 
     pub(crate) fn get(&self, identity: CacheIdentity, path: &Path) -> Option<&CachedSourceEntry> {
+        self.debug_assert_loaded(identity);
         let key = CacheKey::new(identity, path);
         self.entries.get(&key).filter(|entry| {
             entry.parser_namespace == identity.namespace
@@ -1633,6 +1754,7 @@ impl SourceMessageCache {
         identity: CacheIdentity,
         path: &Path,
     ) -> &[UnifiedMessage] {
+        self.debug_assert_loaded(identity);
         // No version filter: `load` admits only current-or-migratable entries
         // and `insert` builds current ones.
         self.entries
@@ -1651,9 +1773,15 @@ impl SourceMessageCache {
     }
 
     pub(crate) fn prune_missing_files(&mut self) {
+        self.prune_missing_files_in(None);
+    }
+
+    /// Prunes entries whose source is gone, in one namespace or (`None`) all.
+    fn prune_missing_files_in(&mut self, namespace: Option<&str>) {
         let removed_keys: Vec<CacheKey> = self
             .entries
             .keys()
+            .filter(|key| namespace.is_none_or(|namespace| key.namespace == namespace))
             .filter(|key| !key.path.to_path_buf().exists())
             .cloned()
             .collect();
@@ -6037,5 +6165,167 @@ mod tests {
         let cached_path = CachedPath::from_path(&path);
 
         assert_eq!(cached_path.to_path_buf(), path);
+    }
+
+    fn lazy_fixture(
+        source_dir: &TempDir,
+    ) -> (
+        CacheIdentity,
+        PathBuf,
+        CacheIdentity,
+        PathBuf,
+        CacheIdentity,
+        PathBuf,
+    ) {
+        let cursor = CacheIdentity::for_client(ClientId::Cursor);
+        let codex = CacheIdentity::for_client(ClientId::Codex);
+        let claude = CacheIdentity::for_client(ClientId::Claude);
+        let cursor_path = source_dir.path().join("cursor.csv");
+        let codex_path = source_dir.path().join("codex.jsonl");
+        let claude_path = source_dir.path().join("claude.jsonl");
+        for path in [&cursor_path, &codex_path, &claude_path] {
+            std::fs::write(path, b"x\n").unwrap();
+        }
+        let mut seed = SourceMessageCache::default();
+        seed.insert(test_entry(cursor, &cursor_path, "cursor-1"));
+        seed.insert(test_entry(codex, &codex_path, "codex-1"));
+        seed.insert(test_entry(claude, &claude_path, "claude-1"));
+        seed.save_if_dirty();
+        (cursor, cursor_path, codex, codex_path, claude, claude_path)
+    }
+
+    fn namespace_entry_count(cache: &SourceMessageCache, identity: CacheIdentity) -> usize {
+        cache
+            .entries
+            .keys()
+            .filter(|key| key.namespace == identity.namespace)
+            .count()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_cache_reads_only_the_namespaces_it_is_asked_for() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source_dir = TempDir::new().unwrap();
+        let (cursor, cursor_path, codex, _, claude, _) = lazy_fixture(&source_dir);
+        take_namespace_reads();
+
+        let mut lazy = SourceMessageCache::open();
+        assert!(lazy.entries.is_empty(), "open must read no shard");
+        lazy.ensure_namespace_loaded(cursor);
+        lazy.ensure_namespace_loaded(cursor);
+        assert!(lazy.get(cursor, &cursor_path).is_some());
+        assert_eq!(namespace_entry_count(&lazy, codex), 0);
+        assert_eq!(namespace_entry_count(&lazy, claude), 0);
+        assert_eq!(take_namespace_reads(), vec!["cursor"]);
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn released_namespace_drops_clean_entries_and_is_not_read_again() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source_dir = TempDir::new().unwrap();
+        let (cursor, cursor_path, codex, codex_path, _, _) = lazy_fixture(&source_dir);
+
+        let mut lazy = SourceMessageCache::open();
+        lazy.ensure_namespace_loaded(cursor);
+        lazy.ensure_namespace_loaded(codex);
+        lazy.release_clean_namespace(cursor);
+        assert_eq!(namespace_entry_count(&lazy, cursor), 0);
+        // Control: releasing one namespace leaves another alone.
+        assert!(lazy.get(codex, &codex_path).is_some());
+        take_namespace_reads();
+        lazy.ensure_namespace_loaded(cursor);
+        assert!(take_namespace_reads().is_empty());
+        assert!(lazy.get(cursor, &cursor_path).is_none());
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_namespace_is_never_released() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source_dir = TempDir::new().unwrap();
+        let (_, _, _, _, claude, claude_path) = lazy_fixture(&source_dir);
+
+        let mut lazy = SourceMessageCache::open();
+        lazy.ensure_namespace_loaded(claude);
+        lazy.release_clean_namespace(claude);
+        assert!(lazy.get(claude, &claude_path).is_some());
+        assert_eq!(lazy.retainable_history(claude, &claude_path).len(), 1);
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn release_keeps_dirty_entries_for_save() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source_dir = TempDir::new().unwrap();
+        let (cursor, cursor_path, _, _, _, _) = lazy_fixture(&source_dir);
+        let new_path = source_dir.path().join("cursor-new.csv");
+        std::fs::write(&new_path, b"y\n").unwrap();
+
+        let mut lazy = SourceMessageCache::open();
+        lazy.ensure_namespace_loaded(cursor);
+        lazy.insert(test_entry(cursor, &new_path, "cursor-2"));
+        lazy.release_clean_namespace(cursor);
+        assert!(
+            lazy.get(cursor, &new_path).is_some(),
+            "dirty entry released"
+        );
+        assert!(lazy.get(cursor, &cursor_path).is_none());
+        lazy.save_if_dirty();
+
+        let reloaded = SourceMessageCache::load();
+        assert!(reloaded.get(cursor, &new_path).is_some());
+        assert!(reloaded.get(cursor, &cursor_path).is_some());
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_load_prunes_missing_sources_of_that_namespace_only() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source_dir = TempDir::new().unwrap();
+        let (cursor, cursor_path, codex, codex_path, _, _) = lazy_fixture(&source_dir);
+        std::fs::remove_file(&cursor_path).unwrap();
+        std::fs::remove_file(&codex_path).unwrap();
+
+        let mut lazy = SourceMessageCache::open();
+        lazy.ensure_namespace_loaded(cursor);
+        lazy.save_if_dirty();
+
+        let reloaded = SourceMessageCache::load();
+        assert!(reloaded.get(cursor, &cursor_path).is_none());
+        // Never loaded, so never pruned.
+        assert!(reloaded.get(codex, &codex_path).is_some());
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_namespace_read_is_attempted_once() {
+        let temp_home = TempDir::new().unwrap();
+        let blocker = temp_home.path().join("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        take_namespace_reads();
+
+        let identity = CacheIdentity::for_client(ClientId::Cursor);
+        let mut lazy = SourceMessageCache::open_from_root(Some(&blocker));
+        lazy.ensure_namespace_loaded(identity);
+        lazy.ensure_namespace_loaded(identity);
+        assert_eq!(take_namespace_reads(), vec!["cursor"]);
+        assert!(lazy.entries.is_empty());
     }
 }
