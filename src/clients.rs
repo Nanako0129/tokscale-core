@@ -686,6 +686,22 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Senpi (OmO Native) is a pi-mono descendant and writes the same session
+    // JSONL under `<agent dir>/sessions/<encoded-cwd>/*.jsonl`. The agent dir
+    // honors `SENPI_CODING_AGENT_DIR` and otherwise defaults to `~/.senpi/agent`.
+    // Upstream numbers this client 39 as well.
+    Senpi = 39 => {
+        id: "senpi",
+        root: PathRoot::EnvVar {
+            var: "SENPI_CODING_AGENT_DIR",
+            fallback_relative: ".senpi/agent",
+        },
+        relative: "sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -775,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 39);
+        assert_eq!(ClientId::COUNT, 40);
     }
 
     #[test]
@@ -789,6 +805,28 @@ mod tests {
             "/tmp/home/.local/share/muse/sessions"
         );
         assert_eq!(client.data().pattern, "session.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_client_registered_with_agent_dir_override() {
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let client = ClientId::from_str("senpi").expect("senpi should be registered");
+        assert_eq!(client, ClientId::Senpi);
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/.senpi/agent/sessions"
+        );
+        env.set("SENPI_CODING_AGENT_DIR", "/custom/senpi-agent");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/custom/senpi-agent/sessions"
+        );
+        assert_eq!(client.data().pattern, "*.jsonl");
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);
