@@ -1405,15 +1405,16 @@ fn uses_full_session_long_context_tier(result: &LookupResult) -> bool {
         .matched_key
         .rsplit('/')
         .next()
-        .unwrap_or(result.matched_key.as_str());
+        .unwrap_or(result.matched_key.as_str())
+        .to_lowercase();
+    let id = normalize_version_separator(&terminal_model_id).unwrap_or(terminal_model_id);
     // The model identity decides, not which dataset's row won: a hinted
     // OpenRouter row for a listed model bills the same way once it carries the
-    // tiers (see `borrow_canonical_long_context_tiers`).
+    // tiers (see `borrow_canonical_long_context_tiers`). The identity is
+    // normalized exactly as the donor match normalizes it.
     (result.source.eq_ignore_ascii_case("LiteLLM")
         || result.source.eq_ignore_ascii_case("OpenRouter"))
-        && FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS
-            .iter()
-            .any(|key| terminal_model_id.eq_ignore_ascii_case(key))
+        && is_request_wide_identity(&id)
 }
 
 #[derive(Clone, Copy)]
@@ -7068,6 +7069,14 @@ mod tests {
                 hinted.pricing.input_cost_per_token_above_272k_tokens,
                 Some(5e-6),
                 "{canonical} / {routed}"
+            );
+            // And the borrowed tier bills request-wide, like the canonical row.
+            let usage = usage_prompt(300_000, 10_000, 0);
+            let hinted_cost = lookup.calculate_cost_with_provider(model, Some("openai"), &usage);
+            let canonical_cost = lookup.calculate_cost_with_provider(canonical, None, &usage);
+            assert!(
+                (hinted_cost - canonical_cost).abs() < 1e-12,
+                "{canonical} / {routed}: {hinted_cost} vs {canonical_cost}"
             );
         }
     }
