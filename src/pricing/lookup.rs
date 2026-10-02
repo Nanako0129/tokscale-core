@@ -1683,9 +1683,13 @@ pub fn compute_cost(
             pricing.cache_creation_input_token_cost_above_200k_tokens,
         )],
     );
-    // A 1-hour write is 2x base input where a 5-minute write is 1.25x, and no
-    // pricing table publishes the 1h rate as its own key. `tiered_cost` is
-    // linear in the price, so doubling the whole result is exactly doubling
+    // A 1-hour write is 2x base input where a 5-minute write is 1.25x. LiteLLM
+    // does publish the 1h rate (`cache_creation_input_token_cost_above_1hr`),
+    // but this tree's `ModelPricing` does not carry it, and measured on LiteLLM
+    // main on 2026-10-02 every one of the 216 rows that publish it equals 2x
+    // `input_cost_per_token` (all 12 that publish a 200K 1h rate match 2x the
+    // 200K input rate too), so deriving it gives the same number. `tiered_cost`
+    // is linear in the price, so doubling the whole result is exactly doubling
     // every tier, and the input tier ladder is reused rather than a second
     // table of pre-doubled thresholds being invented.
     //
