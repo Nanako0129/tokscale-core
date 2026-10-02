@@ -781,6 +781,20 @@ impl ResolvedLocalSourceContext {
                 .source_env_path(var)
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.home_dir.join(fallback_relative)),
+            PathRoot::ReasonixHome => {
+                let explicit = crate::clients::REASONIX_ROOT_KEYS
+                    .into_iter()
+                    .find(|key| self.source_env_is_explicit(key))
+                    .and_then(|key| self.source_env_path(key));
+                match explicit {
+                    Some(path) => path.to_path_buf(),
+                    None if cfg!(target_os = "windows") => match &self.platform_config_dir {
+                        Some(root) if self.use_env_roots => root.join("reasonix"),
+                        _ => self.home_dir.join("AppData/Roaming/reasonix"),
+                    },
+                    None => self.home_dir.join(".reasonix"),
+                }
+            }
         };
         Ok(fallback)
     }
@@ -881,8 +895,10 @@ fn resolver_environment_keys() -> Vec<&'static str> {
     let mut keys = PLATFORM_SOURCE_ENV_KEYS.to_vec();
     keys.extend_from_slice(crate::scanner::DIRECT_SOURCE_ENV_KEYS);
     for client in ClientId::iter() {
-        if let PathRoot::EnvVar { var, .. } = client.data().root {
-            keys.push(var);
+        match client.data().root {
+            PathRoot::EnvVar { var, .. } => keys.push(var),
+            PathRoot::ReasonixHome => keys.extend(crate::clients::REASONIX_ROOT_KEYS),
+            _ => {}
         }
     }
     keys
@@ -894,6 +910,7 @@ fn path_root_tag(root: PathRoot) -> u8 {
         PathRoot::XdgData => 2,
         PathRoot::Config => 3,
         PathRoot::EnvVar { .. } => 4,
+        PathRoot::ReasonixHome => 5,
     }
 }
 
@@ -932,6 +949,21 @@ fn resolve_source_environment_paths(
             ResolvedPathInput::fallback(&input, home.to_path_buf())
         } else if !use_env_roots {
             ResolvedPathInput::ignored()
+        } else if is_reasonix_root_key(key) {
+            // Trimmed and `~`-expanded like `clients::clean_reasonix_env_dir`.
+            // A blank value falls through to the next root in precedence.
+            match input.value.as_deref() {
+                None => ResolvedPathInput::fallback(&input, home.to_path_buf()),
+                Some(raw) => match raw.to_str() {
+                    Some(value) => match crate::clients::reasonix_root_from_value(value, home) {
+                        Some(path) => {
+                            ResolvedPathInput::explicit(&input, fully_qualified(cwd, &path)?)
+                        }
+                        None => ResolvedPathInput::fallback(&input, home.to_path_buf()),
+                    },
+                    None => ResolvedPathInput::unavailable(home.to_path_buf()),
+                },
+            }
         } else if key == ENV_TOKSCALE_HEADLESS_DIR {
             match input.value.as_deref() {
                 None => ResolvedPathInput::fallback(
@@ -1010,6 +1042,10 @@ fn resolve_source_environment_paths(
     }
 
     Ok(resolved)
+}
+
+fn is_reasonix_root_key(key: &str) -> bool {
+    crate::clients::REASONIX_ROOT_KEYS.contains(&key)
 }
 
 fn source_env_requires_unicode(key: &str) -> bool {
@@ -2519,6 +2555,71 @@ mod tests {
     }
 
     #[test]
+    fn reasonix_root_prefers_state_home_then_home_then_default() {
+        let root = fixture_root();
+        let home = fixture_path("home");
+        let capture = |use_env_roots: bool, values: Vec<(&'static str, OsString)>| {
+            ResolvedLocalSourceContext::capture_resolved(
+                fixture_path("cwd"),
+                Some(home.clone()),
+                use_env_roots,
+                ScannerSettings::default(),
+                fixture_inputs(&root, values),
+            )
+            .unwrap()
+            .resolve_client_root(PathRoot::ReasonixHome)
+            .unwrap()
+        };
+        let state = fixture_path("state");
+        let reasonix_home = fixture_path("rx-home");
+
+        assert_eq!(
+            capture(
+                true,
+                vec![
+                    (
+                        crate::clients::REASONIX_STATE_HOME,
+                        state.clone().into_os_string()
+                    ),
+                    (
+                        crate::clients::REASONIX_HOME,
+                        reasonix_home.clone().into_os_string()
+                    ),
+                ]
+            ),
+            state
+        );
+        // A blank state home falls through; `~` expands against the scan home.
+        assert_eq!(
+            capture(
+                true,
+                vec![
+                    (crate::clients::REASONIX_STATE_HOME, OsString::from("  ")),
+                    (crate::clients::REASONIX_HOME, OsString::from("~/rx")),
+                ]
+            ),
+            home.join("rx")
+        );
+        // A relative override resolves against the captured cwd.
+        assert_eq!(
+            capture(
+                true,
+                vec![(crate::clients::REASONIX_HOME, OsString::from("rel"))]
+            ),
+            fixture_path("cwd").join("rel")
+        );
+        // Overrides are ignored when env roots are off.
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            capture(
+                false,
+                vec![(crate::clients::REASONIX_STATE_HOME, state.into_os_string())]
+            ),
+            home.join(".reasonix")
+        );
+    }
+
+    #[test]
     fn descriptor_has_fixed_sha256_and_native_path_vectors() {
         let root = fixture_root();
         let inputs = fixture_inputs(
@@ -2554,12 +2655,12 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:bc562e19c009ef37acdfea78fe88def54875c69b0ff1b396c97c8f9e8682b697"
+            "sc1:9be971c6481bd22e236a3d31a9de41cc032b830c3eddce1afd480ecb6c761787"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:8487098a0186d389f5d42944c7727bb90b8214b00a225bde25dc90a173cfbb68"
+            "sc1:7e9bcaae3602a6e707c13d5fddae303d1b22c52f9e540672fef1318e6aca0c5c"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely

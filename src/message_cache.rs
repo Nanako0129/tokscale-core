@@ -940,6 +940,10 @@ fn parser_version(client: ClientId) -> u32 {
         // `fe72e1f9`, which already carries #1355's provider metadata;
         // upstream's own counter is 3 — vendor-local numbering).
         ClientId::Muse => 1,
+        // 1: Reasonix's stats parser (upstream `parse_reasonix_file`, which
+        // upstream versions 4 after its #1095 reader change; vendor-local
+        // numbering starts here because no older Reasonix entry exists).
+        ClientId::Reasonix => 1,
         // 2: CLI sessions carrying Kiro credits now hold a provider-reported
         // cost, and IDE turns take their request count from `requestIds`
         // (upstream #1342, credits and message_count only; token counts
