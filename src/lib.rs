@@ -2542,7 +2542,7 @@ fn aggregate_model_usage_entries(
         entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
         entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
         entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
-        entry.message_count += msg.message_count.max(0);
+        entry.message_count = entry.message_count.saturating_add(msg.message_count.max(0));
         entry.cost += msg.cost;
         entry
             .performance
@@ -3088,7 +3088,10 @@ async fn get_model_report_inner(
 
     let (total_input, total_output, total_cache_read, total_cache_write) =
         model_report_token_totals(&entries);
-    let total_messages: i32 = entries.iter().map(|e| e.message_count).sum();
+    let total_messages: i32 = entries
+        .iter()
+        .map(|e| e.message_count)
+        .fold(0_i32, i32::saturating_add);
     // f64's Sum identity is -0.0, so an empty report would serialize as
     // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
     // any non-zero total.
@@ -3176,7 +3179,7 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
             entry.output = entry.output.saturating_add(msg.tokens.output);
             entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
             entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
-            entry.message_count += msg.message_count.max(0);
+            entry.message_count = entry.message_count.saturating_add(msg.message_count.max(0));
             entry.cost += msg.cost;
         },
     );
@@ -3236,7 +3239,7 @@ impl AgentAccumulator {
         self.cache_write = self.cache_write.saturating_add(msg.tokens.cache_write);
         self.reasoning = self.reasoning.saturating_add(msg.tokens.reasoning);
         self.cost += msg.cost;
-        self.messages += msg.message_count.max(0);
+        self.messages = self.messages.saturating_add(msg.message_count.max(0));
     }
 }
 
@@ -3411,7 +3414,10 @@ async fn get_agents_report_inner(
     // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
     // any non-zero total.
     let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
-    let total_messages: i32 = entries.iter().map(|e| e.messages).sum();
+    let total_messages: i32 = entries
+        .iter()
+        .map(|e| e.messages)
+        .fold(0_i32, i32::saturating_add);
 
     Ok(AgentReport {
         entries,
@@ -3521,7 +3527,7 @@ async fn get_hourly_report_inner(
         entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
         entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
         entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
-        entry.message_count += msg.message_count.max(0);
+        entry.message_count = entry.message_count.saturating_add(msg.message_count.max(0));
         if msg.is_turn_start {
             entry.turn_count += 1;
         }
@@ -6775,10 +6781,11 @@ fn should_keep_deduped_message(seen_keys: &mut HashSet<String>, message: &Unifie
 }
 
 fn summed_parsed_message_count(messages: &[ParsedMessage]) -> i32 {
+    // Saturating: Reasonix rows carry request counts up to `i32::MAX`.
     messages
         .iter()
         .map(|msg| msg.message_count.max(0))
-        .sum::<i32>()
+        .fold(0_i32, i32::saturating_add)
 }
 
 fn filter_parsed_messages(
@@ -23087,5 +23094,48 @@ mod tests {
         let counted = counted();
         assert_eq!(counted.counts.get(ClientId::Reasonix), 4);
         assert_eq!(counted.messages.len(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_reasonix_request_count_saturates_instead_of_overflowing() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let huge = r#"{"ts":"2026-08-04T09:10:11Z","model":"deepseek/chat","prompt":1,"completion":1,"total":2,"requests":9999999999}"#;
+        write_reasonix_stats(source_home.path(), "2026-08-04.jsonl", &[huge, huge]);
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["reasonix".to_string()]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.messages.len(), 2);
+        assert_eq!(counted.counts.get(ClientId::Reasonix), i32::MAX);
+
+        // The report folds saturate too instead of panicking on overflow.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let options = ReportOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["reasonix".to_string()]),
+            ..Default::default()
+        };
+        let model = runtime.block_on(get_model_report(options.clone())).unwrap();
+        assert_eq!(model.total_messages, i32::MAX);
+        let monthly = runtime
+            .block_on(get_monthly_report(options.clone()))
+            .unwrap();
+        assert_eq!(monthly.entries[0].message_count, i32::MAX);
+        let hourly = runtime
+            .block_on(get_hourly_report(options.clone()))
+            .unwrap();
+        assert_eq!(hourly.entries[0].message_count, i32::MAX);
+        let agents = runtime.block_on(get_agents_report(options)).unwrap();
+        assert_eq!(agents.total_messages, i32::MAX);
     }
 }
