@@ -702,6 +702,20 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Oh My Pi (omp) is a pi-mono descendant with the same session JSONL
+    // under a fixed `~/.omp/agent/sessions` root. It is deliberately not an
+    // env-var root: Oh My Pi reads `PI_CODING_AGENT_DIR`, the variable Pi
+    // itself uses, so honoring it would point both clients at one tree.
+    // Upstream numbers this client 49.
+    Omp = 40 => {
+        id: "omp",
+        root: PathRoot::Home,
+        relative: ".omp/agent/sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -791,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 40);
+        assert_eq!(ClientId::COUNT, 41);
     }
 
     #[test]
@@ -805,6 +819,20 @@ mod tests {
             "/tmp/home/.local/share/muse/sessions"
         );
         assert_eq!(client.data().pattern, "session.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_omp_client_registered_with_fixed_home_root() {
+        let client = ClientId::from_str("omp").expect("omp should be registered");
+        assert_eq!(client, ClientId::Omp);
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/.omp/agent/sessions"
+        );
+        assert_eq!(client.data().pattern, "*.jsonl");
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);

@@ -1,7 +1,8 @@
 //! Pi (badlogic/pi-mono) session parser
 //!
-//! Parses JSONL files from `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl` (and,
-//! via the `pi` client's OMP scan root, `~/.omp/agent/sessions/...`). Current
+//! Parses JSONL files from `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`. Oh My
+//! Pi's `~/.omp/agent/sessions` root belongs to the `omp` client
+//! (`sessions::omp`), which parses it with this same parser. Current
 //! OMP builds write a `title` metadata record before the `session` header in
 //! newly-created session files; see [`PRE_SESSION_METADATA_TYPES`].
 

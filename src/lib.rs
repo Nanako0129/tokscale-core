@@ -1817,6 +1817,34 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // Oh My Pi: Pi format under `~/.omp/agent/sessions`, cross-session keys
+    // like Pi (forks copy records into a new session file).
+    let omp_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Omp)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Omp),
+                &source_cache,
+                pricing,
+                sessions::omp::parse_omp_file,
+            )
+        })
+        .collect();
+    let mut omp_seen: HashSet<String> = HashSet::new();
+    for outcome in omp_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut omp_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let kimi_outcomes: Vec<(bool, CachedParseOutcome)> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
@@ -4523,6 +4551,7 @@ where
     simple_lane!(ClientId::Pi, sessions::pi::parse_pi_file);
     simple_lane!(ClientId::Kimchi, sessions::kimchi::parse_kimchi_file);
     simple_lane!(ClientId::Senpi, sessions::senpi::parse_senpi_file);
+    simple_lane!(ClientId::Omp, sessions::omp::parse_omp_file);
     simple_lane!(
         ClientId::Kimi,
         parse_kimi_source,
@@ -6364,6 +6393,21 @@ fn parse_local_clients_inner(
     let senpi_count = summed_parsed_message_count(&senpi_msgs);
     counts.set(ClientId::Senpi, senpi_count);
     messages.extend(senpi_msgs);
+
+    let omp_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Omp)
+        .par_iter()
+        .flat_map(|path| sessions::omp::parse_omp_file(path))
+        .collect();
+    let mut omp_seen: HashSet<String> = HashSet::new();
+    let omp_msgs: Vec<ParsedMessage> = omp_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut omp_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let omp_count = summed_parsed_message_count(&omp_msgs);
+    counts.set(ClientId::Omp, omp_count);
+    messages.extend(omp_msgs);
 
     let kimi_outcomes: Vec<(bool, Vec<UnifiedMessage>)> = scan_result
         .get(ClientId::Kimi)
@@ -23379,5 +23423,90 @@ mod tests {
             assert_eq!(lane[0].1, "pi_ses");
             assert_eq!(lane[1].0, "senpi");
         }
+    }
+
+    /// The old `pi` lane: every file under both roots parsed as Pi, deduped
+    /// first-wins on Pi's keys. Returns the token total it reported.
+    fn old_pi_lane_total(files: &[PathBuf]) -> i64 {
+        let mut seen = std::collections::HashSet::new();
+        files
+            .iter()
+            .flat_map(|path| sessions::pi::parse_pi_file(path))
+            .filter(|message| super::should_keep_deduped_message(&mut seen, message))
+            .map(|message| message.tokens.total())
+            .sum()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_root_moves_from_pi_to_omp_with_the_same_totals() {
+        // Before this client existed, the `pi` lane also scanned
+        // `~/.omp/agent/sessions`. Those files now belong to `omp`, parsed by
+        // the same parser: when the two trees share no records, attribution
+        // moves and the total stays.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let home = source_home.path();
+        let omp_dir = home.join(".omp/agent/sessions/--p--");
+        let pi_dir = home.join(".pi/agent/sessions/--p--");
+        write_pi_format_session(&omp_dir, "a.jsonl", "omp_ses", "m1");
+        // A fork copy in a new session file counts once.
+        write_pi_format_session(&omp_dir, "fork.jsonl", "omp_fork", "m1");
+        write_pi_format_session(&pi_dir, "a.jsonl", "pi_ses", "m2");
+        let old_total = old_pi_lane_total(&[
+            pi_dir.join("a.jsonl"),
+            omp_dir.join("a.jsonl"),
+            omp_dir.join("fork.jsonl"),
+        ]);
+
+        let clients = ["pi".to_string(), "omp".to_string()];
+        let lanes = client_sessions_per_lane(home.to_str().unwrap(), &clients);
+        for lane in &lanes {
+            assert_eq!(lane.len(), 2, "{lane:?}");
+            assert_eq!(lane[0].0, "omp");
+            assert_eq!(lane[1], ("pi".to_string(), "pi_ses".to_string()));
+        }
+        let new_total: i64 =
+            parse_all_messages_with_pricing(home.to_str().unwrap(), &clients, None)
+                .iter()
+                .map(|m| m.tokens.total())
+                .sum();
+        assert_eq!(new_total, old_total);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_a_record_in_both_the_pi_and_omp_roots_now_counts_in_each() {
+        // Deliberate, as upstream: there is no cross-client dedup. The old
+        // single `pi` lane collapsed a record present in both trees (for
+        // example a session copied from Pi into Oh My Pi); now each client
+        // counts its own copy.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let home = source_home.path();
+        let omp_dir = home.join(".omp/agent/sessions/--p--");
+        let pi_dir = home.join(".pi/agent/sessions/--p--");
+        write_pi_format_session(&pi_dir, "a.jsonl", "shared_ses", "m1");
+        write_pi_format_session(&omp_dir, "a.jsonl", "shared_ses", "m1");
+        let old_total = old_pi_lane_total(&[pi_dir.join("a.jsonl"), omp_dir.join("a.jsonl")]);
+
+        let clients = ["pi".to_string(), "omp".to_string()];
+        for lane in client_sessions_per_lane(home.to_str().unwrap(), &clients) {
+            assert_eq!(
+                lane,
+                vec![
+                    ("omp".to_string(), "shared_ses".to_string()),
+                    ("pi".to_string(), "shared_ses".to_string()),
+                ]
+            );
+        }
+        let new_total: i64 =
+            parse_all_messages_with_pricing(home.to_str().unwrap(), &clients, None)
+                .iter()
+                .map(|m| m.tokens.total())
+                .sum();
+        assert_eq!(new_total, 2 * old_total);
     }
 }
