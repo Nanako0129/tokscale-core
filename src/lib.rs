@@ -12002,6 +12002,100 @@ mod tests {
         assert_eq!(streamed[0].tokens.input, 100);
     }
 
+    // Upstream #1134 recovers BOM-prefixed Pi transcripts without a Pi
+    // `parser_version` bump. That holds only because a zero-message parse is
+    // never cached (`load_or_parse_source` builds no entry for it, and an
+    // unchanged fingerprint over an empty entry re-parses; `simple_lane!`
+    // filters empty entries the same way). Seed exactly the entry an old build
+    // could at worst have left — current version, same fingerprint, no
+    // messages — and require every lane to re-parse the file.
+    #[test]
+    #[serial_test::serial]
+    fn test_pi_bom_transcript_recovers_past_a_same_fingerprint_empty_entry() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let sessions_dir = source_home.path().join(".pi/agent/sessions/--fixture--");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("session-bom.jsonl"),
+            concat!(
+                "\u{feff}",
+                r#"{"type":"session","id":"session-bom","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/demo"}"#,
+                "\n",
+                r#"{"type":"message","id":"assistant-1","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":20,"output":8}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["pi".to_string()];
+        let scan_result = scan_test_sources(
+            source_home.path(),
+            &clients,
+            &scanner::ScannerSettings::default(),
+        );
+        let path = scan_result.get(ClientId::Pi)[0].clone();
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Pi);
+        let seed_empty_entry = || {
+            let mut cache = message_cache::SourceMessageCache::load();
+            cache.insert(message_cache::CachedSourceEntry::new(
+                identity,
+                &path,
+                message_cache::SourceFingerprint::from_path_samples_only(&path).unwrap(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ));
+            cache.save_if_dirty();
+            assert!(message_cache::SourceMessageCache::load()
+                .get(identity, &path)
+                .is_some_and(|entry| entry.messages.is_empty()));
+        };
+
+        seed_empty_entry();
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].session_id, "session-bom");
+        assert_eq!(streamed[0].tokens.total(), 28);
+
+        seed_empty_entry();
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].session_id, "session-bom");
+        assert_eq!(materialized[0].tokens.total(), 28);
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Pi), 1);
+        assert_eq!(counted.messages[0].session_id, "session-bom");
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_parse_local_clients_kimi_deduplicates_repeated_status_updates() {
