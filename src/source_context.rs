@@ -2544,12 +2544,12 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:b3b65ffcb00dacb7c35d9cf0d5221750b4151135ee8d19158cf4061c64cd3406"
+            "sc1:4db3817cdf017ed77bfd970c9973aa75e21ae4db91f389bcf36bc0beac40f33f"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:f66cefc1a6e0f521ea2eaf790f470d64d2277650d18f4e69b0423a6eef41d761"
+            "sc1:606486f7b7744db304e6528400a51c1248319e49ad4a1d8611cd15f5be09f88a"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely

@@ -520,6 +520,19 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // ZCode (z.ai) v2 CLI keeps authoritative per-request usage in one SQLite
+    // database. Only that store is read (via `scan_result.zcode_db`, cached
+    // and `-wal`-fingerprinted); upstream's legacy `~/.zcode/projects` JSONL
+    // root is not ported. Upstream numbers this client 33 as well.
+    Zcode = 33 => {
+        id: "zcode",
+        root: PathRoot::Home,
+        relative: ".zcode/cli/db/db.sqlite",
+        pattern: "db.sqlite",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -609,7 +622,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 33);
+        assert_eq!(ClientId::COUNT, 34);
     }
 
     #[test]

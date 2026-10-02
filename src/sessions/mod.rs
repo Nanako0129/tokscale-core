@@ -37,6 +37,7 @@ pub mod synthetic;
 pub mod trae;
 pub(crate) mod utils;
 pub mod warp;
+pub mod zcode;
 pub mod zed;
 
 use crate::TokenBreakdown;

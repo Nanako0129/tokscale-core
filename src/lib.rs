@@ -2126,6 +2126,21 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // ZCode v2 CLI usage database: cached and `-wal`-fingerprinted like Zed.
+    if let Some(db_path) = &scan_result.zcode_db {
+        let outcome = load_or_parse_sqlite_source(
+            db_path,
+            message_cache::CacheIdentity::for_client(ClientId::Zcode),
+            &source_cache,
+            pricing,
+            sessions::zcode::parse_zcode_sqlite,
+        );
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // Kiro globalStorage has a precedence relation between self-contained
     // snapshots and execution records. Cache each source's raw parser output,
     // then suppress only after every file has been collected. The suppression
@@ -4139,13 +4154,24 @@ where
         // missing cost (`<= 0.0`) is repriced. The cache still stores raw
         // (unpriced) messages, so the guard is applied on emit here — exactly
         // like the default unconditional path (which passes `false`).
-        ($client_id:expr, $parse_fn:expr, $fingerprint_fn:expr, $guard_cost:expr) => {{
+        ($client_id:expr, $parse_fn:expr, $fingerprint_fn:expr, $guard_cost:expr) => {
+            simple_lane!(
+                $client_id,
+                $parse_fn,
+                $fingerprint_fn,
+                $guard_cost,
+                scan_result.get($client_id)
+            )
+        };
+        // 5-arg: a source held in a dedicated `ScanResult` field rather than
+        // the client's `files` lane (e.g. ZCode's single `zcode_db`).
+        ($client_id:expr, $parse_fn:expr, $fingerprint_fn:expr, $guard_cost:expr, $paths:expr) => {{
             // Per-lane dedup set: persists across this client's files, never
             // shared with other clients (see the note above the trae buffer).
             let mut seen_keys: HashSet<String> = HashSet::new();
             // Separate paths into cache-hit (emit immediately) vs cache-miss (par-parse).
             let mut miss_paths: Vec<&PathBuf> = Vec::new();
-            for path in scan_result.get($client_id) {
+            for path in $paths {
                 let fp = $fingerprint_fn(path);
                 let cache_hit = fp.as_ref().and_then(|fp| {
                     source_cache
@@ -4446,6 +4472,15 @@ where
         true
     );
     simple_lane!(ClientId::Mux, sessions::mux::parse_mux_file);
+    // ZCode's v2 usage database is WAL-mode SQLite held in `zcode_db`; fingerprint
+    // via from_sqlite_path so a `-wal`-only write invalidates the cache.
+    simple_lane!(
+        ClientId::Zcode,
+        sessions::zcode::parse_zcode_sqlite,
+        message_cache::SourceFingerprint::from_sqlite_path,
+        false,
+        scan_result.zcode_db.as_slice()
+    );
 
     // ---- Kiro globalStorage files (raw cache + batch suppression) ----
     // Snapshots and successful executions can describe the same conversation.
@@ -5426,6 +5461,7 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
         &scan_result.kilo_db,
         &scan_result.goose_db,
         &scan_result.kiro_db,
+        &scan_result.zcode_db,
     ];
     dbs.extend(single_dbs.into_iter().flatten().cloned());
     // Hermes/Zed dbs may also be auto-discovered or supplied through extra
@@ -5537,6 +5573,7 @@ fn local_source_change_token_inner(scan_result: &scanner::ScanResult) -> Result<
         &scan_result.kilo_db,
         &scan_result.goose_db,
         &scan_result.kiro_db,
+        &scan_result.zcode_db,
     ];
     dbs.extend(single_dbs.into_iter().flatten().cloned());
     dbs.extend(scan_result.hermes_db_paths());
@@ -6347,6 +6384,16 @@ fn parse_local_clients_inner(
         let count = summed_parsed_message_count(&goose_msgs);
         counts.set(ClientId::Goose, count);
         messages.extend(goose_msgs);
+    }
+
+    if let Some(db_path) = &scan_result.zcode_db {
+        let zcode_msgs: Vec<ParsedMessage> = sessions::zcode::parse_zcode_sqlite(db_path)
+            .into_iter()
+            .map(|msg| unified_to_parsed(&msg))
+            .collect();
+        let count = summed_parsed_message_count(&zcode_msgs);
+        counts.set(ClientId::Zcode, count);
+        messages.extend(zcode_msgs);
     }
 
     let zed_db_paths = scan_result.zed_db_paths();
@@ -22005,5 +22052,257 @@ mod tests {
                 );
             }
         });
+    }
+
+    // ---- ZCode v2 SQLite: sibling (`-wal`) rule ----
+    // ZCode's usage database is SQLite held in the single `zcode_db` field. A
+    // WAL-mode writer appends to `db.sqlite-wal` without touching the main
+    // file, so every lane must treat the `-wal` sidecar as part of the source.
+
+    fn zcode_wal_db(source_home: &Path) -> (PathBuf, rusqlite::Connection) {
+        let db_dir = source_home.join(".zcode/cli/db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("db.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE model_usage (
+                 id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, model_id TEXT,
+                 started_at INTEGER, completed_at INTEGER, duration_ms INTEGER,
+                 input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+                 cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
+                 computed_total_tokens INTEGER, agent TEXT, mode TEXT
+             );
+             CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, path TEXT);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+        (db_path, conn)
+    }
+
+    fn insert_zcode_usage(conn: &rusqlite::Connection, id: &str, started_at: i64, input: i64) {
+        conn.execute(
+            "INSERT INTO model_usage (id, session_id, turn_id, model_id, started_at,
+                 input_tokens, output_tokens, computed_total_tokens)
+             VALUES (?1, 'sess_1', ?1, 'glm-5.2', ?2, ?3, 10, ?3 + 10)",
+            rusqlite::params![id, started_at, input],
+        )
+        .unwrap();
+    }
+
+    /// Main-file (len, mtime): unchanged across a write proves it went to the WAL only.
+    fn main_file_state(path: &Path) -> (u64, std::time::SystemTime) {
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.len(), meta.modified().unwrap())
+    }
+
+    type ZcodeShape = (
+        Option<String>,
+        i64,
+        TokenBreakdown,
+        bool,
+        Option<String>,
+        Option<String>,
+    );
+
+    fn zcode_message_shape(messages: &[UnifiedMessage]) -> Vec<ZcodeShape> {
+        let mut shape: Vec<_> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m.dedup_key.clone(),
+                    m.timestamp,
+                    m.tokens.clone(),
+                    m.is_turn_start,
+                    m.workspace_key.clone(),
+                    m.agent.clone(),
+                )
+            })
+            .collect();
+        shape.sort_by(|a, b| a.0.cmp(&b.0));
+        shape
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_zcode_materialized_rebuilds_on_wal_only_write() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["zcode".to_string()];
+
+        let (db_path, conn) = zcode_wal_db(source_home.path());
+        insert_zcode_usage(&conn, "usage_1", 1_782_718_000_000, 100);
+        assert_eq!(
+            parse_all_messages_with_pricing(home, &clients, None).len(),
+            1
+        );
+
+        let before = main_file_state(&db_path);
+        insert_zcode_usage(&conn, "usage_2", 1_782_718_100_000, 200);
+        assert_eq!(main_file_state(&db_path), before, "write must be WAL-only");
+
+        let refreshed = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(
+            refreshed.len(),
+            2,
+            "a WAL-only write must change the zcode fingerprint and force a re-parse"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_zcode_streaming_matches_materialized_after_wal_only_write() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["zcode".to_string()];
+        let stream = || {
+            let mut streamed = Vec::new();
+            scan_messages_streaming(
+                home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |message| streamed.push(message.clone()),
+            );
+            streamed
+        };
+
+        let (db_path, conn) = zcode_wal_db(source_home.path());
+        insert_zcode_usage(&conn, "usage_1", 1_782_718_000_000, 100);
+        assert_eq!(stream().len(), 1);
+
+        let before = main_file_state(&db_path);
+        insert_zcode_usage(&conn, "usage_2", 1_782_718_100_000, 200);
+        assert_eq!(main_file_state(&db_path), before, "write must be WAL-only");
+
+        let streamed = stream();
+        assert_eq!(
+            streamed.len(),
+            2,
+            "the streaming lane must not serve the pre-WAL cache entry"
+        );
+        let materialized = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(
+            zcode_message_shape(&streamed),
+            zcode_message_shape(&materialized)
+        );
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Zcode), 2);
+        assert_eq!(counted.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_latest_source_mtime_ms_probes_zcode_wal() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let db_dir = source_home.path().join(".zcode/cli/db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = db_dir.join("db.sqlite");
+        let wal = db_dir.join("db.sqlite-wal");
+        std::fs::File::create(&db).unwrap();
+        std::fs::File::create(&wal).unwrap();
+
+        let db_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let wal_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_086_400);
+        let db_file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        let Ok(()) = db_file.set_modified(db_time) else {
+            return;
+        };
+        drop(db_file);
+        let wal_file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        let Ok(()) = wal_file.set_modified(wal_time) else {
+            return;
+        };
+        drop(wal_file);
+
+        let options = LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["zcode".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::latest_source_mtime_ms(&options).unwrap(),
+            1_700_086_400_000,
+            "the live-tail mtime probe must include the zcode WAL"
+        );
+
+        let before = crate::local_source_change_token(&options).unwrap();
+        let wal_file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        wal_file
+            .set_modified(wal_time + std::time::Duration::from_secs(60))
+            .unwrap();
+        drop(wal_file);
+        assert_ne!(
+            crate::local_source_change_token(&options).unwrap(),
+            before,
+            "a WAL-only write must move the live-tail change token"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_modified_after_keeps_zcode_db_when_only_wal_is_newer() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+
+        // `conn` stays open: closing the last connection checkpoints and
+        // removes the WAL.
+        let (db_path, conn) = zcode_wal_db(source_home.path());
+        insert_zcode_usage(&conn, "usage_1", 1_782_718_000_000, 100);
+        insert_zcode_usage(&conn, "usage_2", 1_782_718_100_000, 200);
+
+        let db_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let db_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .unwrap();
+        let Ok(()) = db_file.set_modified(db_time) else {
+            return;
+        };
+        drop(db_file);
+        let threshold_ms = 1_700_086_400_000;
+        let wal_mtime = std::fs::metadata(db_path.with_file_name("db.sqlite-wal"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            wal_mtime > std::time::UNIX_EPOCH + std::time::Duration::from_millis(threshold_ms),
+            "the WAL must be the newer sibling"
+        );
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["zcode".to_string()]),
+            modified_after: Some(threshold_ms),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            counted.counts.get(ClientId::Zcode),
+            2,
+            "an old db.sqlite with a newer -wal must survive modified-after pruning"
+        );
     }
 }
