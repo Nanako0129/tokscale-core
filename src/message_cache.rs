@@ -886,7 +886,8 @@ fn parser_version(client: ClientId) -> u32 {
         // 2: Pi messages now carry a cross-session dedup key (upstream #1323),
         // and a cached v1 entry has none, so fork copies would keep counting
         // once per session file until re-parsed.
-        // Pi shares `parse_pi_format_file` with Kimchi; bump both together.
+        // Pi shares `parse_pi_format_file` with Kimchi and Senpi; bump all of
+        // them together.
         ClientId::Pi => 2,
         // 2: These parser output shapes now preserve source cost provenance;
         // Mux additionally splits mixed known/unknown token buckets.
@@ -961,6 +962,9 @@ fn parser_version(client: ClientId) -> u32 {
         // `ClientId::Pi` must bump this arm too, or warm Kimchi caches keep
         // the old output.
         ClientId::Kimchi => 1,
+        // 1: Senpi's Pi-format parser (`parse_pi_format_file`, cross-session
+        // keys). Shared with Pi and Kimchi: bump all three together.
+        ClientId::Senpi => 1,
         _ => 1,
     }
 }

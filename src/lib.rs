@@ -1789,6 +1789,34 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // Senpi: Pi format under its own root, cross-session keys like Pi (forks
+    // copy records into a new session file).
+    let senpi_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Senpi)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Senpi),
+                &source_cache,
+                pricing,
+                sessions::senpi::parse_senpi_file,
+            )
+        })
+        .collect();
+    let mut senpi_seen: HashSet<String> = HashSet::new();
+    for outcome in senpi_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut senpi_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let kimi_outcomes: Vec<(bool, CachedParseOutcome)> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
@@ -4494,6 +4522,7 @@ where
     );
     simple_lane!(ClientId::Pi, sessions::pi::parse_pi_file);
     simple_lane!(ClientId::Kimchi, sessions::kimchi::parse_kimchi_file);
+    simple_lane!(ClientId::Senpi, sessions::senpi::parse_senpi_file);
     simple_lane!(
         ClientId::Kimi,
         parse_kimi_source,
@@ -6320,6 +6349,21 @@ fn parse_local_clients_inner(
     let kimchi_count = summed_parsed_message_count(&kimchi_msgs);
     counts.set(ClientId::Kimchi, kimchi_count);
     messages.extend(kimchi_msgs);
+
+    let senpi_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Senpi)
+        .par_iter()
+        .flat_map(|path| sessions::senpi::parse_senpi_file(path))
+        .collect();
+    let mut senpi_seen: HashSet<String> = HashSet::new();
+    let senpi_msgs: Vec<ParsedMessage> = senpi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut senpi_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let senpi_count = summed_parsed_message_count(&senpi_msgs);
+    counts.set(ClientId::Senpi, senpi_count);
+    messages.extend(senpi_msgs);
 
     let kimi_outcomes: Vec<(bool, Vec<UnifiedMessage>)> = scan_result
         .get(ClientId::Kimi)
@@ -23297,6 +23341,43 @@ mod tests {
         let clients = ["pi".to_string(), "kimchi".to_string(), "cline".to_string()];
         for lane in client_sessions_per_lane(home.to_str().unwrap(), &clients) {
             assert_eq!(lane, vec![("kimchi".to_string(), "kimchi_ses".to_string())]);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_senpi_and_pi_each_count_only_their_own_root_and_forks_collapse() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let home = source_home.path();
+        write_pi_format_session(
+            &home.join(".pi/agent/sessions/--p--"),
+            "a.jsonl",
+            "pi_ses",
+            "m1",
+        );
+        write_pi_format_session(
+            &home.join(".senpi/agent/sessions/--p--"),
+            "a.jsonl",
+            "senpi_ses",
+            "m1",
+        );
+        // A fork copies the parent's records into a new session file; the
+        // cross-session key counts the copied record once.
+        write_pi_format_session(
+            &home.join(".senpi/agent/sessions/--p--"),
+            "fork.jsonl",
+            "senpi_fork",
+            "m1",
+        );
+
+        let clients = ["pi".to_string(), "senpi".to_string()];
+        for lane in client_sessions_per_lane(home.to_str().unwrap(), &clients) {
+            assert_eq!(lane.len(), 2, "{lane:?}");
+            assert_eq!(lane[0].0, "pi");
+            assert_eq!(lane[0].1, "pi_ses");
+            assert_eq!(lane[1].0, "senpi");
         }
     }
 }
