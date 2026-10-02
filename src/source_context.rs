@@ -156,7 +156,17 @@ impl RemoteSourceContextV1 {
 
 const DOMAIN: &[u8] = b"tokenbar-source-context";
 const REMOTE_DOMAIN: &[u8] = b"tokenbar-remote-source-context-v1";
-const RESOLVER_CONTRACT_VERSION: u32 = 1;
+/// Version of the rules that turn the descriptor's inputs into the set of
+/// directories a scan visits. Bump it for any change that alters what an
+/// existing descriptor actually scans — adding or removing a derived scan root,
+/// or changing a resolution rule — even when every input stays the same. The
+/// identity is the approved-scope fingerprint for remote pairing, and it must
+/// describe what gets scanned, not only the inputs (705817f6); otherwise a
+/// scope approved before the change silently widens after it. A new `ClientId`
+/// already changes the descriptor through the client list and needs no bump.
+///
+/// 2: Kimi Work scan roots under the desktop app-data tree (upstream #1170).
+const RESOLVER_CONTRACT_VERSION: u32 = 2;
 
 const ENV_HOME: &str = "HOME";
 const ENV_XDG_DATA_HOME: &str = "XDG_DATA_HOME";
@@ -2544,12 +2554,12 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:55f15b570273595b648bfb1c44ce06b0f03c4834df947d45bce634f58bc02e96"
+            "sc1:fdebafd87ec5f2db30f081ca49b4e694b76f72322a347920fcba7e983c5ba256"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:3f03a4d23ca387cf41c3db0c78cebe6c32af24e1e69ecfdbb31c040c5ec9d37e"
+            "sc1:4cb000100c419ce4449277e76f90a8a6bee44784a6f8abde0e0ac354ee06b213"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely
