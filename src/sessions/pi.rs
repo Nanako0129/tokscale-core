@@ -130,12 +130,24 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut workspace_key: Option<String> = None;
     let mut workspace_label: Option<String> = None;
     let mut agent: Option<String> = None;
-    for line in reader.lines() {
+    for (line_index, line) in reader.lines().enumerate() {
+        // An invalid-UTF-8 line costs only itself: `Lines` has consumed its
+        // bytes, so the next call reads the following record (upstream #1095).
         let line = match line {
             Ok(l) => l,
             Err(_) => continue,
         };
 
+        // A UTF-8 BOM decodes cleanly, so it survives as U+FEFF glued to the
+        // front of the first record, where `str::trim` leaves it (U+FEFF is not
+        // White_Space) and the header then fails to parse — which discards the
+        // whole transcript. Strip it on the file's first physical line only;
+        // anywhere else it stays an ordinary malformed record (upstream #1134).
+        let line = if line_index == 0 {
+            line.strip_prefix('\u{feff}').unwrap_or(&line)
+        } else {
+            &line
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -318,6 +330,84 @@ mod tests {
         assert_eq!(messages[0].tokens.cache_write, 5);
         assert_eq!(messages[0].workspace_key, Some("/tmp".to_string()));
         assert_eq!(messages[0].workspace_label, Some("tmp".to_string()));
+    }
+
+    #[test]
+    fn utf8_bom_before_the_header_keeps_the_transcript() {
+        // Ported from upstream #1134. Without the strip, the header fails to
+        // parse and the whole transcript is dropped.
+        let file = create_test_file(concat!(
+            "\u{feff}",
+            r#"{"type":"session","id":"session-with-bom","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#,
+            "\n",
+            r#"{"type":"message","id":"assistant-1","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":20,"output":8}}}"#,
+            "\n",
+        ));
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "session-with-bom");
+        assert_eq!(messages[0].tokens.total(), 28);
+    }
+
+    #[test]
+    fn a_marker_after_the_first_record_still_costs_only_its_own_record() {
+        // Ported from upstream #1134: the strip is scoped to the first line.
+        let file = create_test_file(concat!(
+            r#"{"type":"session","id":"session-clean","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#,
+            "\n\u{feff}",
+            r#"{"type":"message","id":"assistant-1","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":1,"output":1}}}"#,
+            "\n",
+            r#"{"type":"message","id":"assistant-2","timestamp":"2026-08-08T00:00:02.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":20,"output":8}}}"#,
+            "\n",
+        ));
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "session-clean");
+        assert_eq!(messages[0].tokens.total(), 28);
+    }
+
+    #[test]
+    fn invalid_utf8_record_costs_only_itself() {
+        // Upstream #1095's claim for Pi's strict reader: an undecodable record
+        // must not truncate the valid records after it. The control is the
+        // same transcript with the damaged record removed.
+        let header = br#"{"type":"session","id":"session-bytes","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#;
+        let damaged = b"{\"type\":\"message\",\"id\":\"damaged\xff\xfe\"}";
+        let record = |id: &str, input: i64| {
+            format!(
+                r#"{{"type":"message","id":"{id}","timestamp":"2026-08-08T00:00:01.000Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{{"input":{input},"output":1}}}}}}"#
+            )
+        };
+        let write = |with_damage: bool| {
+            let mut bytes = header.to_vec();
+            bytes.push(b'\n');
+            bytes.extend_from_slice(record("before", 10).as_bytes());
+            bytes.push(b'\n');
+            if with_damage {
+                bytes.extend_from_slice(damaged);
+                bytes.push(b'\n');
+            }
+            bytes.extend_from_slice(record("after", 20).as_bytes());
+            bytes.push(b'\n');
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(&bytes).unwrap();
+            file.flush().unwrap();
+            file
+        };
+
+        let control = parse_pi_file(write(false).path());
+        let damaged = parse_pi_file(write(true).path());
+
+        assert_eq!(control.len(), 2);
+        assert_eq!(damaged.len(), control.len());
+        assert_eq!(
+            damaged.iter().map(|m| m.tokens.input).collect::<Vec<_>>(),
+            vec![10, 20]
+        );
     }
 
     #[test]
