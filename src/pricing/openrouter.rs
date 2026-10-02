@@ -154,6 +154,7 @@ async fn fetch_author_pricing(
     }
 }
 
+/// An endpoint's prices, or `None` when its input or output price does not parse.
 fn endpoint_pricing(endpoint: &Endpoint) -> Option<ModelPricing> {
     Some(ModelPricing {
         input_cost_per_token: Some(parse_price(&endpoint.pricing.prompt)?),
@@ -172,6 +173,7 @@ fn endpoint_pricing(endpoint: &Endpoint) -> Option<ModelPricing> {
     })
 }
 
+/// Whether `candidate` quotes the same input and output price as `listed`.
 fn quotes_same_base_price(candidate: &ModelPricing, listed: &ModelPricing) -> bool {
     let same = |candidate: Option<f64>, listed: Option<f64>| match (candidate, listed) {
         (Some(candidate), Some(listed)) => (candidate - listed).abs() <= listed.abs() * 1e-9,
@@ -258,6 +260,7 @@ fn fewest_unpriceable_buckets(
     })
 }
 
+/// How many of the two cache rates (read, write) a price publishes.
 fn published_cache_rates(pricing: &ModelPricing) -> usize {
     usize::from(pricing.cache_read_input_token_cost.is_some())
         + usize::from(pricing.cache_creation_input_token_cost.is_some())
@@ -410,6 +413,7 @@ pub async fn fetch_all_mapped() -> HashMap<String, ModelPricing> {
 mod tests {
     use super::*;
 
+    /// An OpenRouter endpoint with no cache-write price.
     fn endpoint(
         provider_name: &str,
         prompt: &str,
@@ -427,6 +431,7 @@ mod tests {
         }
     }
 
+    /// A `/models` listed price with only input and output.
     fn listed(input: f64, output: f64) -> ModelPricing {
         ModelPricing {
             input_cost_per_token: Some(input),
@@ -435,11 +440,11 @@ mod tests {
         }
     }
 
-    // OpenRouter serves `openai/gpt-6-astra` from three `OpenAI` endpoints that
-    // differ only by service tier, and returns the discounted `openai/flex` one
-    // first. Selecting by `provider_name` alone therefore stored $5/$25 for a
-    // model whose standard rate — and whose `/models` listed price — is
-    // $10/$50, halving every reported cost for it.
+    /// OpenRouter serves `openai/gpt-6-astra` from three `OpenAI` endpoints that
+    /// differ only by service tier, and returns the discounted `openai/flex` one
+    /// first. Selecting by `provider_name` alone therefore stored $5/$25 for a
+    /// model whose standard rate — and whose `/models` listed price — is
+    /// $10/$50, halving every reported cost for it.
     #[test]
     fn a_discounted_tier_does_not_outrank_the_standard_author_endpoint() {
         let endpoints = vec![
@@ -457,9 +462,9 @@ mod tests {
         assert_eq!(pricing.cache_read_input_token_cost, Some(1e-6));
     }
 
-    // The error is not one-directional: `openai/fast` is 2x the standard rate,
-    // so the same ordering dependency overcharges if OpenRouter ever returns
-    // that tier first.
+    /// The error is not one-directional: `openai/fast` is 2x the standard rate,
+    /// so the same ordering dependency overcharges if OpenRouter ever returns
+    /// that tier first.
     #[test]
     fn a_premium_tier_does_not_outrank_the_standard_author_endpoint() {
         let endpoints = vec![
@@ -475,9 +480,9 @@ mod tests {
         assert_eq!(pricing.output_cost_per_token, Some(5e-5));
     }
 
-    // Tiering is not an OpenAI shape. Google serves `gemini-3.6-flash` from
-    // `google-vertex/global/flex` before `google-vertex/global`, both as
-    // `Google`.
+    /// Tiering is not an OpenAI shape. Google serves `gemini-3.6-flash` from
+    /// `google-vertex/global/flex` before `google-vertex/global`, both as
+    /// `Google`.
     #[test]
     fn the_tier_rule_is_not_specific_to_one_author() {
         let endpoints = vec![
@@ -495,9 +500,9 @@ mod tests {
         assert_eq!(pricing.cache_read_input_token_cost, Some(7.5e-8));
     }
 
-    // Z.AI quantization tiers (`z-ai/fp4`, `z-ai/fp8`) quote prices that match
-    // no listed price, and the listed price there is a reseller's. Those models
-    // must keep resolving exactly as before, so the tier rule stays additive.
+    /// Z.AI quantization tiers (`z-ai/fp4`, `z-ai/fp8`) quote prices that match
+    /// no listed price, and the listed price there is a reseller's. Those models
+    /// must keep resolving exactly as before, so the tier rule stays additive.
     #[test]
     fn author_endpoint_still_wins_when_none_quotes_the_listed_price() {
         let endpoints = vec![
@@ -512,8 +517,8 @@ mod tests {
         assert_eq!(pricing.output_cost_per_token, Some(2.2e-6));
     }
 
-    // Two author endpoints quote the listed price; the one that publishes a
-    // cache-read rate wins over the one that does not, whatever the order.
+    /// Two author endpoints quote the listed price; the one that publishes a
+    /// cache-read rate wins over the one that does not, whatever the order.
     #[test]
     fn equally_priced_author_endpoints_keep_the_one_with_a_cache_read_rate() {
         let endpoints = vec![
@@ -528,8 +533,8 @@ mod tests {
         assert_eq!(pricing.cache_read_input_token_cost, Some(1e-6));
     }
 
-    // Upstream #1028 also picks a same-priced non-author endpoint when the
-    // author serves none; this tree keeps the listed price there instead.
+    /// Upstream #1028 also picks a same-priced non-author endpoint when the
+    /// author serves none; this tree keeps the listed price there instead.
     #[test]
     fn no_author_endpoint_leaves_the_listed_price_to_the_caller() {
         let endpoints = vec![endpoint("Azure", "0.00001", "0.00005", Some("0.000001"))];
