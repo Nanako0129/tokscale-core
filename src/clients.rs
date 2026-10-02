@@ -671,6 +671,21 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Kimchi Coding uses the Pi session format under its own agent directory.
+    // The launcher exposes KIMCHI_CODING_AGENT_DIR for relocated installs.
+    // Upstream numbers this client 41.
+    Kimchi = 38 => {
+        id: "kimchi",
+        root: PathRoot::EnvVar {
+            var: "KIMCHI_CODING_AGENT_DIR",
+            fallback_relative: ".config/kimchi/harness",
+        },
+        relative: "sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -760,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 38);
+        assert_eq!(ClientId::COUNT, 39);
     }
 
     #[test]
@@ -774,6 +789,29 @@ mod tests {
             "/tmp/home/.local/share/muse/sessions"
         );
         assert_eq!(client.data().pattern, "session.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    #[serial]
+    fn test_kimchi_client_registered_with_agent_dir_override() {
+        let mut env = EnvGuard::capture(&["KIMCHI_CODING_AGENT_DIR"]);
+        env.set("KIMCHI_CODING_AGENT_DIR", "/custom/kimchi");
+        let client = ClientId::from_str("kimchi").expect("kimchi should be registered");
+        assert_eq!(client, ClientId::Kimchi);
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/custom/kimchi/sessions"
+        );
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            "/tmp/home/.config/kimchi/harness/sessions"
+        );
+        assert_eq!(client.data().pattern, "*.jsonl");
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);
