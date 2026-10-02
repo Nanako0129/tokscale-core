@@ -87,18 +87,18 @@ fn credit_sum(entries: Option<&Value>) -> f64 {
         .sum()
 }
 
-/// Kiro bills in credits. Once a conversation reports any, its credits are its
-/// whole provider-reported cost: every emitted message is marked, so token
-/// pricing never adds an estimate on top, and a message carrying no credits of
-/// its own costs 0. `credits[i]` belongs to `messages[i]`. Tokens are untouched.
+/// Kiro bills in credits. A message that carries credits gets them as its
+/// provider-reported cost, so token pricing does not replace it; a message
+/// without credits keeps cost 0 / `Unknown` for token pricing, because no
+/// source shows that a conversation's credits cover turns that report none.
+/// `credits[i]` belongs to `messages[i]`. Tokens are untouched.
 fn apply_credit_costs(messages: &mut [UnifiedMessage], credits: &[f64]) {
     debug_assert_eq!(messages.len(), credits.len());
-    if credits.iter().sum::<f64>() <= 0.0 {
-        return;
-    }
     for (message, credits) in messages.iter_mut().zip(credits) {
-        message.cost = credits * CREDIT_TO_USD;
-        message.mark_provider_reported_cost();
+        if *credits > 0.0 {
+            message.cost = credits * CREDIT_TO_USD;
+            message.mark_provider_reported_cost();
+        }
     }
 }
 
@@ -1401,7 +1401,11 @@ pub fn parse_kiro_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
 
         // Conversation-level credits (unlike the CLI's per-turn ones) go on the
-        // conversation's first emitted message.
+        // conversation's first emitted message, as upstream. Whether they are
+        // the conversation's total or only its latest turn's is unverified
+        // (upstream's fixtures are single-turn), so the other messages stay
+        // token-priced: if the credits are the total, the overcount is at most
+        // those messages' token estimates.
         let credits = credit_sum(
             parsed
                 .user_turn_metadata
@@ -2482,12 +2486,21 @@ not valid json at all
         assert_eq!(strip(token_view(&credited)), strip(token_view(&control)));
         // Each metered turn carries 0.25 credit; non-credit units and valueless
         // entries contribute nothing. Turn 0's credit moves forward to the
-        // first emitted turn, turn 4's back to the last; the turn between
-        // carries none and is still provider-reported, so token pricing cannot
-        // add to a conversation whose cost is its credits.
-        let costs: Vec<f64> = credited.iter().map(|m| m.cost).collect();
-        assert_eq!(costs, vec![0.25 * CREDIT_TO_USD, 0.0, 0.5 * CREDIT_TO_USD]);
-        assert!(credited.iter().all(UnifiedMessage::has_authoritative_cost));
+        // first emitted turn, turn 4's back to the last. Turn 2 reports no
+        // credits, so it stays unpriced here and token pricing prices it; its
+        // credits (if any) are counted nowhere else, so that cannot double.
+        let view: Vec<(f64, bool)> = credited
+            .iter()
+            .map(|m| (m.cost, m.has_authoritative_cost()))
+            .collect();
+        assert_eq!(
+            view,
+            vec![
+                (0.25 * CREDIT_TO_USD, true),
+                (0.0, false),
+                (0.5 * CREDIT_TO_USD, true)
+            ]
+        );
         assert_eq!(credited[0].message_count, 3);
     }
 
@@ -2567,10 +2580,11 @@ not valid json at all
         let credited = &both[2..];
         assert_eq!(token_view(credited), token_view(&control));
         // Conversation-level credits sit on the first emitted message; the
-        // rest are provider-reported at 0 so token pricing cannot add to them.
+        // rest stay unpriced for token pricing, as upstream.
         assert_eq!(credited[0].cost, 0.25 * CREDIT_TO_USD);
+        assert!(credited[0].has_authoritative_cost());
         assert_eq!(credited[1].cost, 0.0);
-        assert!(credited.iter().all(UnifiedMessage::has_authoritative_cost));
+        assert!(!credited[1].has_authoritative_cost());
         assert!(both[..2].iter().all(|m| !m.has_authoritative_cost()));
         assert_eq!(credited[0].message_count, 4);
         assert_eq!(credited[1].message_count, 2);
@@ -2652,7 +2666,7 @@ not valid json at all
         );
         assert_eq!(
             kept.iter().filter(|m| m.has_authoritative_cost()).count(),
-            3
+            2
         );
     }
 }

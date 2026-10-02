@@ -20759,10 +20759,9 @@ mod tests {
     }
 
     // Upstream #1342, credits half: Kiro credits become a provider-reported
-    // cost that token pricing must neither replace nor add to on the
-    // materialized and streaming lanes -- for the credited turn and for an
-    // uncredited turn of the same conversation -- from both the CLI files and
-    // the SQLite database. The count lane carries no cost; it reports summed
+    // cost that token pricing must not replace on the materialized and
+    // streaming lanes, from both the CLI files and the SQLite database, while
+    // an uncredited turn of the same conversation is still token-priced. The count lane carries no cost; it reports summed
     // request counts. A v1 cache entry of the unchanged CLI file (cost 0,
     // request count 1) must be re-parsed, not replayed; the SQLite source is
     // never cached.
@@ -20867,14 +20866,15 @@ mod tests {
                     )
                 })
                 .collect();
-            // Token pricing would give each message (input + output) * 1.0.
+            // Token pricing gives (input + output) * 1.0; a credited message
+            // must keep its credit cost instead.
             assert_eq!(
                 view,
                 vec![
                     ("conv-1:0".to_string(), 0.5 * 0.04, true, 2, 100, 10),
-                    ("conv-1:1".to_string(), 0.0, true, 1, 0, 2),
+                    ("conv-1:1".to_string(), 2.0, false, 1, 0, 2),
                     ("credited:0".to_string(), 0.25 * 0.04, true, 3, 100, 4),
-                    ("credited:1".to_string(), 0.0, true, 1, 1, 1),
+                    ("credited:1".to_string(), 2.0, false, 1, 1, 1),
                 ],
                 "{lane}"
             );
