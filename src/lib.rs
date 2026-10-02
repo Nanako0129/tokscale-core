@@ -1901,6 +1901,39 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // `parse_muse_file` never reads a cost (upstream's parser and fixtures
+    // carry none; no local Muse data was checked), so every message leaves it
+    // at 0.0, pricing is its only cost source, and the generic source cache
+    // is safe. The parser skips the parent-side `workflow_child_lifecycle`
+    // aggregates (they duplicate the child's own scanned transcript) and keys
+    // each call by its stream sequence, so the cross-file dedup is first-wins
+    // on keys that survive a warm cache hit (upstream `d409ee07`).
+    let muse_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Muse)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Muse),
+                &source_cache,
+                pricing,
+                sessions::muse::parse_muse_file,
+            )
+        })
+        .collect();
+    let mut muse_seen: HashSet<String> = HashSet::new();
+    for outcome in muse_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut muse_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // Parse Qwen files
     let qwen_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Qwen)
@@ -4420,6 +4453,7 @@ where
         ClientId::Hindsight,
         sessions::hindsight::parse_hindsight_file
     );
+    simple_lane!(ClientId::Muse, sessions::muse::parse_muse_file);
     simple_lane!(ClientId::Qwen, sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
     // sibling api_conversation_history.json (which parse_roo_kilo_file reads for
@@ -6301,6 +6335,21 @@ fn parse_local_clients_inner(
     let hindsight_count = summed_parsed_message_count(&hindsight_msgs);
     counts.set(ClientId::Hindsight, hindsight_count);
     messages.extend(hindsight_msgs);
+
+    let muse_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Muse)
+        .par_iter()
+        .flat_map(|path| sessions::muse::parse_muse_file(path))
+        .collect();
+    let mut muse_seen: HashSet<String> = HashSet::new();
+    let muse_msgs: Vec<ParsedMessage> = muse_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut muse_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let muse_count = summed_parsed_message_count(&muse_msgs);
+    counts.set(ClientId::Muse, muse_count);
+    messages.extend(muse_msgs);
 
     // Parse Qwen JSONL files in parallel
     let qwen_msgs: Vec<ParsedMessage> = scan_result
@@ -22662,6 +22711,144 @@ mod tests {
             2,
             "an old db.sqlite with a newer -wal must survive modified-after pruning"
         );
+    }
+
+    // ---- Muse (upstream `d409ee07` + #1355): nested discovery, pricing, dedup ----
+    // Adapted from upstream `tests/muse.rs`'s end-to-end test: a parent session
+    // and its `subagent/<uuid>/` transcript are separate sessions; a byte copy
+    // of the parent under another date directory collapses on its stream key.
+    // Every lane must agree, and the priced cost must match the split buckets
+    // (cache reads out of input, reasoning out of output).
+    #[test]
+    #[serial_test::serial]
+    fn test_muse_nested_sessions_price_and_dedup_in_every_lane() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        const PARENT: &str = "01a0b7d1-b7af-7de2-8369-4f4815ae1d72";
+        const CHILD: &str = "01a0b7df-bac6-75d2-b28e-8dab127205f0";
+        let usage_line = |session: &str, sequence: i64, recorded_at: i64, usage: &str| {
+            format!(
+                r#"{{"schema_version":1,"stream":{{"kind":"session","id":"{session}"}},"sequence":{sequence},"recorded_at":{recorded_at},"record_type":"event","payload_type":"runtime.session","payload_schema_version":1,"payload":{{"kind":"run","event":{{"kind":"model_completed","usage":{usage},"duration_ms":1000,"finish_reason":"tool_calls","model":"muse-spark-1.3-contributor"}}}}}}"#
+            )
+        };
+        let sessions = source_home.path().join(".local/share/muse/sessions");
+        let parent_line = usage_line(
+            PARENT,
+            39,
+            1789790455896395,
+            r#"{"input_tokens":1000,"output_tokens":250,"cached_tokens":400,"cache_write_tokens":50,"cache_read_tokens":400,"reasoning_tokens":25}"#,
+        );
+        for date in ["2026/09/18", "2026/09/19"] {
+            let dir = sessions.join(date).join(PARENT);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("session.jsonl"), &parent_line).unwrap();
+        }
+        let child_dir = sessions
+            .join("2026/09/18")
+            .join(PARENT)
+            .join("subagent")
+            .join(CHILD);
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(
+            child_dir.join("session.jsonl"),
+            usage_line(
+                CHILD,
+                40,
+                1789791288021470,
+                r#"{"input_tokens":100,"output_tokens":10,"cached_tokens":0,"cache_write_tokens":0,"cache_read_tokens":0,"reasoning_tokens":0}"#,
+            ),
+        )
+        .unwrap();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "muse-spark-1.3-contributor".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                cache_read_input_token_cost: Some(0.0001),
+                cache_creation_input_token_cost: Some(0.0005),
+                ..Default::default()
+            },
+        );
+        let pricing_service = pricing::PricingService::new(litellm, HashMap::new());
+        let parent_cost = 600.0 * 0.001 + (225.0 + 25.0) * 0.002 + 400.0 * 0.0001 + 50.0 * 0.0005;
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["muse".to_string()];
+        let check = |messages: Vec<UnifiedMessage>, lane: &str| {
+            assert_eq!(messages.len(), 2, "{lane}");
+            let parent = messages
+                .iter()
+                .find(|m| m.session_id == PARENT)
+                .unwrap_or_else(|| panic!("{lane}: parent missing"));
+            assert_eq!(
+                (
+                    parent.tokens.input,
+                    parent.tokens.cache_read,
+                    parent.tokens.output,
+                    parent.tokens.reasoning,
+                    parent.tokens.cache_write
+                ),
+                (600, 400, 225, 25, 50),
+                "{lane}"
+            );
+            assert_eq!(parent.provider_id, "meta", "{lane}");
+            assert!((parent.cost - parent_cost).abs() < 1e-10, "{lane}");
+            assert!(messages.iter().any(|m| m.session_id == CHILD), "{lane}");
+        };
+
+        // Each lane runs cold (cache cleared first) and then warm, so both the
+        // parse-and-writeback and the cache-hit paths are exercised per lane.
+        let clear_cache = |expect_written: bool| {
+            let cache_dir = crate::paths::get_cache_dir();
+            assert!(cache_dir.starts_with(cache_home.path()));
+            assert_eq!(cache_dir.exists(), expect_written, "{cache_dir:?}");
+            if expect_written {
+                std::fs::remove_dir_all(&cache_dir).unwrap();
+            }
+        };
+        clear_cache(false);
+        for pass in ["cold", "warm"] {
+            check(
+                parse_all_messages_with_pricing_with_env_strategy(
+                    home,
+                    &clients,
+                    Some(&pricing_service),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                    None,
+                ),
+                &format!("materialized, {pass}"),
+            );
+        }
+        clear_cache(true);
+        for pass in ["cold", "warm"] {
+            let mut streamed = Vec::new();
+            scan_messages_streaming(
+                home,
+                &clients,
+                Some(&pricing_service),
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_m: &UnifiedMessage| true,
+                &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+            );
+            check(streamed, &format!("streaming, {pass}"));
+        }
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Muse), 2);
+        assert_eq!(counted.messages.len(), 2);
     }
 
     // ---- Augment: a session snapshot copied to a second file counts once ----
