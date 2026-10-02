@@ -7,6 +7,60 @@ pub enum PathRoot {
         var: &'static str,
         fallback_relative: &'static str,
     },
+    /// Reasonix's state root: `REASONIX_STATE_HOME`, then `REASONIX_HOME`,
+    /// then the platform default (`~/.reasonix`; on Windows the roaming
+    /// config dir's `reasonix`).
+    ReasonixHome,
+}
+
+pub(crate) const REASONIX_STATE_HOME: &str = "REASONIX_STATE_HOME";
+pub(crate) const REASONIX_HOME: &str = "REASONIX_HOME";
+/// Reasonix root overrides in precedence order; every resolver reads this.
+pub(crate) const REASONIX_ROOT_KEYS: [&str; 2] = [REASONIX_STATE_HOME, REASONIX_HOME];
+
+/// A Reasonix root override: trimmed, `~` expanded against the scan home, and
+/// a relative path resolved against the current directory. Upstream also
+/// expands `${VAR}` / `${VAR:-default}` here; this vendor does not, because the
+/// resolved source context captures only a fixed set of environment keys and
+/// an expansion would read variables outside it (see UPSTREAM.md).
+pub(crate) fn clean_reasonix_env_dir(name: &str, home_dir: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    let path = reasonix_root_from_value(&value, std::path::Path::new(home_dir))?;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Trim a Reasonix root override and expand a leading `~` against `home`;
+/// `None` when blank. Relative results are resolved by the caller. Shared by
+/// the env-strategy resolver above and the resolved source context.
+pub(crate) fn reasonix_root_from_value(
+    value: &str,
+    home: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let path = if value == "~" {
+        home.to_path_buf()
+    } else if let Some(relative) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        // Push each component so `~/a/b` gets native separators on Windows,
+        // as upstream's `join_home` does (#1048).
+        relative
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty())
+            .fold(home.to_path_buf(), |path, part| path.join(part))
+    } else {
+        std::path::PathBuf::from(value)
+    };
+    Some(path)
 }
 
 impl PathRoot {
@@ -67,6 +121,34 @@ impl PathRoot {
                     }
                 } else {
                     format!("{}/{}", home_dir, fallback_relative)
+                }
+            }
+            PathRoot::ReasonixHome => {
+                if use_env_roots {
+                    if let Some(root) = REASONIX_ROOT_KEYS
+                        .iter()
+                        .find_map(|key| clean_reasonix_env_dir(key, home_dir))
+                    {
+                        return root;
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    if use_env_roots {
+                        if let Some(config_dir) = dirs::config_dir() {
+                            return config_dir.join("reasonix").to_string_lossy().into_owned();
+                        }
+                    }
+                    std::path::Path::new(home_dir)
+                        .join("AppData")
+                        .join("Roaming")
+                        .join("reasonix")
+                        .to_string_lossy()
+                        .into_owned()
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    format!("{home_dir}/.reasonix")
                 }
             }
         }
@@ -576,6 +658,19 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Reasonix stores authoritative provider usage as daily append-only JSONL
+    // records under `<state root>/stats/`. Transcript JSONL is intentionally
+    // excluded: it lacks exact token counters and overlaps these records.
+    // Upstream numbers this client 42.
+    Reasonix = 37 => {
+        id: "reasonix",
+        root: PathRoot::ReasonixHome,
+        relative: "stats",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -665,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 37);
+        assert_eq!(ClientId::COUNT, 38);
     }
 
     #[test]
@@ -706,6 +801,56 @@ mod tests {
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_reasonix_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("reasonix").expect("reasonix client should be registered");
+        assert_eq!(client.data().relative_path, "stats");
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            "/tmp/home/.reasonix/stats"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_reasonix_stats_prefers_state_home_then_reasonix_home() {
+        let mut env = EnvGuard::capture(&[REASONIX_STATE_HOME, REASONIX_HOME]);
+        // Platform-absolute paths: on Windows a rooted path without a drive
+        // is relative and would be joined onto the current directory.
+        let base = std::env::temp_dir();
+        let home = base.join("rx-scan-home");
+        let home_str = home.to_str().unwrap();
+        let state = base.join("rx-state");
+        let reasonix_home = base.join("rx-home");
+        let client = ClientId::Reasonix.data();
+        let resolved = || std::path::PathBuf::from(client.resolve_path(home_str));
+
+        env.set(REASONIX_HOME, reasonix_home.as_os_str());
+        env.set(REASONIX_STATE_HOME, state.as_os_str());
+        assert_eq!(resolved(), state.join("stats"));
+        // A blank state home falls through to REASONIX_HOME.
+        env.set(REASONIX_STATE_HOME, "   ");
+        assert_eq!(resolved(), reasonix_home.join("stats"));
+        // `~` expands against the scan home, one component at a time.
+        env.set(REASONIX_HOME, "~/rx/inner");
+        assert_eq!(
+            client.resolve_path(home_str),
+            format!("{}/stats", home.join("rx").join("inner").display())
+        );
+        // Overrides are ignored when env roots are off.
+        assert_ne!(
+            std::path::PathBuf::from(client.resolve_path_with_env_strategy(home_str, false)),
+            reasonix_home.join("stats")
+        );
     }
 
     #[test]

@@ -1934,6 +1934,28 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // Reasonix stats JSONL: append-only daily files; the sampled fingerprint
+    // re-parses a file once records are appended.
+    let reasonix_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Reasonix),
+                &source_cache,
+                pricing,
+                sessions::reasonix::parse_reasonix_file,
+            )
+        })
+        .collect();
+    for outcome in reasonix_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // Parse Qwen files
     let qwen_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Qwen)
@@ -4454,6 +4476,7 @@ where
         sessions::hindsight::parse_hindsight_file
     );
     simple_lane!(ClientId::Muse, sessions::muse::parse_muse_file);
+    simple_lane!(ClientId::Reasonix, sessions::reasonix::parse_reasonix_file);
     simple_lane!(ClientId::Qwen, sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
     // sibling api_conversation_history.json (which parse_roo_kilo_file reads for
@@ -6350,6 +6373,21 @@ fn parse_local_clients_inner(
     let muse_count = summed_parsed_message_count(&muse_msgs);
     counts.set(ClientId::Muse, muse_count);
     messages.extend(muse_msgs);
+
+    // Reasonix records carry an authoritative request count per row.
+    let reasonix_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::reasonix::parse_reasonix_file(path)
+                .into_iter()
+                .map(|message| unified_to_parsed(&message))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let reasonix_count = summed_parsed_message_count(&reasonix_msgs);
+    counts.set(ClientId::Reasonix, reasonix_count);
+    messages.extend(reasonix_msgs);
 
     // Parse Qwen JSONL files in parallel
     let qwen_msgs: Vec<ParsedMessage> = scan_result
@@ -22979,5 +23017,75 @@ mod tests {
             .map(|m| m.input + m.output + m.cache_read + m.cache_write + m.reasoning)
             .sum();
         assert_eq!(counted_total, 4559 + 1100);
+    }
+
+    // ---- Reasonix stats: three lanes, request counts, appends ----
+    fn write_reasonix_stats(source_home: &Path, file: &str, lines: &[&str]) {
+        // The platform default root (Windows: AppData/Roaming/reasonix).
+        let stats_dir = PathBuf::from(
+            ClientId::Reasonix
+                .data()
+                .resolve_path_with_env_strategy(source_home.to_str().unwrap(), false),
+        );
+        std::fs::create_dir_all(&stats_dir).unwrap();
+        std::fs::write(stats_dir.join(file), format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_reasonix_stats_lanes_agree_and_reparse_appends() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let first = r#"{"ts":"2026-08-04T09:10:11Z","model":"deepseek/chat","prompt":100,"completion":20,"cache_hit":30,"cache_miss":70,"total":120,"requests":3}"#;
+        let second = r#"{"ts":"2026-08-04T09:11:11Z","model":"deepseek/chat","prompt":10,"completion":2,"total":12}"#;
+        write_reasonix_stats(source_home.path(), "2026-08-04.jsonl", &[first]);
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["reasonix".to_string()];
+        let shape = |messages: &[UnifiedMessage]| {
+            let mut shape: Vec<_> = messages
+                .iter()
+                .map(|m| (m.dedup_key.clone(), m.message_count, m.tokens.clone()))
+                .collect();
+            shape.sort_by(|a, b| a.0.cmp(&b.0));
+            shape
+        };
+        let streamed = || {
+            let mut streamed = Vec::new();
+            scan_messages_streaming(
+                home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |message| streamed.push(message.clone()),
+            );
+            streamed
+        };
+        let counted = || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(home.to_string()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        let materialized = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].tokens.total(), 120);
+        assert_eq!(shape(&streamed()), shape(&materialized));
+        assert_eq!(counted().counts.get(ClientId::Reasonix), 3);
+
+        // Appending a record re-parses the warm-cached daily file.
+        write_reasonix_stats(source_home.path(), "2026-08-04.jsonl", &[first, second]);
+        let materialized = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(shape(&streamed()), shape(&materialized));
+        let counted = counted();
+        assert_eq!(counted.counts.get(ClientId::Reasonix), 4);
+        assert_eq!(counted.messages.len(), 2);
     }
 }

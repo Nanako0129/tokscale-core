@@ -121,21 +121,78 @@ fn contains_delimited(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// Match a model-family token at a real leading boundary. A decimal digit may
+/// immediately follow the family because catalog ids commonly concatenate a
+/// major version (`gpt4`, `claude3`, `qwen3`); an ASCII letter may not, which
+/// rejects ordinary words that merely contain a family name.
+fn contains_versioned_family(haystack: &str, family: &str) -> bool {
+    for (pos, _) in haystack.match_indices(family) {
+        let before_ok = haystack[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric());
+        let after_pos = pos + family.len();
+        let after_ok = haystack[after_pos..]
+            .chars()
+            .next()
+            .is_none_or(|character| character.is_ascii_digit() || !character.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// A family this vendor matches as a plain substring; the delimiter-aware
+/// variant requires a versioned-family boundary instead.
+fn contains_family(haystack: &str, family: &str, delimiter_aware: bool) -> bool {
+    if delimiter_aware {
+        contains_versioned_family(haystack, family)
+    } else {
+        haystack.contains(family)
+    }
+}
+
+/// A family this vendor matches with `contains_delimited`; the
+/// delimiter-aware variant also accepts a concatenated version (`opus4`).
+fn contains_named_family(haystack: &str, family: &str, delimiter_aware: bool) -> bool {
+    if delimiter_aware {
+        contains_versioned_family(haystack, family)
+    } else {
+        contains_delimited(haystack, family)
+    }
+}
+
 pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
+    inferred_provider_from_model_inner(model, false)
+}
+
+/// Delimiter-aware inference (upstream #1095), for damaged-input recovery
+/// paths only: it rejects words that merely contain a family name
+/// (`declaude-x`), which plain inference would attribute. Every other caller
+/// keeps `inferred_provider_from_model`.
+pub(crate) fn inferred_provider_from_model_delimited(model: &str) -> Option<&'static str> {
+    inferred_provider_from_model_inner(model, true)
+}
+
+fn inferred_provider_from_model_inner(
+    model: &str,
+    delimit_family_names: bool,
+) -> Option<&'static str> {
     let lower = model.to_lowercase();
 
-    if lower.contains("claude")
-        || lower.contains("anthropic")
-        || contains_delimited(&lower, "opus")
-        || contains_delimited(&lower, "sonnet")
-        || contains_delimited(&lower, "haiku")
-        || contains_delimited(&lower, "fable")
+    if contains_family(&lower, "claude", delimit_family_names)
+        || contains_family(&lower, "anthropic", delimit_family_names)
+        || contains_named_family(&lower, "opus", delimit_family_names)
+        || contains_named_family(&lower, "sonnet", delimit_family_names)
+        || contains_named_family(&lower, "haiku", delimit_family_names)
+        || contains_named_family(&lower, "fable", delimit_family_names)
     {
         return Some("anthropic");
     }
 
-    if lower.contains("gpt")
-        || lower.contains("openai")
+    if contains_family(&lower, "gpt", delimit_family_names)
+        || contains_family(&lower, "openai", delimit_family_names)
         || contains_delimited(&lower, "o1")
         || contains_delimited(&lower, "o3")
         || contains_delimited(&lower, "o4")
@@ -143,50 +200,56 @@ pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
         return Some("openai");
     }
 
-    if lower.contains("gemini") || lower.contains("google") {
+    if contains_family(&lower, "gemini", delimit_family_names)
+        || contains_family(&lower, "google", delimit_family_names)
+    {
         return Some("google");
     }
 
-    if lower.contains("grok") {
+    if contains_family(&lower, "grok", delimit_family_names) {
         return Some("xai");
     }
 
-    if lower.contains("deepseek") {
+    if contains_family(&lower, "deepseek", delimit_family_names) {
         return Some("deepseek");
     }
 
-    if lower.contains("minimax") {
+    if contains_family(&lower, "minimax", delimit_family_names) {
         return Some("minimax");
     }
 
-    if lower.contains("mistral") || lower.contains("mixtral") {
+    if contains_family(&lower, "mistral", delimit_family_names)
+        || contains_family(&lower, "mixtral", delimit_family_names)
+    {
         return Some("mistral");
     }
 
-    if lower.contains("llama") || contains_delimited(&lower, "meta") {
+    if contains_family(&lower, "llama", delimit_family_names)
+        || contains_named_family(&lower, "meta", delimit_family_names)
+    {
         return Some("meta");
     }
 
-    if lower.contains("qwen") {
+    if contains_family(&lower, "qwen", delimit_family_names) {
         return Some("qwen");
     }
 
     // Kimi (Moonshot AI) — `kimi`, `kimi-k2.5`, `kimi-code` variants
-    if contains_delimited(&lower, "kimi") {
+    if contains_named_family(&lower, "kimi", delimit_family_names) {
         return Some("moonshotai");
     }
     // MiMo (Xiaomi) — `mimo-v2.5` etc.
-    if contains_delimited(&lower, "mimo") {
+    if contains_named_family(&lower, "mimo", delimit_family_names) {
         return Some("xiaomi");
     }
     // GLM (Zhipu AI / Zai) — `glm-4.6`, `glm-5.2` etc.
-    if contains_delimited(&lower, "glm") {
+    if contains_named_family(&lower, "glm", delimit_family_names) {
         return Some("zai");
     }
 
     // Sakana's Fugu model line. Provider identity is independent of whether
     // the bare router model has a recoverable fixed price.
-    if lower.contains("fugu") {
+    if contains_family(&lower, "fugu", delimit_family_names) {
         return Some("sakana");
     }
 
@@ -387,5 +450,64 @@ mod tests {
         assert!(!matches_provider_hint("openai/gpt-4", None));
         assert!(!matches_provider_hint("openai/gpt-4", Some("")));
         assert!(!matches_provider_hint("openai/gpt-4", Some("unknown")));
+    }
+
+    #[test]
+    fn delimiter_aware_inference_accepts_family_versions_not_word_substrings() {
+        let genuine = [
+            ("gpt4-turbo", "openai"),
+            ("claude3-opus", "anthropic"),
+            ("opus4", "anthropic"),
+            ("sonnet4", "anthropic"),
+            ("haiku3", "anthropic"),
+            ("fable5", "anthropic"),
+            ("gemini2-pro", "google"),
+            ("grok3", "xai"),
+            ("deepseek3", "deepseek"),
+            ("minimax2", "minimax"),
+            ("mistral4", "mistral"),
+            ("mixtral8x7b", "mistral"),
+            ("llama3", "meta"),
+            ("meta3", "meta"),
+            ("qwen3-coder", "qwen"),
+            ("fugu2", "sakana"),
+            ("kimi2", "moonshotai"),
+            ("mimo2", "xiaomi"),
+            ("glm5", "zai"),
+        ];
+        for (model, provider) in genuine {
+            assert_eq!(
+                inferred_provider_from_model_delimited(model),
+                Some(provider),
+                "{model}"
+            );
+        }
+
+        for model in [
+            "agpt-model",
+            "declaude-x",
+            "pregeminified",
+            "engroked",
+            "deepseeking",
+            "minimaximal",
+            "demistralized",
+            "remixtralized",
+            "collamated",
+            "unqwened-model",
+            "defugued",
+            "skimimoed",
+            "glimmer",
+            "unkimied",
+            "unsonneted",
+            "alphabetafablegamma",
+            "préqwened",
+            "qwené-model",
+        ] {
+            assert_eq!(
+                inferred_provider_from_model_delimited(model),
+                None,
+                "{model} is not a genuine family token"
+            );
+        }
     }
 }
