@@ -20,6 +20,7 @@ pub mod gjc;
 pub mod goose;
 pub mod grok;
 pub mod hermes;
+pub mod hindsight;
 pub mod jcode;
 pub mod junie;
 pub mod kilo;

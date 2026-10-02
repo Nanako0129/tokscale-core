@@ -546,6 +546,22 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Hindsight persists exact LLM usage metadata from its self-hosted memory
+    // service. The client parses a local append-only JSONL mirror written by
+    // upstream's `tokscale hindsight sync` (no writer ships in this vendor or
+    // its consumers). Upstream numbers this client 52.
+    Hindsight = 35 => {
+        id: "hindsight",
+        root: PathRoot::EnvVar {
+            var: "HINDSIGHT_HOME",
+            fallback_relative: ".hindsight",
+        },
+        relative: "usage",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -635,7 +651,31 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 35);
+        assert_eq!(ClientId::COUNT, 36);
+    }
+
+    #[test]
+    #[serial]
+    fn test_hindsight_client_registered_with_home_override() {
+        let mut env = EnvGuard::capture(&["HINDSIGHT_HOME"]);
+        env.set("HINDSIGHT_HOME", "/custom/hindsight");
+        let client = ClientId::from_str("hindsight").expect("Hindsight should be registered");
+        assert_eq!(client, ClientId::Hindsight);
+        assert_eq!(client.data().relative_path, "usage");
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/custom/hindsight/usage"
+        );
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            "/tmp/home/.hindsight/usage"
+        );
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
     }
 
     #[test]

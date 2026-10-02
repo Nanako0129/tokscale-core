@@ -944,6 +944,9 @@ fn parser_version(client: ClientId) -> u32 {
         // forever. The SQLite source gets the same changes but is parsed on
         // every scan, never cached. Vendor-local numbering.
         ClientId::Kiro => 2,
+        // 1: Hindsight's usage-ledger parser (upstream `parse_hindsight_file`
+        // plus the vendor-local `split_cached_input`).
+        ClientId::Hindsight => 1,
         _ => 1,
     }
 }
