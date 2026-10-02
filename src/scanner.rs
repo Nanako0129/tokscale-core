@@ -112,6 +112,8 @@ pub struct ScanResult {
     pub goose_db: Option<PathBuf>,
     pub zed_db: Option<PathBuf>,
     pub kiro_db: Option<PathBuf>,
+    /// ZCode v2 CLI usage database at `~/.zcode/cli/db/db.sqlite`.
+    pub zcode_db: Option<PathBuf>,
     pub crush_dbs: Vec<CrushDbSource>,
     /// Path to the OpenCode legacy JSON directory (for migration cache stat checks)
     pub opencode_json_dir: Option<PathBuf>,
@@ -129,6 +131,7 @@ impl Default for ScanResult {
             goose_db: None,
             zed_db: None,
             kiro_db: None,
+            zcode_db: None,
             crush_dbs: Vec::new(),
             opencode_json_dir: None,
         }
@@ -864,7 +867,7 @@ fn supports_extra_dir_scanning(client_id: ClientId) -> bool {
     // `scan_directory` to find them from user-provided roots.
     !matches!(
         client_id,
-        ClientId::Kilo | ClientId::Crush | ClientId::Goose
+        ClientId::Kilo | ClientId::Crush | ClientId::Goose | ClientId::Zcode
     )
 }
 
@@ -1129,6 +1132,7 @@ fn scan_all_clients_resolved_inner(
                 | ClientId::Hermes
                 | ClientId::Goose
                 | ClientId::Zed
+                | ClientId::Zcode
                 | ClientId::Crush
                 | ClientId::Codebuff
         ) {
@@ -1406,6 +1410,10 @@ fn scan_all_clients_resolved_inner(
         .into_iter()
         .find(|path| path.is_file());
     }
+    if enabled.contains(&ClientId::Zcode) {
+        let path = context.resolve_client_path(ClientId::Zcode)?;
+        result.zcode_db = path.is_file().then_some(path);
+    }
     if enabled.contains(&ClientId::Codebuff) {
         if use_env_roots {
             if context.source_env_is_explicit("CODEBUFF_DATA_DIR") {
@@ -1520,6 +1528,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 | ClientId::Hermes
                 | ClientId::Goose
                 | ClientId::Zed
+                | ClientId::Zcode
                 | ClientId::Crush
                 | ClientId::Codebuff
         ) {
@@ -1935,6 +1944,15 @@ fn scan_all_clients_with_env_strategy_inner(
                 result.kiro_db = Some(macos_path);
             }
         }
+    }
+
+    if enabled.contains(&ClientId::Zcode) {
+        let path = PathBuf::from(
+            ClientId::Zcode
+                .data()
+                .resolve_path_with_env_strategy(home_dir, use_env_roots),
+        );
+        result.zcode_db = path.is_file().then_some(path);
     }
 
     if enabled.contains(&ClientId::Codebuff) {
@@ -4628,6 +4646,33 @@ mod tests {
             result.get(ClientId::OpenCodeReview),
             std::slice::from_ref(&review)
         );
+    }
+
+    #[test]
+    fn test_scan_all_clients_discovers_zcode_v2_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().to_path_buf();
+        let db_dir = home.join(".zcode/cli/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("db.sqlite");
+        File::create(&db_path).unwrap();
+        // The JSONL root upstream also scans is not ported: nothing there may
+        // reach any lane.
+        let legacy_dir = home.join(".zcode/projects/demo");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        File::create(legacy_dir.join("session.jsonl")).unwrap();
+        let clients = ["zcode".to_string()];
+
+        let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, false);
+        assert_eq!(legacy.zcode_db.as_deref(), Some(db_path.as_path()));
+        assert!(legacy.get(ClientId::Zcode).is_empty());
+
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home), false, ScannerSettings::default())
+                .unwrap();
+        let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
+        assert_eq!(resolved.zcode_db.as_deref(), Some(db_path.as_path()));
+        assert!(resolved.get(ClientId::Zcode).is_empty());
     }
 
     #[test]

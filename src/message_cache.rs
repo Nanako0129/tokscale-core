@@ -930,6 +930,10 @@ fn parser_version(client: ClientId) -> u32 {
         // keep reporting zero OpenCode usage; the bump makes the namespace
         // cold so every source re-parses with the corrected query.
         ClientId::OpenCode => 2,
+        // 1: ZCode's v2 SQLite parser (upstream `parse_zcode_sqlite`). An
+        // explicit arm so the next ZCode parser change has a local counter
+        // to increment instead of sharing the default.
+        ClientId::Zcode => 1,
         _ => 1,
     }
 }
