@@ -83,6 +83,13 @@ const FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS: &[&str] = &[
     "gpt-5.4-pro-2026-03-05",
     "gpt-5.5",
     "gpt-5.5-2026-04-23",
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
 ];
 
 const MIN_FUZZY_MATCH_LEN: usize = 5;
@@ -6663,6 +6670,59 @@ mod tests {
                 source,
                 pricing.clone()
             )));
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_and_gpt_6_apply_full_request_pricing_above_272k() {
+        let pricing = ModelPricing {
+            input_cost_per_token: Some(0.000010),
+            input_cost_per_token_above_272k_tokens: Some(0.000020),
+            output_cost_per_token: Some(0.000050),
+            output_cost_per_token_above_272k_tokens: Some(0.000075),
+            cache_read_input_token_cost: Some(0.000001),
+            cache_read_input_token_cost_above_272k_tokens: Some(0.000002),
+            cache_creation_input_token_cost: Some(0.0000125),
+            ..Default::default()
+        };
+        let cost = |result: &LookupResult, input, output, cache_read| {
+            compute_cost_and_coverage_for_lookup_result(
+                result,
+                &TokenBreakdown {
+                    input,
+                    output,
+                    cache_read,
+                    ..Default::default()
+                },
+            )
+            .cost
+        };
+        for key in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+            "openai/gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
+            let result = lookup_result(key, "LiteLLM", pricing.clone());
+
+            // At the 272k boundary: standard rates.
+            let actual = cost(&result, 272_000, 10_000, 0);
+            let expected = 272_000.0 * 0.000010 + 10_000.0 * 0.000050;
+            assert!((actual - expected).abs() < 1e-12, "{key} at boundary");
+
+            // One token over: the whole request at the long-context rates.
+            let actual = cost(&result, 272_001, 10_000, 0);
+            let expected = 272_001.0 * 0.000020 + 10_000.0 * 0.000075;
+            assert!((actual - expected).abs() < 1e-12, "{key} above boundary");
+
+            // Input plus cache read selects the tier.
+            let actual = cost(&result, 250_000, 10_000, 50_000);
+            let expected = 250_000.0 * 0.000020 + 10_000.0 * 0.000075 + 50_000.0 * 0.000002;
+            assert!((actual - expected).abs() < 1e-12, "{key} with cache read");
         }
     }
 
