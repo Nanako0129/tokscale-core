@@ -84,6 +84,18 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("claude-opus-4.6", "claude-opus-4-6");
     m.insert("claude-sonnet-4.6", "claude-sonnet-4-6");
     m.insert("claude-haiku-4.6", "claude-haiku-4-6");
+    // GitHub Copilot reports Claude 4.1 without the separator; resolve it the
+    // same way github_copilot/gpt-4o already resolves to gpt-4o.
+    // Deliberately opus-only: `claude-sonnet-4-1` resolves cross-vendor to
+    // `databricks/databricks-claude-sonnet-4-1`, so aliasing the Copilot
+    // spelling onto it would route Sonnet 4.1 usage to Databricks rates.
+    m.insert("claude-opus-41", "claude-opus-4-1");
+    // Anthropic's "-0" suffix is their documented moving alias for the latest
+    // snapshot of a model line. Upstream also aliases `claude-opus-4-0` to the
+    // bare `claude-opus-4`; that one is not taken here because, without a
+    // provider hint, bare `claude-opus-4` resolves in this tree to an Opus 4.5
+    // reseller row at a third of the Opus 4 rate.
+    m.insert("claude-sonnet-4-0", "claude-sonnet-4");
     m.insert("anthropic/claude-4-5-opus", "claude-opus-4-5");
     m.insert("anthropic/claude-4-5-sonnet", "claude-sonnet-4-5");
     m.insert("anthropic/claude-4-5-haiku", "claude-haiku-4-5");
@@ -305,6 +317,19 @@ mod tests {
                 "{key} is in both CURSOR_PRICING_ALIASES and MODEL_ALIASES"
             );
         }
+    }
+
+    #[test]
+    fn copilot_opus_41_and_sonnet_4_0_resolve_and_the_deferred_aliases_stay_absent() {
+        assert_eq!(resolve_alias("claude-opus-41"), Some("claude-opus-4-1"));
+        assert_eq!(resolve_alias("Claude-Opus-41"), Some("claude-opus-4-1"));
+        assert_eq!(resolve_alias("claude-sonnet-4-0"), Some("claude-sonnet-4"));
+        assert_eq!(resolve_alias("Claude-Sonnet-4-0"), Some("claude-sonnet-4"));
+        // `claude-sonnet-4-1` resolves cross-vendor today, so no Copilot alias.
+        assert_eq!(resolve_alias("claude-sonnet-41"), None);
+        // Deferred until bare `claude-opus-4` resolves to the right model
+        // without a hint.
+        assert_eq!(resolve_alias("claude-opus-4-0"), None);
     }
 
     #[test]
