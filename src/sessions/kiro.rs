@@ -18,7 +18,7 @@ use crate::TokenBreakdown;
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -65,6 +65,44 @@ struct KiroTurnMetadata {
     total_request_count: Option<i32>,
     message_ids: Option<Vec<Option<String>>>,
     context_usage_percentage: Option<f64>,
+}
+
+/// USD value of one Kiro credit: Kiro's published pay-as-you-go overage rate
+/// (upstream #1342).
+const CREDIT_TO_USD: f64 = 0.04;
+
+/// Sum of `value` across `[{"value": .., "unit": "credit"}]` entries; entries in
+/// other units or without a numeric value contribute nothing.
+///
+/// Credits and request counts (upstream #1342) are read from a second, untyped
+/// parse of the same JSON rather than from the typed structs, which stay as
+/// they were: a field `serde_json::Value` refuses (an out-of-range number, a
+/// duplicate key, a lone surrogate, deep nesting) then costs only the credit or
+/// count, never the record and its tokens. The price is one extra parse per
+/// source.
+fn credit_sum(entries: Option<&Value>) -> f64 {
+    entries
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("unit").and_then(Value::as_str) == Some("credit"))
+        .filter_map(|entry| entry.get("value").and_then(Value::as_f64))
+        .sum()
+}
+
+/// Kiro bills in credits. A message that carries credits gets them as its
+/// provider-reported cost, so token pricing does not replace it; a message
+/// without credits keeps cost 0 / `Unknown` for token pricing, because no
+/// source shows that a conversation's credits cover turns that report none.
+/// `credits[i]` belongs to `messages[i]`. Tokens are untouched.
+fn apply_credit_costs(messages: &mut [UnifiedMessage], credits: &[f64]) {
+    debug_assert_eq!(messages.len(), credits.len());
+    for (message, credits) in messages.iter_mut().zip(credits) {
+        if *credits > 0.0 {
+            message.cost = credits * CREDIT_TO_USD;
+            message.mark_provider_reported_cost();
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +177,22 @@ pub fn parse_kiro_file(path: &Path) -> Vec<UnifiedMessage> {
         Ok(bytes) => bytes,
         Err(_) => return Vec::new(),
     };
+
+    // Before simd_json reuses the buffer; see `credit_sum`.
+    let turn_credits: Vec<f64> = serde_json::from_slice::<Value>(&json_bytes)
+        .ok()
+        .as_ref()
+        .and_then(|header| {
+            header.pointer("/session_state/conversation_metadata/user_turn_metadatas")
+        })
+        .and_then(Value::as_array)
+        .map(|turns| {
+            turns
+                .iter()
+                .map(|turn| credit_sum(turn.get("metering_usage")))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let header = match simd_json::from_slice::<KiroSessionHeader>(&mut json_bytes) {
         Ok(header) => header,
@@ -229,10 +283,17 @@ pub fn parse_kiro_file(path: &Path) -> Vec<UnifiedMessage> {
         }
     }
 
-    turns
+    // Each turn's credits stay on that turn's message, so cost lands on the day
+    // it was spent. A skipped (token-less) turn's credits move to the next
+    // emitted turn, or back to the last one when none follows.
+    let mut message_credits: Vec<f64> = Vec::new();
+    let mut pending_credits = 0.0;
+
+    let mut messages: Vec<UnifiedMessage> = turns
         .into_iter()
         .enumerate()
         .filter_map(|(index, turn)| {
+            pending_credits += turn_credits.get(index).copied().unwrap_or(0.0);
             let message_ids = turn.message_ids.unwrap_or_default();
             let mut prompt_chars = 0;
             let mut assistant_chars = 0;
@@ -305,9 +366,15 @@ pub fn parse_kiro_file(path: &Path) -> Vec<UnifiedMessage> {
             message.duration_ms = duration_ms;
             message.is_turn_start = true;
             message.set_workspace(workspace_key.clone(), workspace_label.clone());
+            message_credits.push(std::mem::take(&mut pending_credits));
             Some(message)
         })
-        .collect()
+        .collect();
+    if let Some(last) = message_credits.last_mut() {
+        *last += pending_credits;
+    }
+    apply_credit_costs(&mut messages, &message_credits);
+    messages
 }
 
 fn text_char_count(content: Option<&[KiroContentPart]>) -> usize {
@@ -481,6 +548,7 @@ fn parse_kiro_ide_session_file(path: &Path) -> Vec<UnifiedMessage> {
         end_timestamp_ms: Option<i64>,
         context_usage_percentage: f64,
         elapsed_ms: Option<i64>,
+        request_ids: HashSet<String>,
     }
 
     let mut turns: Vec<IdeTurn> = Vec::new();
@@ -575,6 +643,16 @@ fn parse_kiro_ide_session_file(path: &Path) -> Vec<UnifiedMessage> {
                                 turn.elapsed_ms = Some(elapsed);
                             }
                         }
+                        // The distinct `requestIds` across the turn's usage
+                        // summaries are its request count (upstream #1342
+                        // takes the last summary's length); they carry no
+                        // tokens or credits.
+                        if let (Some(ids), Some(turn)) = (
+                            payload.get("requestIds").and_then(Value::as_array),
+                            current_turn.as_mut(),
+                        ) {
+                            turn.request_ids.extend(ids.iter().map(Value::to_string));
+                        }
                     }
                     "turn_end" => {
                         if let Some(turn) = current_turn.as_mut() {
@@ -655,7 +733,9 @@ fn parse_kiro_ide_session_file(path: &Path) -> Vec<UnifiedMessage> {
                     0.0,
                     Some(format!("{}:ide:{}", session_id, index)),
                 );
-                message.message_count = 1;
+                message.message_count = i32::try_from(turn.request_ids.len())
+                    .unwrap_or(i32::MAX)
+                    .max(1);
                 message.is_turn_start = true;
                 message.duration_ms = duration_ms;
                 message.set_workspace(workspace_key.clone(), workspace_label.clone());
@@ -1323,6 +1403,8 @@ pub fn parse_kiro_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             Ok(p) => p,
             Err(_) => continue,
         };
+        // See `credit_sum` for why this is a separate, untyped parse.
+        let raw = serde_json::from_str::<Value>(&json_str).ok();
 
         let context_window = parsed
             .model_info
@@ -1338,6 +1420,18 @@ pub fn parse_kiro_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             .to_string();
         let workspace_key = normalize_workspace_key(&cwd);
         let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
+
+        // Conversation-level credits (unlike the CLI's per-turn ones) go on the
+        // conversation's first emitted message, as upstream. Whether they are
+        // the conversation's total or only its latest turn's is unverified
+        // (upstream's fixtures are single-turn), so the other messages stay
+        // token-priced: if the credits are the total, the overcount is at most
+        // those messages' token estimates.
+        let credits = credit_sum(
+            raw.as_ref()
+                .and_then(|raw| raw.pointer("/user_turn_metadata/usage_info")),
+        );
+        let first_conversation_message = messages.len();
 
         let history = parsed.history.unwrap_or_default();
         for (index, turn) in history.into_iter().enumerate() {
@@ -1390,12 +1484,23 @@ pub fn parse_kiro_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                 0.0,
                 Some(format!("{}:{}", conversation_id, index)),
             );
-            message.message_count = 1;
+            message.message_count = raw
+                .as_ref()
+                .and_then(|raw| raw.get("history")?.get(index)?.get("request_metadata"))
+                .and_then(kiro_db_request_count)
+                .unwrap_or(1)
+                .max(1);
             message.duration_ms = duration_ms;
             message.is_turn_start = true;
             message.set_workspace(workspace_key.clone(), workspace_label.clone());
             messages.push(message);
         }
+        let conversation = &mut messages[first_conversation_message..];
+        let mut conversation_credits = vec![0.0; conversation.len()];
+        if let Some(first) = conversation_credits.first_mut() {
+            *first = credits;
+        }
+        apply_credit_costs(conversation, &conversation_credits);
     }
 
     messages
@@ -1418,6 +1523,27 @@ struct KiroDbRequestMetadata {
     response_size: Option<usize>,
     request_start_timestamp_ms: Option<i64>,
     stream_end_timestamp_ms: Option<i64>,
+}
+
+/// A SQLite turn's request count with upstream #1342's precedence: the first
+/// flat `request_count` / `user_turn_request_count` / `total_request_count`
+/// holding an integer, then the same keys inside `token_usage` / `usage`.
+/// Separate keys, not upstream's serde aliases onto one field, which reject the
+/// whole conversation when two spellings coexist.
+fn kiro_db_request_count(request_metadata: &Value) -> Option<i32> {
+    const KEYS: [&str; 3] = [
+        "request_count",
+        "user_turn_request_count",
+        "total_request_count",
+    ];
+    let count_in = |object: &Value| KEYS.iter().find_map(|key| object.get(key)?.as_i64());
+    count_in(request_metadata)
+        .or_else(|| {
+            ["token_usage", "usage"]
+                .iter()
+                .find_map(|key| count_in(request_metadata.get(key)?))
+        })
+        .map(|count| count.clamp(0, i64::from(i32::MAX)) as i32)
 }
 
 #[cfg(test)]
@@ -2281,5 +2407,341 @@ not valid json at all
         assert!(keys.contains("session-2:workspace-session"));
         assert!(keys.contains("cli-session:0"));
         assert!(keys.contains("sqlite-session:0"));
+    }
+
+    // ---- upstream #1342, credits and request counts only ----
+
+    /// CLI session with five turns: 0 and 4 have no content (skipped), 1-3
+    /// emit. The optional `metering` JSON is spliced into turns 0, 3 and 4, so
+    /// turn 0's credits must move forward to turn 1, turn 4's back to turn 3,
+    /// and turn 2 carries none.
+    fn kiro_cli_credit_session(dir: &TempDir, stem: &str, metering: Option<&str>) -> PathBuf {
+        let metering = metering
+            .map(|value| format!(r#","metering_usage":{value}"#))
+            .unwrap_or_default();
+        let turn = |ids: &str, extra: &str| {
+            format!(
+                r#"{{"input_token_count":0,"output_token_count":0,"message_ids":[{ids}]{extra}}}"#
+            )
+        };
+        let turns = [
+            turn(r#""missing""#, &metering),
+            turn(
+                r#""a-1""#,
+                r#","total_request_count":3,"context_usage_percentage":10.0"#,
+            ),
+            turn(r#""a-2""#, ""),
+            turn(r#""a-3""#, &metering),
+            turn(r#""missing-too""#, &metering),
+        ]
+        .join(",");
+        let json = format!(
+            r#"{{"session_id":"{stem}","cwd":"/tmp/project","session_state":{{"rts_model_state":{{"model_info":{{"model_id":"claude-sonnet-4-5","context_window_tokens":1000}}}},"conversation_metadata":{{"user_turn_metadatas":[{turns}]}}}}}}"#
+        );
+        let jsonl = [
+            (1, "hello world", "response text", "1770983426.0"),
+            (2, "next", "done", "1770983500.0"),
+            (3, "third", "last answer", "1771070000.0"),
+        ]
+        .iter()
+        .map(|(n, prompt, answer, ts)| {
+            format!(
+                "{{\"version\":\"v1\",\"kind\":\"Prompt\",\"data\":{{\"message_id\":\"p-{n}\",\"content\":[{{\"kind\":\"text\",\"data\":\"{prompt}\"}}],\"meta\":{{\"timestamp\":{ts}}}}}}}\n{{\"version\":\"v1\",\"kind\":\"AssistantMessage\",\"data\":{{\"message_id\":\"a-{n}\",\"content\":[{{\"kind\":\"text\",\"data\":\"{answer}\"}}]}}}}\n"
+            )
+        })
+        .collect::<String>();
+        create_session_files(dir, stem, &json, &jsonl)
+    }
+
+    fn token_view(messages: &[UnifiedMessage]) -> Vec<(Option<String>, TokenBreakdown, i64)> {
+        messages
+            .iter()
+            .map(|m| (m.dedup_key.clone(), m.tokens.clone(), m.timestamp))
+            .collect()
+    }
+
+    const CREDIT_METERING: &str =
+        r#"[{"value":0.25,"unit":"credit"},{"value":7.0,"unit":"request"},{"unit":"credit"}]"#;
+
+    #[test]
+    fn kiro_cli_credits_stay_on_their_turns_and_leave_tokens_alone() {
+        let dir = TempDir::new().unwrap();
+        let control = parse_kiro_file(&kiro_cli_credit_session(&dir, "control", None));
+        let credited = parse_kiro_file(&kiro_cli_credit_session(
+            &dir,
+            "credited",
+            Some(CREDIT_METERING),
+        ));
+
+        assert_eq!(control.len(), 3);
+        assert!(control
+            .iter()
+            .all(|m| m.cost == 0.0 && !m.has_authoritative_cost()));
+        // Same tokens and timestamps, bit for bit; only the key prefix differs.
+        let strip = |view: Vec<(Option<String>, TokenBreakdown, i64)>| {
+            view.into_iter()
+                .map(|(key, tokens, ts)| {
+                    (
+                        key.map(|k| k.split_once(':').unwrap().1.to_string()),
+                        tokens,
+                        ts,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(token_view(&credited)), strip(token_view(&control)));
+        // Each metered turn carries 0.25 credit; non-credit units and valueless
+        // entries contribute nothing. Turn 0's credit moves forward to the
+        // first emitted turn, turn 4's back to the last. Turn 2 reports no
+        // credits, so it stays unpriced here and token pricing prices it; its
+        // credits (if any) are counted nowhere else, so that cannot double.
+        let view: Vec<(f64, bool)> = credited
+            .iter()
+            .map(|m| (m.cost, m.has_authoritative_cost()))
+            .collect();
+        assert_eq!(
+            view,
+            vec![
+                (0.25 * CREDIT_TO_USD, true),
+                (0.0, false),
+                (0.5 * CREDIT_TO_USD, true)
+            ]
+        );
+        assert_eq!(credited[0].message_count, 3);
+    }
+
+    #[test]
+    fn kiro_cli_unexpected_metering_shape_costs_only_the_credit() {
+        let dir = TempDir::new().unwrap();
+        let control = parse_kiro_file(&kiro_cli_credit_session(&dir, "control", None));
+        let odd = parse_kiro_file(&kiro_cli_credit_session(
+            &dir,
+            "control2",
+            Some(r#"[{"value":"0.25","unit":"credit"}, 3, null]"#),
+        ));
+        let strip = |messages: &[UnifiedMessage]| {
+            messages
+                .iter()
+                .map(|m| (m.tokens.clone(), m.timestamp))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&odd), strip(&control));
+        assert!(odd.iter().all(|m| m.cost == 0.0));
+    }
+
+    fn kiro_sqlite_with(conversations: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("data.sqlite3");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE conversations_v2 (key TEXT, conversation_id TEXT, value TEXT)",
+            [],
+        )
+        .unwrap();
+        for (conversation_id, value) in conversations {
+            conn.execute(
+                "INSERT INTO conversations_v2 (key, conversation_id, value) VALUES (?1, ?2, ?3)",
+                (&"/tmp/project", conversation_id, value),
+            )
+            .unwrap();
+        }
+        (dir, db_path)
+    }
+
+    fn kiro_sqlite_conversation(extra_top: &str, turn_extras: [&str; 3]) -> String {
+        // Turn 0 has no tokens (skipped); turns 1 and 2 emit.
+        format!(
+            r#"{{"model_info":{{"model_id":"claude-sonnet-4-5","context_window_tokens":1000}}{extra_top},"history":[{{"request_metadata":{{"request_start_timestamp_ms":1770983426000{}}}}},{{"request_metadata":{{"context_usage_percentage":10,"response_size":40,"request_start_timestamp_ms":1770983427000{}}}}},{{"request_metadata":{{"response_size":8,"request_start_timestamp_ms":1770983428000{}}}}}]}}"#,
+            turn_extras[0], turn_extras[1], turn_extras[2]
+        )
+    }
+
+    #[test]
+    fn kiro_sqlite_credits_and_request_counts_leave_tokens_alone() {
+        let control_value = kiro_sqlite_conversation("", ["", "", ""]);
+        let credited_value = kiro_sqlite_conversation(
+            &format!(r#","user_turn_metadata":{{"usage_info":{CREDIT_METERING}}}"#),
+            [
+                r#","request_count":9"#,
+                // Two spellings at once: upstream's serde aliases would reject
+                // the whole conversation here.
+                r#","user_turn_request_count":4,"total_request_count":5"#,
+                r#","token_usage":{"request_count":2}"#,
+            ],
+        );
+        let (_c, control_db) = kiro_sqlite_with(&[("conv-1", &control_value)]);
+        // The credited conversation comes second, so its credit landing on
+        // the database's first message would be visible.
+        let (_d, credited_db) =
+            kiro_sqlite_with(&[("conv-1", &control_value), ("conv-1", &credited_value)]);
+
+        let control = parse_kiro_sqlite(&control_db);
+        let both = parse_kiro_sqlite(&credited_db);
+
+        assert_eq!(control.len(), 2);
+        assert_eq!(both.len(), 4);
+        assert!(both[..2]
+            .iter()
+            .all(|m| m.cost == 0.0 && m.message_count == 1));
+        let credited = &both[2..];
+        assert_eq!(token_view(credited), token_view(&control));
+        // Conversation-level credits sit on the first emitted message; the
+        // rest stay unpriced for token pricing, as upstream.
+        assert_eq!(credited[0].cost, 0.25 * CREDIT_TO_USD);
+        assert!(credited[0].has_authoritative_cost());
+        assert_eq!(credited[1].cost, 0.0);
+        assert!(!credited[1].has_authoritative_cost());
+        assert!(both[..2].iter().all(|m| !m.has_authoritative_cost()));
+        assert_eq!(credited[0].message_count, 4);
+        assert_eq!(credited[1].message_count, 2);
+    }
+
+    #[test]
+    fn kiro_ide_request_ids_set_message_count_and_leave_tokens_alone() {
+        let session_json = r#"{"id":"sess_req","modelId":"claude-opus-4.6"}"#;
+        // One `usage_summary` line per entry of `summaries`.
+        let jsonl = |summaries: &[&str]| {
+            let summaries: String = summaries
+                .iter()
+                .map(|extra| {
+                    format!(
+                        "{{\"payload\":{{\"type\":\"usage_summary\",\"elapsedTime\":2500{extra}}}}}\n"
+                    )
+                })
+                .collect();
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-06-20T10:00:00Z\",\"payload\":{{\"type\":\"user\",\"content\":\"hello\"}}}}\n",
+                    "{{\"payload\":{{\"type\":\"assistant\",\"content\":\"answer\"}}}}\n",
+                    "{}",
+                    "{{\"timestamp\":\"2026-06-20T10:00:02.500Z\",\"payload\":{{\"type\":\"turn_end\"}}}}\n",
+                ),
+                summaries
+            )
+        };
+        let dir = TempDir::new().unwrap();
+        let control = parse_kiro_file(&create_ide_session_files(
+            &dir,
+            "ws",
+            "sess_control",
+            session_json,
+            &jsonl(&[""]),
+        ));
+        let counted = parse_kiro_file(&create_ide_session_files(
+            &dir,
+            "ws",
+            "sess_counted",
+            session_json,
+            // Two summaries in one turn: the distinct ids across both count.
+            &jsonl(&[
+                r#","requestIds":["r1","r2"]"#,
+                r#","requestIds":["r2","r3"]"#,
+            ]),
+        ));
+
+        assert_eq!(control.len(), 1);
+        assert_eq!(control[0].message_count, 1);
+        assert_eq!(counted[0].message_count, 3);
+        assert_eq!(counted[0].tokens, control[0].tokens);
+        assert_eq!(counted[0].cost, 0.0);
+    }
+
+    #[test]
+    fn kiro_merge_counts_a_credit_once_and_a_suppressed_snapshot_carries_none() {
+        let dir = TempDir::new().unwrap();
+        let cli = kiro_cli_credit_session(&dir, "credited", Some(CREDIT_METERING));
+        // The same CLI session reached through a second path: same dedup keys.
+        let copy_dir = TempDir::new().unwrap();
+        let cli_copy = kiro_cli_credit_session(&copy_dir, "credited", Some(CREDIT_METERING));
+        let snapshot = globalstorage_path(&dir, "workspace-a/chat-one.chat");
+        fs::write(
+            &snapshot,
+            r#"{"executionId":"exec-one","messages":[{"role":"user","content":"ABCD"},{"role":"assistant","content":"WXYZ"}]}"#,
+        )
+        .unwrap();
+        let execution = globalstorage_path(&dir, "workspace-a/execution-store/execution-one");
+        fs::write(
+            &execution,
+            r#"{"executionId":"exec-one","chatSessionId":"chat-one","status":"succeed","startTime":"2026-02-13T12:00:00Z","input":{"data":{"messages":[{"content":"string input"}]}},"actions":[{"actionType":"say","output":"answer"}]}"#,
+        )
+        .unwrap();
+
+        let snapshot_messages = parse_kiro_file(&snapshot);
+        assert_eq!(snapshot_messages.len(), 1);
+        assert_eq!(snapshot_messages[0].cost, 0.0);
+        let kept = merge_kiro_source_messages(vec![
+            (cli.clone(), parse_kiro_file(&cli)),
+            (cli_copy.clone(), parse_kiro_file(&cli_copy)),
+            (snapshot, snapshot_messages),
+            (execution.clone(), parse_kiro_file(&execution)),
+        ]);
+
+        let keys: Vec<_> = kept.iter().filter_map(|m| m.dedup_key.as_deref()).collect();
+        assert!(!keys.iter().any(|key| key.contains(":globalstorage")));
+        assert_eq!(kept.len(), 4, "three CLI turns once, plus the execution");
+        assert_eq!(
+            kept.iter().map(|m| m.cost).sum::<f64>(),
+            0.75 * CREDIT_TO_USD
+        );
+        assert_eq!(
+            kept.iter().filter(|m| m.has_authoritative_cost()).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn kiro_odd_credit_and_count_shapes_cost_only_the_credit_or_count() {
+        // Shapes `serde_json::Value` refuses. Read through the typed structs
+        // they would reject the whole record; the untyped second pass must
+        // lose only the credit or count, and keep every token.
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        let sqlite_cases = [
+            r#","request_count":1e400"#.to_string(),
+            r#","request_count":1,"request_count":2"#.to_string(),
+            r#","usage":{"note":"\ud800","request_count":4}"#.to_string(),
+            format!(r#","usage":{deep}"#),
+        ];
+        let control_value = kiro_sqlite_conversation("", ["", "", ""]);
+        let (_c, control_db) = kiro_sqlite_with(&[("conv-1", &control_value)]);
+        let control = parse_kiro_sqlite(&control_db);
+        assert_eq!(control.len(), 2);
+        for case in &sqlite_cases {
+            let value = kiro_sqlite_conversation(
+                r#","user_turn_metadata":{"usage_info":[{"value":0.25,"unit":"credit"}],"x":1e400}"#,
+                ["", case, ""],
+            );
+            let (_d, db) = kiro_sqlite_with(&[("conv-1", &value)]);
+            let odd = parse_kiro_sqlite(&db);
+            assert_eq!(token_view(&odd), token_view(&control), "{case}");
+            assert!(
+                odd.iter().all(|m| m.cost == 0.0 && m.message_count == 1),
+                "{case}"
+            );
+        }
+
+        let dir = TempDir::new().unwrap();
+        let control = parse_kiro_file(&kiro_cli_credit_session(&dir, "control", None));
+        let odd = parse_kiro_file(&kiro_cli_credit_session(
+            &dir,
+            "control2",
+            Some(r#"[],"metering_usage":[{"value":0.25,"unit":"credit"}]"#),
+        ));
+        let strip = |messages: &[UnifiedMessage]| {
+            messages
+                .iter()
+                .map(|m| (m.tokens.clone(), m.timestamp))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(control.len(), 3);
+        assert_eq!(strip(&odd), strip(&control), "duplicate metering_usage");
+        // `Value` keeps the last duplicate, so the credits survive too.
+        let credited = parse_kiro_file(&kiro_cli_credit_session(
+            &dir,
+            "credited",
+            Some(CREDIT_METERING),
+        ));
+        let costs =
+            |messages: &[UnifiedMessage]| messages.iter().map(|m| m.cost).collect::<Vec<_>>();
+        assert_eq!(costs(&odd), costs(&credited));
     }
 }
