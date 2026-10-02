@@ -133,6 +133,11 @@ pub struct PricingLookup {
     litellm_key_parts: Vec<KeyModelPart>,
     openrouter_key_parts: Vec<KeyModelPart>,
     litellm_lower: HashMap<String, String>,
+    /// LiteLLM keys whose whole id, after version-separator normalization, is
+    /// one of the request-wide 272K identities: the only rows
+    /// `canonical_tier_donor` may lend tiers from. Such a key has no provider
+    /// prefix by construction.
+    litellm_canonical: HashMap<String, String>,
     openrouter_lower: HashMap<String, String>,
     openrouter_model_part: HashMap<String, String>,
     cursor_lower: HashMap<String, String>,
@@ -183,8 +188,17 @@ impl PricingLookup {
         openrouter_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut litellm_lower = HashMap::with_capacity(litellm.len());
+        let mut litellm_canonical: HashMap<String, String> = HashMap::new();
         for key in &litellm_keys {
-            litellm_lower.insert(key.to_lowercase(), key.clone());
+            let lower = key.to_lowercase();
+            let id = normalize_version_separator(&lower).unwrap_or_else(|| lower.clone());
+            if is_request_wide_identity(&id) {
+                let slot = litellm_canonical.entry(id).or_insert_with(|| key.clone());
+                if key < slot {
+                    *slot = key.clone();
+                }
+            }
+            litellm_lower.insert(lower, key.clone());
         }
 
         let mut openrouter_lower = HashMap::with_capacity(openrouter.len());
@@ -235,6 +249,7 @@ impl PricingLookup {
             litellm_key_parts,
             openrouter_key_parts,
             litellm_lower,
+            litellm_canonical,
             openrouter_lower,
             openrouter_model_part,
             cursor_lower,
@@ -324,6 +339,70 @@ impl PricingLookup {
     /// owned by the built-in datasets and must never retain a result supplied by
     /// an unrelated custom-pricing closure.
     pub(crate) fn lookup_with_source_and_provider_and_terminal_custom<F>(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+        provider_id: Option<&str>,
+        terminal_custom: F,
+    ) -> Option<LookupResult>
+    where
+        F: Fn(&str) -> Option<LookupResult>,
+    {
+        let mut result = self.resolve_with_source_and_provider(
+            model_id,
+            force_source,
+            provider_id,
+            terminal_custom,
+        )?;
+        if force_source.is_none() && normalize_provider_hint(provider_id).is_some() {
+            self.borrow_canonical_long_context_tiers(&mut result);
+        }
+        Some(result)
+    }
+
+    /// A provider hint can elect a row (a reseller LiteLLM key, or an
+    /// OpenRouter endpoint) that quotes the model's base rates but omits the
+    /// long-context tiers the canonical LiteLLM row publishes, so a request past
+    /// the threshold bills at the base rate. Fill only the tier rates the
+    /// elected row leaves out, from the canonical row for the same model; the
+    /// elected row is never replaced and every rate it publishes stays.
+    ///
+    /// The donor must be a LiteLLM key with no provider prefix whose model id
+    /// equals the elected row's (after the version-separator normalization
+    /// OpenRouter matching already uses). Anything looser, including the
+    /// unhinted lookup result, can name another model or a reseller.
+    fn borrow_canonical_long_context_tiers(&self, result: &mut LookupResult) {
+        if !matches!(result.source.as_str(), "LiteLLM" | "OpenRouter") {
+            return;
+        }
+        let Some(donor) = self.canonical_tier_donor(&result.matched_key) else {
+            return;
+        };
+        borrow_missing_long_context_tiers(&mut result.pricing, donor);
+    }
+
+    /// The canonical LiteLLM row that may lend 272K tiers to the row keyed
+    /// `matched_key`, or `None` when the model is not a request-wide identity,
+    /// has no canonical row, or is that row.
+    fn canonical_tier_donor(&self, matched_key: &str) -> Option<&ModelPricing> {
+        let terminal = matched_key
+            .rsplit('/')
+            .next()
+            .unwrap_or(matched_key)
+            .to_lowercase();
+        let id = normalize_version_separator(&terminal).unwrap_or(terminal);
+        // `litellm_canonical` only holds the request-wide identities, so other
+        // vendors' tiers (Claude/Gemini 200K) are never borrowed.
+        let key = self.litellm_canonical.get(&id)?;
+        if key.eq_ignore_ascii_case(matched_key) {
+            return None;
+        }
+        self.litellm.get(key)
+    }
+
+    /// The pricing pipeline itself, before the hinted-row tier borrow that
+    /// `lookup_with_source_and_provider_and_terminal_custom` applies.
+    fn resolve_with_source_and_provider<F>(
         &self,
         model_id: &str,
         force_source: Option<&str>,
@@ -1326,11 +1405,16 @@ fn uses_full_session_long_context_tier(result: &LookupResult) -> bool {
         .matched_key
         .rsplit('/')
         .next()
-        .unwrap_or(result.matched_key.as_str());
-    result.source.eq_ignore_ascii_case("LiteLLM")
-        && FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS
-            .iter()
-            .any(|key| terminal_model_id.eq_ignore_ascii_case(key))
+        .unwrap_or(result.matched_key.as_str())
+        .to_lowercase();
+    let id = normalize_version_separator(&terminal_model_id).unwrap_or(terminal_model_id);
+    // The model identity decides, not which dataset's row won: a hinted
+    // OpenRouter row for a listed model bills the same way once it carries the
+    // tiers (see `borrow_canonical_long_context_tiers`). The identity is
+    // normalized exactly as the donor match normalizes it.
+    (result.source.eq_ignore_ascii_case("LiteLLM")
+        || result.source.eq_ignore_ascii_case("OpenRouter"))
+        && is_request_wide_identity(&id)
 }
 
 #[derive(Clone, Copy)]
@@ -2723,6 +2807,66 @@ fn backfill_cache_costs(mut winner: LookupResult, donor: &ModelPricing) -> Looku
         }
     }
     winner
+}
+
+/// Whether a version-normalized model id is one of the identities whose 272K
+/// tier OpenAI documents as request-wide.
+fn is_request_wide_identity(id: &str) -> bool {
+    FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS
+        .iter()
+        .any(|key| normalize_version_separator(key).as_deref().unwrap_or(key) == id)
+}
+
+/// Give `row` the donor's 272K tier rates, all at once or not at all. Every
+/// base rate `row` publishes must be paid and equal to the donor's (a tier
+/// means nothing relative to a different base, and a paid tier on a free
+/// bucket would invent spend), and `row` must publish an input base. A 272K
+/// rate `row` already publishes is kept.
+fn borrow_missing_long_context_tiers(row: &mut ModelPricing, donor: &ModelPricing) {
+    let valid = |rate: Option<f64>| rate.is_some_and(is_valid_price_value);
+    let bases = [
+        (row.input_cost_per_token, donor.input_cost_per_token),
+        (row.output_cost_per_token, donor.output_cost_per_token),
+        (
+            row.cache_read_input_token_cost,
+            donor.cache_read_input_token_cost,
+        ),
+        (
+            row.cache_creation_input_token_cost,
+            donor.cache_creation_input_token_cost,
+        ),
+    ];
+    let same_paid_base = |own: f64, theirs: Option<f64>| {
+        own > 0.0 && theirs.is_some_and(|theirs| (own - theirs).abs() <= theirs.abs() * 1e-9)
+    };
+    if !valid(row.input_cost_per_token)
+        || !bases
+            .iter()
+            .filter_map(|(own, theirs)| {
+                own.filter(|own| is_valid_price_value(*own))
+                    .map(|own| (own, *theirs))
+            })
+            .all(|(own, theirs)| same_paid_base(own, theirs))
+    {
+        return;
+    }
+    let fill = |own: &mut Option<f64>, theirs: Option<f64>| {
+        if !valid(*own) && valid(theirs) {
+            *own = theirs;
+        }
+    };
+    fill(
+        &mut row.input_cost_per_token_above_272k_tokens,
+        donor.input_cost_per_token_above_272k_tokens,
+    );
+    fill(
+        &mut row.output_cost_per_token_above_272k_tokens,
+        donor.output_cost_per_token_above_272k_tokens,
+    );
+    fill(
+        &mut row.cache_read_input_token_cost_above_272k_tokens,
+        donor.cache_read_input_token_cost_above_272k_tokens,
+    );
 }
 
 fn exact_match_with_provider_prefixes(
@@ -6663,9 +6807,16 @@ mod tests {
             "Sakana",
             pricing.clone()
         )));
+        // The model identity decides, so an OpenRouter row for a listed model
+        // qualifies too.
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "openai/gpt-5.5",
+            "OpenRouter",
+            pricing.clone()
+        )));
         for (source, key) in [
             ("LiteLLM", "gpt-5.5-pro"),
-            ("OpenRouter", "gpt-5.5"),
+            ("OpenRouter", "openai/gpt-5.5-pro"),
             ("Custom", "gpt-5.5"),
             ("Sakana", "fugu"),
         ] {
@@ -6728,6 +6879,370 @@ mod tests {
             let expected = 250_000.0 * 0.000020 + 10_000.0 * 0.000075 + 50_000.0 * 0.000002;
             assert!((actual - expected).abs() < 1e-12, "{key} with cache read");
         }
+    }
+
+    /// A LiteLLM-style row with a 272K tier on input, output and cache read.
+    fn tiered_272k(input: f64, output: f64, cache_read: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(input),
+            input_cost_per_token_above_272k_tokens: Some(input * 2.0),
+            output_cost_per_token: Some(output),
+            output_cost_per_token_above_272k_tokens: Some(output * 1.5),
+            cache_read_input_token_cost: Some(cache_read),
+            cache_read_input_token_cost_above_272k_tokens: Some(cache_read * 2.0),
+            ..Default::default()
+        }
+    }
+
+    /// A row with base rates and no long-context tier.
+    fn base_only(input: f64, output: f64, cache_read: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            cache_read_input_token_cost: Some(cache_read),
+            ..Default::default()
+        }
+    }
+
+    /// Usage with only input, output and cache-read tokens.
+    fn usage_prompt(input: i64, output: i64, cache_read: i64) -> TokenBreakdown {
+        TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            ..Default::default()
+        }
+    }
+
+    /// A hinted OpenRouter row for a listed model quotes the base rates but no
+    /// 272K tier. It keeps its own rates and borrows only the canonical LiteLLM
+    /// row's tiers, so it bills exactly like the canonical row on both sides of
+    /// the threshold.
+    #[test]
+    fn hinted_row_borrows_missing_long_context_tiers_from_the_canonical_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-6-astra".into(), base_only(1e-5, 5e-5, 1e-6));
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("gpt-6-astra", Some("openai"))
+            .unwrap();
+        assert_eq!(hinted.source, "OpenRouter");
+        assert_eq!(hinted.matched_key, "openai/gpt-6-astra");
+        assert_eq!(
+            hinted.pricing.input_cost_per_token_above_272k_tokens,
+            Some(2e-5)
+        );
+
+        for usage in [
+            usage_prompt(300_000, 10_000, 50_000),
+            usage_prompt(200_000, 10_000, 72_000),
+        ] {
+            let hinted = lookup.calculate_cost_with_provider("gpt-6-astra", Some("openai"), &usage);
+            let canonical = lookup.calculate_cost_with_provider("gpt-6-astra", None, &usage);
+            assert!(
+                (hinted - canonical).abs() < 1e-12,
+                "{usage:?}: {hinted} vs {canonical}"
+            );
+        }
+        // Above the threshold the whole request moves to the long-context rate.
+        let above = lookup.calculate_cost_with_provider(
+            "gpt-6-astra",
+            Some("openai"),
+            &usage_prompt(300_000, 10_000, 0),
+        );
+        assert!((above - (300_000.0 * 2e-5 + 10_000.0 * 7.5e-5)).abs() < 1e-12);
+    }
+
+    /// The same through a reseller LiteLLM key elected by its own hint.
+    #[test]
+    fn hinted_reseller_litellm_row_borrows_only_the_tier_it_omits() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.4".into(), tiered_272k(2.5e-6, 1.5e-5, 2.5e-7));
+        let mut reseller = tiered_272k(2.5e-6, 1.5e-5, 2.5e-7);
+        reseller.cache_read_input_token_cost_above_272k_tokens = None;
+        litellm.insert("perplexity/openai/gpt-5.4".into(), reseller);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("gpt-5.4", Some("perplexity"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "perplexity/openai/gpt-5.4");
+        assert_eq!(
+            hinted.pricing.cache_read_input_token_cost_above_272k_tokens,
+            Some(5e-7)
+        );
+    }
+
+    /// A tier the elected row publishes is its own and is never replaced.
+    #[test]
+    fn hinted_row_keeps_the_tiers_it_publishes() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        let mut own = base_only(1e-5, 5e-5, 1e-6);
+        own.input_cost_per_token_above_272k_tokens = Some(3e-5);
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-6-astra".into(), own);
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("gpt-6-astra", Some("openai"))
+            .unwrap();
+        assert_eq!(
+            hinted.pricing.input_cost_per_token_above_272k_tokens,
+            Some(3e-5)
+        );
+        // Buckets it leaves out are still filled.
+        assert_eq!(
+            hinted.pricing.output_cost_per_token_above_272k_tokens,
+            Some(5e-5 * 1.5)
+        );
+    }
+
+    /// A row quoting zero for every base rate is a free or subscription row;
+    /// grafting paid tiers onto it would invent spend.
+    #[test]
+    fn hinted_row_quoting_zero_everywhere_is_left_alone() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-6-astra".into(), base_only(0.0, 0.0, 0.0));
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("gpt-6-astra", Some("openai"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "openai/gpt-6-astra");
+        assert_eq!(hinted.pricing.input_cost_per_token_above_272k_tokens, None);
+        assert_eq!(
+            lookup.calculate_cost_with_provider(
+                "gpt-6-astra",
+                Some("openai"),
+                &usage_prompt(300_000, 10_000, 0)
+            ),
+            0.0
+        );
+    }
+
+    /// Only a prefix-free LiteLLM key with the same model id may lend tiers. A
+    /// reseller-prefixed row or a differently named one lends nothing.
+    #[test]
+    fn ineligible_donors_lend_nothing() {
+        for (donor_key, model) in [
+            ("azure/gpt-6-astra", "gpt-6-astra"),
+            ("gpt-6-astra-2026-09-03", "gpt-6-astra"),
+        ] {
+            let mut litellm = HashMap::new();
+            litellm.insert(donor_key.to_string(), tiered_272k(1e-5, 5e-5, 1e-6));
+            let mut openrouter = HashMap::new();
+            openrouter.insert("openai/gpt-6-astra".into(), base_only(1e-5, 5e-5, 1e-6));
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+            let hinted = lookup.lookup_with_provider(model, Some("openai")).unwrap();
+            assert_eq!(hinted.matched_key, "openai/gpt-6-astra", "{donor_key}");
+            assert_eq!(
+                hinted.pricing.input_cost_per_token_above_272k_tokens, None,
+                "{donor_key} must not lend tiers"
+            );
+        }
+    }
+
+    /// The donor id matches after the version-separator normalization
+    /// OpenRouter matching uses, in either spelling direction.
+    #[test]
+    fn donor_matches_across_version_separator_spellings() {
+        for (canonical, routed, model) in [
+            ("gpt-5.4", "openai/gpt-5-4", "gpt-5-4"),
+            ("gpt-5-4", "openai/gpt-5.4", "gpt-5.4"),
+        ] {
+            let mut litellm = HashMap::new();
+            litellm.insert(canonical.to_string(), tiered_272k(2.5e-6, 1.5e-5, 2.5e-7));
+            let mut openrouter = HashMap::new();
+            openrouter.insert(routed.to_string(), base_only(2.5e-6, 1.5e-5, 2.5e-7));
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+            let hinted = lookup.lookup_with_provider(model, Some("openai")).unwrap();
+            assert_eq!(hinted.matched_key, routed, "{canonical} / {routed}");
+            assert_eq!(
+                hinted.pricing.input_cost_per_token_above_272k_tokens,
+                Some(5e-6),
+                "{canonical} / {routed}"
+            );
+            // And the borrowed tier bills request-wide, like the canonical row.
+            let usage = usage_prompt(300_000, 10_000, 0);
+            let hinted_cost = lookup.calculate_cost_with_provider(model, Some("openai"), &usage);
+            let canonical_cost = lookup.calculate_cost_with_provider(canonical, None, &usage);
+            assert!(
+                (hinted_cost - canonical_cost).abs() < 1e-12,
+                "{canonical} / {routed}: {hinted_cost} vs {canonical_cost}"
+            );
+        }
+    }
+
+    /// Borrowing is for hinted, non-forced lookups only.
+    #[test]
+    fn forced_and_unhinted_lookups_do_not_borrow() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-6-astra".into(), base_only(1e-5, 5e-5, 1e-6));
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let forced = lookup
+            .lookup_with_source_and_provider("gpt-6-astra", Some("openrouter"), Some("openai"))
+            .unwrap();
+        assert_eq!(forced.matched_key, "openai/gpt-6-astra");
+        assert_eq!(forced.pricing.input_cost_per_token_above_272k_tokens, None);
+
+        // Unhinted, a reseller row reached by its raw id stays as it is.
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.4".into(), tiered_272k(2.5e-6, 1.5e-5, 2.5e-7));
+        litellm.insert(
+            "perplexity/openai/gpt-5.4".into(),
+            base_only(2.5e-6, 1.5e-5, 2.5e-7),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let unhinted = lookup
+            .lookup_with_provider("perplexity/openai/gpt-5.4", None)
+            .unwrap();
+        assert_eq!(unhinted.matched_key, "perplexity/openai/gpt-5.4");
+        assert_eq!(
+            unhinted.pricing.input_cost_per_token_above_272k_tokens,
+            None
+        );
+    }
+
+    /// Bedrock-style keys carry their provider or region as a dotted prefix
+    /// (`openai.gpt-6-astra`, `us.openai.…`) or a `:N` suffix; none of them is
+    /// a canonical row.
+    #[test]
+    fn dotted_or_suffixed_bedrock_keys_are_not_canonical_donors() {
+        let mut litellm = HashMap::new();
+        litellm.insert("openai.gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        litellm.insert(
+            "bedrock_mantle/openai.gpt-6-astra".into(),
+            base_only(1e-5, 5e-5, 1e-6),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let hinted = lookup
+            .lookup_with_provider("openai.gpt-6-astra", Some("bedrock_mantle"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "bedrock_mantle/openai.gpt-6-astra");
+        assert_eq!(hinted.pricing.input_cost_per_token_above_272k_tokens, None);
+    }
+
+    /// The 272K tiers come over all at once or not at all: every base the
+    /// row publishes must be paid and equal to the canonical row's.
+    #[test]
+    fn tiers_are_borrowed_all_or_nothing_against_equal_paid_bases() {
+        let donor = tiered_272k(1e-5, 5e-5, 1e-6);
+
+        let mut equal = base_only(1e-5, 5e-5, 1e-6);
+        borrow_missing_long_context_tiers(&mut equal, &donor);
+        assert_eq!(equal.input_cost_per_token_above_272k_tokens, Some(2e-5));
+        assert_eq!(
+            equal.output_cost_per_token_above_272k_tokens,
+            donor.output_cost_per_token_above_272k_tokens
+        );
+        assert_eq!(
+            equal.cache_read_input_token_cost_above_272k_tokens,
+            Some(2e-6)
+        );
+
+        let cases = [
+            ("input base differs", base_only(5e-6, 5e-5, 1e-6)),
+            ("free cache-read bucket", base_only(1e-5, 5e-5, 0.0)),
+            (
+                "cache-write base the donor does not publish",
+                ModelPricing {
+                    cache_creation_input_token_cost: Some(1.25e-5),
+                    ..base_only(1e-5, 5e-5, 1e-6)
+                },
+            ),
+        ];
+        for (label, mut row) in cases {
+            borrow_missing_long_context_tiers(&mut row, &donor);
+            assert_eq!(row.input_cost_per_token_above_272k_tokens, None, "{label}");
+            assert_eq!(row.output_cost_per_token_above_272k_tokens, None, "{label}");
+            assert_eq!(
+                row.cache_read_input_token_cost_above_272k_tokens, None,
+                "{label}"
+            );
+        }
+    }
+
+    /// Only the request-wide 272K identities borrow. A hinted Sonnet 4.5 row
+    /// with the canonical base and no tier stays as it is, although the
+    /// canonical `claude-sonnet-4-5` row publishes a 200K ladder.
+    #[test]
+    fn models_outside_the_request_wide_list_never_borrow() {
+        let canonical = ModelPricing {
+            input_cost_per_token: Some(3e-6),
+            input_cost_per_token_above_200k_tokens: Some(6e-6),
+            output_cost_per_token: Some(1.5e-5),
+            output_cost_per_token_above_200k_tokens: Some(2.25e-5),
+            cache_read_input_token_cost: Some(3e-7),
+            cache_read_input_token_cost_above_200k_tokens: Some(6e-7),
+            ..Default::default()
+        };
+        let mut litellm = HashMap::new();
+        litellm.insert("claude-sonnet-4-5".into(), canonical);
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-sonnet-4.5".into(),
+            base_only(3e-6, 1.5e-5, 3e-7),
+        );
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("claude-sonnet-4.5", Some("anthropic"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "anthropic/claude-sonnet-4.5");
+        assert_eq!(hinted.pricing.input_cost_per_token_above_200k_tokens, None);
+        assert_eq!(hinted.pricing.output_cost_per_token_above_200k_tokens, None);
+        assert_eq!(
+            hinted.pricing.cache_read_input_token_cost_above_200k_tokens,
+            None
+        );
+
+        // A GPT model with a 272K tier that is not on the request-wide list
+        // (`gpt-5.6-cyber`) does not borrow either.
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.6-cyber".into(),
+            tiered_272k(1.25e-5, 7.5e-5, 1.25e-6),
+        );
+        litellm.insert(
+            "perplexity/openai/gpt-5.6-cyber".into(),
+            base_only(1.25e-5, 7.5e-5, 1.25e-6),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let hinted = lookup
+            .lookup_with_provider("gpt-5.6-cyber", Some("perplexity"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "perplexity/openai/gpt-5.6-cyber");
+        assert_eq!(hinted.pricing.input_cost_per_token_above_272k_tokens, None);
+    }
+
+    /// The request-wide 272K rule follows the model identity, not the dataset
+    /// the winning row came from.
+    #[test]
+    fn full_request_rule_applies_to_a_listed_openrouter_row() {
+        let result = lookup_result(
+            "openai/gpt-6-astra",
+            "OpenRouter",
+            tiered_272k(1e-5, 5e-5, 1e-6),
+        );
+        assert!(uses_full_session_long_context_tier(&result));
+        let cost = compute_cost_and_coverage_for_lookup_result(
+            &result,
+            &usage_prompt(250_000, 10_000, 50_000),
+        )
+        .cost;
+        let expected = 250_000.0 * 2e-5 + 10_000.0 * 7.5e-5 + 50_000.0 * 2e-6;
+        assert!((cost - expected).abs() < 1e-12);
     }
 
     #[test]
