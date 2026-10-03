@@ -889,6 +889,40 @@ impl ResolvedLocalSourceContext {
         descriptor.field(15);
         descriptor.path(&self.capture_cwd)?;
 
+        // Exclusions narrow what the source-context scan reads, so two
+        // contexts that differ only in them must not share an identity (local
+        // caches, the remote approved-scope fingerprint). Encoded only when
+        // some exclusion can take effect: empty entries and empty lists are
+        // skipped by the scanner's filter, and leaving the field out for them
+        // keeps every identity captured without exclusions byte-identical, so
+        // no persisted id or golden moves and RESOLVER_CONTRACT_VERSION stays.
+        let exclusions: Vec<(&String, Vec<&PathBuf>)> = self
+            .scanner_settings
+            .excluded_scan_paths
+            .iter()
+            .map(|(client, paths)| {
+                (
+                    client,
+                    paths
+                        .iter()
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .collect(),
+                )
+            })
+            .filter(|(_, paths): &(&String, Vec<&PathBuf>)| !paths.is_empty())
+            .collect();
+        if !exclusions.is_empty() {
+            descriptor.field(16);
+            descriptor.count(exclusions.len())?;
+            for (client, paths) in exclusions {
+                descriptor.text(client)?;
+                descriptor.count(paths.len())?;
+                for path in paths {
+                    descriptor.path(path)?;
+                }
+            }
+        }
+
         Ok(Sha256::digest(descriptor.0).into())
     }
 }
@@ -2301,6 +2335,52 @@ mod tests {
             vec![captured_cwd.join("work-d"), PathBuf::new()],
             "a relative exclusion is bound to the capture cwd; an empty one stays empty"
         );
+    }
+
+    /// Exclusions narrow the scan, so they are part of the identity; empty
+    /// ones cannot take effect and leave it untouched (no persisted id moves).
+    #[test]
+    fn scan_exclusions_change_identity_only_when_they_can_take_effect() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let capture = |excluded: BTreeMap<String, Vec<PathBuf>>| {
+            ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                false,
+                ScannerSettings {
+                    excluded_scan_paths: excluded,
+                    ..ScannerSettings::default()
+                },
+                fixture_inputs(&root, []),
+            )
+            .unwrap()
+            .identity_bytes()
+        };
+
+        let none = capture(BTreeMap::new());
+        assert_eq!(
+            capture(BTreeMap::from([("claude".to_string(), Vec::new())])),
+            none
+        );
+        assert_eq!(
+            capture(BTreeMap::from([(
+                "claude".to_string(),
+                vec![PathBuf::new()]
+            )])),
+            none
+        );
+        let d = capture(BTreeMap::from([(
+            "claude".to_string(),
+            vec![home.join("work-d")],
+        )]));
+        let e = capture(BTreeMap::from([(
+            "claude".to_string(),
+            vec![home.join("work-e")],
+        )]));
+        assert_ne!(d, none);
+        assert_ne!(d, e);
     }
 
     #[test]
