@@ -1200,6 +1200,22 @@ fn resolve_scanner_settings(
     settings
         .extra_scan_paths
         .retain(|_, paths| !paths.is_empty());
+    // Exclusions are read at scan time, like the roots above, so a relative
+    // one is bound to the capture cwd too. Empty entries stay empty: the
+    // scanner's exclusion filter skips them, and qualifying one would turn it
+    // into the cwd itself.
+    for paths in settings.excluded_scan_paths.values_mut() {
+        *paths = std::mem::take(paths)
+            .into_iter()
+            .map(|path| {
+                if path.as_os_str().is_empty() {
+                    Ok(path)
+                } else {
+                    fully_qualified(cwd, &path)
+                }
+            })
+            .collect::<Result<_, _>>()?;
+    }
     Ok(settings)
 }
 
@@ -2267,6 +2283,10 @@ mod tests {
         settings
             .opencode_db_paths
             .push(PathBuf::from("db/opencode.db"));
+        settings.excluded_scan_paths.insert(
+            "claude".to_string(),
+            vec![PathBuf::from("work-d"), PathBuf::new()],
+        );
         let context =
             ResolvedLocalSourceContext::capture(Some(PathBuf::from("home")), false, settings)
                 .unwrap();
@@ -2275,6 +2295,11 @@ mod tests {
         assert_eq!(
             context.scanner_settings().opencode_db_paths,
             vec![captured_cwd.join("db/opencode.db")]
+        );
+        assert_eq!(
+            context.scanner_settings().excluded_scan_paths["claude"],
+            vec![captured_cwd.join("work-d"), PathBuf::new()],
+            "a relative exclusion is bound to the capture cwd; an empty one stays empty"
         );
     }
 
