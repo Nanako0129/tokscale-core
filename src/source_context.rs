@@ -427,6 +427,15 @@ impl ResolvedLocalSourceContext {
                 .values()
                 .flatten()
                 .all(|path| path.is_absolute())
+            // A remote context is never bound to a capture cwd, so a relative
+            // exclusion would resolve against the host's cwd at scan time and
+            // the approved-scope fingerprint would not pin what it excludes.
+            // Empty entries are skipped by the scanner's filter.
+            || !scanner_settings
+                .excluded_scan_paths
+                .values()
+                .flatten()
+                .all(|path| path.as_os_str().is_empty() || path.is_absolute())
         {
             return Err(RemoteSourceContextError::InvalidScannerSettings);
         }
@@ -2810,6 +2819,30 @@ mod tests {
             first.compute_identity().unwrap(),
             first.compute_remote_identity().unwrap()
         );
+    }
+
+    /// Remote exclusions must be absolute like the remote roots: nothing binds
+    /// them to a cwd. An empty entry is allowed (the filter skips it).
+    #[test]
+    fn remote_context_rejects_a_relative_scan_exclusion() {
+        let root = fixture_root();
+        let build = |excluded: Vec<PathBuf>| {
+            ResolvedLocalSourceContext::from_remote_explicit(
+                &root.join("home"),
+                &root.join("config"),
+                &root.join("data"),
+                &root.join("cache"),
+                &ScannerSettings {
+                    excluded_scan_paths: BTreeMap::from([("claude".to_string(), excluded)]),
+                    ..ScannerSettings::default()
+                },
+            )
+        };
+        assert!(matches!(
+            build(vec![PathBuf::from("projects")]),
+            Err(RemoteSourceContextError::InvalidScannerSettings)
+        ));
+        assert!(build(vec![root.join("home/work-d"), PathBuf::new()]).is_ok());
     }
 
     /// A redirected Windows profile: the approved platform roots are nowhere
