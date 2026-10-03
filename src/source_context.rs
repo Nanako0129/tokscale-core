@@ -901,10 +901,13 @@ impl ResolvedLocalSourceContext {
         // Exclusions narrow what the source-context scan reads, so two
         // contexts that differ only in them must not share an identity (local
         // caches, the remote approved-scope fingerprint). Encoded only when
-        // some exclusion can take effect: empty entries and empty lists are
-        // skipped by the scanner's filter, and leaving the field out for them
-        // keeps every identity captured without exclusions byte-identical, so
-        // no persisted id or golden moves and RESOLVER_CONTRACT_VERSION stays.
+        // some client has a non-empty exclusion path: empty entries and empty
+        // lists are skipped by the scanner's filter, and leaving the field out
+        // for them keeps every identity captured without exclusions
+        // byte-identical, so no persisted id or golden moves and
+        // RESOLVER_CONTRACT_VERSION stays. A client key the scanner does not
+        // recognize is still encoded: an extra cache key, never a wrong scan
+        // (field 11 hashes its raw keys the same way).
         let exclusions: Vec<(&String, Vec<&PathBuf>)> = self
             .scanner_settings
             .excluded_scan_paths
