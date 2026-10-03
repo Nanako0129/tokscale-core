@@ -79,7 +79,8 @@ pub struct ScannerSettings {
     /// the built-in extras, a `.cc-mirror` variant naming an absolute config
     /// directory, a cowork session tree — and a caller that owns only one of
     /// those registries cannot keep a directory out of the scan by editing it.
-    /// A prefix here removes the directory whichever route found it.
+    /// A prefix here removes the directory whichever route found it, on the
+    /// context-free scan and on a captured source context alike.
     ///
     /// Keys use the same public client ids as [`Self::extra_scan_paths`].
     #[serde(default)]
@@ -959,8 +960,12 @@ fn grok_unified_log_path_from_updates(updates_path: &Path) -> Option<PathBuf> {
 /// Both sides are canonicalized, for the same reason the helper canonicalizes
 /// its dedup key at the call below: a symlinked directory would otherwise walk
 /// straight past a string comparison.
-fn retain_unexcluded_scan_tasks(
-    tasks: &mut Vec<(ClientId, String, &'static str)>,
+///
+/// Both scan paths call it: the context-free one on its `String` tasks and
+/// the source-context one on its `PathBuf` tasks, each just before
+/// `run_scan_tasks`.
+fn retain_unexcluded_scan_tasks<P: AsRef<Path>>(
+    tasks: &mut Vec<(ClientId, P, &'static str)>,
     scanner_settings: &ScannerSettings,
 ) {
     if scanner_settings.excluded_scan_paths.is_empty() {
@@ -986,8 +991,8 @@ fn retain_unexcluded_scan_tasks(
         return;
     }
     tasks.retain(|(client_id, path, _)| {
-        let path = PathBuf::from(path);
-        let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+        let path = path.as_ref();
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         !excluded
             .iter()
             .any(|(excluded_id, prefix)| excluded_id == client_id && resolved.starts_with(prefix))
@@ -1504,6 +1509,8 @@ fn scan_all_clients_resolved_inner(
             }
         }
     }
+
+    retain_unexcluded_scan_tasks(&mut tasks, scanner_settings);
 
     let scan_results = run_scan_tasks(tasks, |path| path.as_path());
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -3257,6 +3264,134 @@ mod tests {
         assert!(
             !roots.iter().any(|path| path.starts_with(&dir_e)),
             "the registered root should still have been excluded: {roots:?}"
+        );
+    }
+
+    fn claude_context_roots(
+        home: &Path,
+        use_env_roots: bool,
+        settings: ScannerSettings,
+    ) -> Vec<PathBuf> {
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home.to_path_buf()), use_env_roots, settings)
+                .unwrap();
+        scan_all_clients_with_source_context(&context, &["claude".to_string()])
+            .unwrap()
+            .get(ClientId::Claude)
+            .to_vec()
+    }
+
+    /// The same three routes as the context-free test above, through the
+    /// source-context entry every production report scans with. That path
+    /// used to ignore `excluded_scan_paths` entirely.
+    #[test]
+    #[serial]
+    fn test_source_context_excluded_scan_paths_drop_every_route_to_a_claude_directory() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (dir_d, dir_e, dir_sub) = claude_exclusion_fixture(home);
+        let extra_scan_paths = registry_for([&dir_d, &dir_e]);
+
+        let without = claude_context_roots(
+            home,
+            false,
+            ScannerSettings {
+                extra_scan_paths: extra_scan_paths.clone(),
+                ..Default::default()
+            },
+        );
+        for expected in [&dir_d, &dir_e, &dir_sub] {
+            assert!(
+                without.iter().any(|path| path.starts_with(expected)),
+                "fixture is inert: nothing scanned under {expected:?}, got {without:?}"
+            );
+        }
+
+        let with = claude_context_roots(
+            home,
+            false,
+            ScannerSettings {
+                extra_scan_paths,
+                excluded_scan_paths: BTreeMap::from([(
+                    "claude".to_string(),
+                    vec![dir_d.clone(), dir_e.clone()],
+                )]),
+                ..Default::default()
+            },
+        );
+        for excluded in [&dir_d, &dir_e, &dir_sub] {
+            assert!(
+                !with.iter().any(|path| path.starts_with(excluded)),
+                "excluded directory still scanned: {excluded:?} in {with:?}"
+            );
+        }
+        assert!(
+            with.iter()
+                .any(|path| path.starts_with(home.join(".claude"))),
+            "the exclusion removed the primary root too: {with:?}"
+        );
+    }
+
+    /// `TOKSCALE_EXTRA_DIRS` reaches a captured context by its own route
+    /// (`context.extra_scan_paths()`), not through `ScannerSettings`.
+    #[test]
+    #[serial]
+    fn test_source_context_excluded_scan_paths_drop_an_env_extra_dir() {
+        let mut env = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (_, dir_e, _) = claude_exclusion_fixture(home);
+        env.set(
+            "TOKSCALE_EXTRA_DIRS",
+            format!("claude:{}", dir_e.join("projects").display()),
+        );
+
+        let without = claude_context_roots(home, true, ScannerSettings::default());
+        assert!(
+            without.iter().any(|path| path.starts_with(&dir_e)),
+            "fixture is inert: the env extra dir was not scanned, got {without:?}"
+        );
+
+        let with = claude_context_roots(
+            home,
+            true,
+            ScannerSettings {
+                excluded_scan_paths: BTreeMap::from([("claude".to_string(), vec![dir_e.clone()])]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !with.iter().any(|path| path.starts_with(&dir_e)),
+            "env extra dir still scanned: {with:?}"
+        );
+    }
+
+    /// No exclusion, an empty map and an empty list for the client all scan
+    /// exactly what the default capture scans.
+    #[test]
+    #[serial]
+    fn test_source_context_empty_exclusions_scan_what_the_default_scans() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (dir_d, dir_e, _) = claude_exclusion_fixture(home);
+        let extra_scan_paths = registry_for([&dir_d, &dir_e]);
+        let scan = |excluded_scan_paths| {
+            claude_context_roots(
+                home,
+                false,
+                ScannerSettings {
+                    extra_scan_paths: extra_scan_paths.clone(),
+                    excluded_scan_paths,
+                    ..Default::default()
+                },
+            )
+        };
+
+        let default = scan(BTreeMap::new());
+        assert!(default.len() >= 4, "fixture is inert: {default:?}");
+        assert_eq!(
+            scan(BTreeMap::from([("claude".to_string(), Vec::new())])),
+            default
         );
     }
 

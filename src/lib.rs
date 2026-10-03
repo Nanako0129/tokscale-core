@@ -7735,6 +7735,75 @@ mod tests {
         );
     }
 
+    async fn claude_window_output(context: &crate::ResolvedLocalSourceContext) -> i64 {
+        let options = ReportOptions {
+            clients: Some(vec!["claude".to_string()]),
+            ..Default::default()
+        };
+        super::get_window_usage_with_source_context(
+            context,
+            options,
+            1767225600000 - 1,
+            1767225600000 + 1,
+        )
+        .await
+        .expect("window scan must succeed")
+        .messages
+        .iter()
+        .map(|message| message.output)
+        .sum()
+    }
+
+    /// A captured context honors `excluded_scan_paths` through the window
+    /// entry, in tokens: cold, and again after the control has put the excluded
+    /// file in the shared source cache (a cached entry must not bring an
+    /// unscanned file back).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_window_usage_with_source_context_honors_excluded_scan_paths() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let home = source_home.path();
+        write_claude_message(
+            &home.join(".claude/projects/p"),
+            "primary.jsonl",
+            "m-primary",
+            100,
+        );
+        let work = home.join("work-d");
+        write_claude_message(&work.join("projects/p"), "d.jsonl", "m-d", 7_000);
+        let capture = |excluded: Vec<PathBuf>| {
+            crate::ResolvedLocalSourceContext::capture(
+                Some(home.to_path_buf()),
+                false,
+                scanner::ScannerSettings {
+                    extra_scan_paths: BTreeMap::from([(
+                        "claude".to_string(),
+                        vec![work.join("projects")],
+                    )]),
+                    excluded_scan_paths: BTreeMap::from([("claude".to_string(), excluded)]),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let excluded = capture(vec![work.clone()]);
+        let control = capture(Vec::new());
+
+        assert_eq!(claude_window_output(&excluded).await, 100, "cold");
+        assert_eq!(
+            claude_window_output(&control).await,
+            7_100,
+            "control sees both"
+        );
+        assert_eq!(claude_window_output(&excluded).await, 100, "warm cache");
+    }
+
     fn collect_streamed_claude_fixture(source_home: &Path) -> Vec<UnifiedMessage> {
         let mut messages = Vec::new();
         scan_messages_streaming(

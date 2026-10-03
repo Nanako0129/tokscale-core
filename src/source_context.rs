@@ -427,6 +427,15 @@ impl ResolvedLocalSourceContext {
                 .values()
                 .flatten()
                 .all(|path| path.is_absolute())
+            // A remote context is never bound to a capture cwd, so a relative
+            // exclusion would resolve against the host's cwd at scan time and
+            // the approved-scope fingerprint would not pin what it excludes.
+            // Empty entries are skipped by the scanner's filter.
+            || !scanner_settings
+                .excluded_scan_paths
+                .values()
+                .flatten()
+                .all(|path| path.as_os_str().is_empty() || path.is_absolute())
         {
             return Err(RemoteSourceContextError::InvalidScannerSettings);
         }
@@ -889,6 +898,43 @@ impl ResolvedLocalSourceContext {
         descriptor.field(15);
         descriptor.path(&self.capture_cwd)?;
 
+        // Exclusions narrow what the source-context scan reads, so two
+        // contexts that differ only in them must not share an identity (local
+        // caches, the remote approved-scope fingerprint). Encoded only when
+        // some client has a non-empty exclusion path: empty entries and empty
+        // lists are skipped by the scanner's filter, and leaving the field out
+        // for them keeps every identity captured without exclusions
+        // byte-identical, so no persisted id or golden moves and
+        // RESOLVER_CONTRACT_VERSION stays. A client key the scanner does not
+        // recognize is still encoded: an extra cache key, never a wrong scan
+        // (field 11 hashes its raw keys the same way).
+        let exclusions: Vec<(&String, Vec<&PathBuf>)> = self
+            .scanner_settings
+            .excluded_scan_paths
+            .iter()
+            .map(|(client, paths)| {
+                (
+                    client,
+                    paths
+                        .iter()
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .collect(),
+                )
+            })
+            .filter(|(_, paths): &(&String, Vec<&PathBuf>)| !paths.is_empty())
+            .collect();
+        if !exclusions.is_empty() {
+            descriptor.field(16);
+            descriptor.count(exclusions.len())?;
+            for (client, paths) in exclusions {
+                descriptor.text(client)?;
+                descriptor.count(paths.len())?;
+                for path in paths {
+                    descriptor.path(path)?;
+                }
+            }
+        }
+
         Ok(Sha256::digest(descriptor.0).into())
     }
 }
@@ -1200,6 +1246,22 @@ fn resolve_scanner_settings(
     settings
         .extra_scan_paths
         .retain(|_, paths| !paths.is_empty());
+    // Exclusions are read at scan time, like the roots above, so a relative
+    // one is bound to the capture cwd too. Empty entries stay empty: the
+    // scanner's exclusion filter skips them, and qualifying one would turn it
+    // into the cwd itself.
+    for paths in settings.excluded_scan_paths.values_mut() {
+        *paths = std::mem::take(paths)
+            .into_iter()
+            .map(|path| {
+                if path.as_os_str().is_empty() {
+                    Ok(path)
+                } else {
+                    fully_qualified(cwd, &path)
+                }
+            })
+            .collect::<Result<_, _>>()?;
+    }
     Ok(settings)
 }
 
@@ -2267,6 +2329,10 @@ mod tests {
         settings
             .opencode_db_paths
             .push(PathBuf::from("db/opencode.db"));
+        settings.excluded_scan_paths.insert(
+            "claude".to_string(),
+            vec![PathBuf::from("work-d"), PathBuf::new()],
+        );
         let context =
             ResolvedLocalSourceContext::capture(Some(PathBuf::from("home")), false, settings)
                 .unwrap();
@@ -2276,6 +2342,57 @@ mod tests {
             context.scanner_settings().opencode_db_paths,
             vec![captured_cwd.join("db/opencode.db")]
         );
+        assert_eq!(
+            context.scanner_settings().excluded_scan_paths["claude"],
+            vec![captured_cwd.join("work-d"), PathBuf::new()],
+            "a relative exclusion is bound to the capture cwd; an empty one stays empty"
+        );
+    }
+
+    /// Exclusions narrow the scan, so they are part of the identity; empty
+    /// ones cannot take effect and leave it untouched (no persisted id moves).
+    #[test]
+    fn scan_exclusions_change_identity_only_when_they_can_take_effect() {
+        let root = fixture_root();
+        let cwd = fixture_path("cwd");
+        let home = fixture_path("home");
+        let capture = |excluded: BTreeMap<String, Vec<PathBuf>>| {
+            ResolvedLocalSourceContext::capture_resolved(
+                cwd.clone(),
+                Some(home.clone()),
+                false,
+                ScannerSettings {
+                    excluded_scan_paths: excluded,
+                    ..ScannerSettings::default()
+                },
+                fixture_inputs(&root, []),
+            )
+            .unwrap()
+            .identity_bytes()
+        };
+
+        let none = capture(BTreeMap::new());
+        assert_eq!(
+            capture(BTreeMap::from([("claude".to_string(), Vec::new())])),
+            none
+        );
+        assert_eq!(
+            capture(BTreeMap::from([(
+                "claude".to_string(),
+                vec![PathBuf::new()]
+            )])),
+            none
+        );
+        let d = capture(BTreeMap::from([(
+            "claude".to_string(),
+            vec![home.join("work-d")],
+        )]));
+        let e = capture(BTreeMap::from([(
+            "claude".to_string(),
+            vec![home.join("work-e")],
+        )]));
+        assert_ne!(d, none);
+        assert_ne!(d, e);
     }
 
     #[test]
@@ -2705,6 +2822,30 @@ mod tests {
             first.compute_identity().unwrap(),
             first.compute_remote_identity().unwrap()
         );
+    }
+
+    /// Remote exclusions must be absolute like the remote roots: nothing binds
+    /// them to a cwd. An empty entry is allowed (the filter skips it).
+    #[test]
+    fn remote_context_rejects_a_relative_scan_exclusion() {
+        let root = fixture_root();
+        let build = |excluded: Vec<PathBuf>| {
+            ResolvedLocalSourceContext::from_remote_explicit(
+                &root.join("home"),
+                &root.join("config"),
+                &root.join("data"),
+                &root.join("cache"),
+                &ScannerSettings {
+                    excluded_scan_paths: BTreeMap::from([("claude".to_string(), excluded)]),
+                    ..ScannerSettings::default()
+                },
+            )
+        };
+        assert!(matches!(
+            build(vec![PathBuf::from("projects")]),
+            Err(RemoteSourceContextError::InvalidScannerSettings)
+        ));
+        assert!(build(vec![root.join("home/work-d"), PathBuf::new()]).is_ok());
     }
 
     /// A redirected Windows profile: the approved platform roots are nowhere
