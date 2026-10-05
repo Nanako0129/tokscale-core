@@ -716,6 +716,20 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // DeepSeek Harness (DSH) persists per-project session snapshots as
+    // `session-*.json` under `~/.dsh/storages/session_projcache/sessions`.
+    // Each file holds one session's `record.rows`; the authoritative
+    // per-step usage is `record.rows.contextTimeline.val.requests[]`.
+    // Vendor-local client (no upstream number yet).
+    Dsh = 41 => {
+        id: "dsh",
+        root: PathRoot::Home,
+        relative: ".dsh/storages/session_projcache/sessions",
+        pattern: "session-*.json",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -805,7 +819,23 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 41);
+        assert_eq!(ClientId::COUNT, 42);
+    }
+
+    #[test]
+    fn test_dsh_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("dsh").expect("dsh client should be registered");
+        assert_eq!(client, ClientId::Dsh);
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            "/tmp/home/.dsh/storages/session_projcache/sessions"
+        );
+        assert_eq!(client.data().pattern, "session-*.json");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
     }
 
     #[test]

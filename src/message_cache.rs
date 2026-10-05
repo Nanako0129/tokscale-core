@@ -990,6 +990,9 @@ fn parser_version(client: ClientId) -> u32 {
         // cross-session keys). Shared with Pi, Kimchi and Senpi: bump all four
         // together.
         ClientId::Omp => 1,
+        // 1: DSH's projcache parser (`parse_dsh_file`, one request row per
+        // message). Vendor-local numbering: no upstream DSH parser exists.
+        ClientId::Dsh => 1,
         _ => 1,
     }
 }
