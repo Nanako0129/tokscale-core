@@ -5725,7 +5725,8 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     // sidecars here too — a WAL-only write would otherwise leave the change
     // token unchanged and the live tail would never re-parse the new usage.
     // `prune_scan_result_by_mtime` folds the same `-wal` into its threshold
-    // check for this lane; keep the two in lockstep.
+    // check for this lane and `local_source_change_token_inner` probes it too;
+    // keep the three in lockstep.
     dbs.extend(scan_result.get(ClientId::AntigravityCli).iter().cloned());
     // micode `.db` files likewise arrive via the generic `*.db` glob and are
     // WAL-mode SQLite, so probe their `-wal` sidecars for the live-tail change
@@ -5836,6 +5837,8 @@ fn local_source_change_token_inner(scan_result: &scanner::ScanResult) -> Result<
             .iter()
             .map(|source| source.db_path.clone()),
     );
+    // Same Antigravity CLI `-wal` as `latest_source_mtime_ms_from_scan` and the
+    // retain in `prune_scan_result_by_mtime`; keep the three in lockstep.
     dbs.extend(scan_result.get(ClientId::AntigravityCli).iter().cloned());
     dbs.extend(scan_result.get(ClientId::MiMoCode).iter().cloned());
     for db in dbs {
@@ -6036,10 +6039,18 @@ fn grok_source_mtime_ms(source_path: &Path) -> Option<u64> {
 /// `session_*.json` snapshot whose sibling `.journal.jsonl` is appended between
 /// snapshot rewrites. Those lanes remain exempt. Roo-family, Droid, legacy Kimi,
 /// Kiro file sources, Grok sources, and Antigravity CLI dbs can still be
-/// bounded by folding every parser dependency into their newest mtime (for
-/// Antigravity CLI: the db and its `-wal`; a missing `-wal` is ignored). Each
-/// Antigravity CLI db is parsed independently and every message timestamp it
-/// yields is no later than its last write, which moves the db or `-wal` mtime.
+/// bounded by folding every parser dependency into their newest mtime.
+///
+/// Antigravity CLI: the db and the `-wal` SQLite keeps beside the db's resolved
+/// path (a symlinked db's WAL sits next to its target); a missing `-wal` is
+/// ignored. SQLite appends a write to `-wal` in WAL mode and rewrites the db in
+/// rollback mode, and every timestamp the parser yields is written by agy or is
+/// the db mtime, so a db older than the threshold holds nothing dated after it.
+/// That bounds `parse_local_clients`, which parses each db on its own; the
+/// streaming lane's cross-file responseId gate is not covered by this argument.
+/// Checked against real agy data on APFS; NTFS mtime behaviour is unverified. A
+/// read-only open can create or touch `-wal`, which only keeps a db longer.
+///
 /// Any stat failure keeps the file — over-parsing is safe, silently skipping is
 /// not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
@@ -6053,7 +6064,7 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
     // Lanes whose scanned file's mtime does not reflect a sibling write
     // (SQLite `-wal` or jcode's `.journal.jsonl`) and that have no sibling-aware
     // retain below; kept in lockstep with the sibling probes in
-    // `latest_source_mtime_ms`.
+    // `latest_source_mtime_ms_from_scan` and `local_source_change_token_inner`.
     let db_lanes = [
         ClientId::Hermes as usize,
         ClientId::Zed as usize,
@@ -6077,7 +6088,9 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
         }
         if lane == ClientId::AntigravityCli as usize {
             files.retain(|path| {
-                let mut wal = path.clone().into_os_string();
+                // SQLite resolves a symlinked db and keeps `-wal` beside the target.
+                let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                let mut wal = target.into_os_string();
                 wal.push("-wal");
                 source_with_related_mtime_ms(path, std::iter::once(PathBuf::from(wal)))
                     .is_none_or(|mtime| mtime >= threshold_ms)
@@ -17740,6 +17753,40 @@ mod tests {
     #[test]
     fn test_modified_after_keeps_fresh_antigravity_cli_db_without_wal() {
         assert!(antigravity_cli_db_survives_prune(1_000, None));
+        // An mtime exactly at the threshold is kept.
+        assert!(antigravity_cli_db_survives_prune(0, None));
+    }
+
+    /// A checkpoint moves pages from `-wal` into the db, so the db can be the
+    /// fresh one while `-wal` still carries an older mtime.
+    #[test]
+    fn test_modified_after_keeps_antigravity_cli_db_when_only_db_is_fresh() {
+        assert!(antigravity_cli_db_survives_prune(1_000, Some(-1_000)));
+    }
+
+    /// SQLite resolves a symlinked db and writes its WAL beside the target, so
+    /// the `-wal` that proves freshness is the target's, not the link's.
+    #[cfg(unix)]
+    #[test]
+    fn test_modified_after_reads_wal_beside_a_symlinked_antigravity_cli_db() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let target = temp_dir.path().join("elsewhere.db");
+        std::fs::File::create(&target).unwrap();
+        set_mtime_relative_to_agy_threshold(&target, -2_000);
+        let wal = temp_dir.path().join("elsewhere.db-wal");
+        std::fs::File::create(&wal).unwrap();
+        set_mtime_relative_to_agy_threshold(&wal, 1_000);
+        let link = temp_dir.path().join("conv.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result.get_mut(ClientId::AntigravityCli).push(link.clone());
+        crate::prune_scan_result_by_mtime(&mut scan_result, AGY_PRUNE_THRESHOLD_MS);
+        assert_eq!(scan_result.get(ClientId::AntigravityCli), std::slice::from_ref(&link));
+
+        set_mtime_relative_to_agy_threshold(&wal, -1_000);
+        crate::prune_scan_result_by_mtime(&mut scan_result, AGY_PRUNE_THRESHOLD_MS);
+        assert!(scan_result.get(ClientId::AntigravityCli).is_empty());
     }
 
     #[test]
@@ -17758,14 +17805,18 @@ mod tests {
         );
     }
 
+    /// agy writes in WAL mode: a turn lands in `-wal` frames and the db's mtime
+    /// stays put until a checkpoint. The writer stays open with automatic
+    /// checkpoints off, so the only copy of the message is in the WAL.
     #[test]
     fn test_modified_after_parses_antigravity_cli_db_only_when_db_or_wal_is_fresh() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let conversations_dir = temp_dir.path().join(".gemini/antigravity-cli/conversations");
-        write_antigravity_cli_db(&conversations_dir, "conv-e2e", "resp-e2e");
+        let _writer =
+            write_antigravity_cli_db_with(&conversations_dir, "conv-e2e", "resp-e2e", true);
         let db = conversations_dir.join("conv-e2e.db");
         let wal = conversations_dir.join("conv-e2e.db-wal");
-        std::fs::File::create(&wal).unwrap();
+        assert!(wal.metadata().unwrap().len() > 0, "the row is held in WAL frames");
         set_mtime_relative_to_agy_threshold(&db, -2_000);
 
         let parse = || {
@@ -17801,6 +17852,18 @@ mod tests {
         file_stem: &str,
         response_id: &str,
     ) {
+        write_antigravity_cli_db_with(conversations_dir, file_stem, response_id, false);
+    }
+
+    /// As `write_antigravity_cli_db`, returning the open writer. With `wal`, the
+    /// db is in WAL mode with automatic checkpoints off, so while the returned
+    /// connection lives the row exists only in `-wal`.
+    fn write_antigravity_cli_db_with(
+        conversations_dir: &std::path::Path,
+        file_stem: &str,
+        response_id: &str,
+        wal: bool,
+    ) -> rusqlite::Connection {
         fn encode_varint(mut value: u64) -> Vec<u8> {
             let mut out = Vec::new();
             loop {
@@ -17840,6 +17903,13 @@ mod tests {
         std::fs::create_dir_all(conversations_dir).unwrap();
         let path = conversations_dir.join(format!("{file_stem}.db"));
         let conn = rusqlite::Connection::open(&path).unwrap();
+        if wal {
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode.to_lowercase(), "wal");
+            conn.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        }
         conn.execute_batch("CREATE TABLE gen_metadata (idx integer, data blob, size integer);")
             .unwrap();
         conn.execute(
@@ -17847,6 +17917,7 @@ mod tests {
             rusqlite::params![gen_blob],
         )
         .unwrap();
+        conn
     }
 
     // Two independent Antigravity CLI conversation DBs that reuse the same
@@ -19090,7 +19161,8 @@ mod tests {
 
     // micode `.db` is WAL-mode SQLite reached via the generic `*.db` glob, so it
     // must be exempt from mtime pruning (a WAL-only write leaves the main db's
-    // mtime untouched) — same treatment as Antigravity CLI / Hermes / Zed.
+    // mtime untouched) — same treatment as Hermes / Zed (Antigravity CLI is instead
+    // pruned by the newer of its db and `-wal` mtimes).
     #[test]
     fn test_modified_after_never_prunes_micode_dbs() {
         let temp_dir = tempfile::TempDir::new().unwrap();
