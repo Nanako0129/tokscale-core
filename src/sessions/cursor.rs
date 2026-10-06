@@ -256,16 +256,15 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
         Err(_) => return vec![],
     };
 
-    let root: serde_json::Value = match serde_json::from_str(&content) {
+    let mut root: serde_json::Value = match serde_json::from_str(&content) {
         Ok(root) => root,
         Err(_) => return vec![],
     };
 
-    let rows = root
-        .get("usageEventsDisplay")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let rows = match root.get_mut("usageEventsDisplay").map(serde_json::Value::take) {
+        Some(serde_json::Value::Array(rows)) => rows,
+        _ => Vec::new(),
+    };
 
     let account_id = account_id_from_cursor_cache_path(path);
     let mut messages = Vec::with_capacity(rows.len());
