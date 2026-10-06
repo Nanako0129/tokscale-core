@@ -5724,9 +5724,11 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     // lane (a `*.db` glob, no dedicated ScanResult field), so probe their `-wal`
     // sidecars here too — a WAL-only write would otherwise leave the change
     // token unchanged and the live tail would never re-parse the new usage.
-    // `prune_scan_result_by_mtime` folds the same `-wal` into its threshold
-    // check for this lane and `local_source_change_token_inner` probes it too;
-    // keep the three in lockstep.
+    // `local_source_change_token_inner` probes the same `<path>-wal`. The
+    // Antigravity CLI retain in `prune_scan_result_by_mtime` also probes the
+    // `-wal` beside a symlinked db's target; these two token probes do not,
+    // so a WAL-only write there does not move the token (a gap older than the
+    // pruning).
     dbs.extend(scan_result.get(ClientId::AntigravityCli).iter().cloned());
     // micode `.db` files likewise arrive via the generic `*.db` glob and are
     // WAL-mode SQLite, so probe their `-wal` sidecars for the live-tail change
@@ -5837,8 +5839,9 @@ fn local_source_change_token_inner(scan_result: &scanner::ScanResult) -> Result<
             .iter()
             .map(|source| source.db_path.clone()),
     );
-    // Same Antigravity CLI `-wal` as `latest_source_mtime_ms_from_scan` and the
-    // retain in `prune_scan_result_by_mtime`; keep the three in lockstep.
+    // Antigravity CLI: the same `<path>-wal` as `latest_source_mtime_ms_from_scan`.
+    // The retain in `prune_scan_result_by_mtime` also probes the `-wal` beside a
+    // symlinked db's target, which these token probes do not.
     dbs.extend(scan_result.get(ClientId::AntigravityCli).iter().cloned());
     dbs.extend(scan_result.get(ClientId::MiMoCode).iter().cloned());
     for db in dbs {
