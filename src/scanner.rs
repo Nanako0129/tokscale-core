@@ -453,6 +453,25 @@ fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
 
                     true
                 }
+                // Cursor cache: JSON is the current format, CSV is legacy. Both
+                // are matched so a cache written before the JSON switch still
+                // parses; sibling de-duplication (JSON wins) happens after the
+                // scan so a co-existing CSV never double-counts (upstream #1247).
+                "usage*.json|usage*.csv" => {
+                    if is_in_archive_dir {
+                        return false;
+                    }
+
+                    if !file_name.starts_with("usage.")
+                        || !(file_name.ends_with(".json") || file_name.ends_with(".csv"))
+                    {
+                        return false;
+                    }
+
+                    // Excludes backups like usage.backup-<ts>.csv; non-usage
+                    // files such as usage.last-sync-attempt fail the suffix test.
+                    !file_name.starts_with("usage.backup")
+                }
                 "session-*.json" => {
                     file_name.starts_with("session-") && file_name.ends_with(".json")
                 }
@@ -1553,6 +1572,8 @@ fn scan_all_clients_resolved_inner(
         }
     }
 
+    prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+
     Ok(result)
 }
 
@@ -2106,7 +2127,26 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
+    prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+
     result
+}
+
+/// Drop each Cursor `usage[.account].csv` whose `usage[.account].json` sibling
+/// (same directory) is also present, so an account is parsed from exactly one
+/// file. Mirrors upstream #1247.
+fn prefer_cursor_json_over_csv(files: &mut Vec<PathBuf>) {
+    let is_ext = |path: &Path, want: &str| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
+    };
+    let json_stems: HashSet<PathBuf> = files
+        .iter()
+        .filter(|path| is_ext(path, "json"))
+        .map(|path| path.with_extension(""))
+        .collect();
+    files.retain(|path| !(is_ext(path, "csv") && json_stems.contains(&path.with_extension(""))));
 }
 
 pub fn scan_all_clients(home_dir: &str, clients: &[String]) -> ScanResult {
@@ -2379,6 +2419,153 @@ mod tests {
                 .unwrap_or_default()
                 == "ui_messages.json"
         }));
+    }
+
+    fn names_of(files: &[PathBuf]) -> Vec<String> {
+        let mut names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_scan_directory_cursor_pattern_matches_usage_json_and_csv_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        for name in [
+            "usage.json",
+            "usage.csv",
+            "usage.work.json",
+            "usage.work.csv",
+            "usage.last-sync-attempt",
+            "usage.backup-1.json",
+            "usage.backup-1.csv",
+            "usage-notes.json",
+            "other.json",
+        ] {
+            File::create(path.join(name)).unwrap();
+        }
+        let archive = path.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        File::create(archive.join("usage.json")).unwrap();
+        File::create(archive.join("usage.csv")).unwrap();
+
+        let files = scan_directory(path.to_str().unwrap(), "usage*.json|usage*.csv");
+        assert_eq!(
+            names_of(&files),
+            vec![
+                "usage.csv",
+                "usage.json",
+                "usage.work.csv",
+                "usage.work.json"
+            ]
+        );
+    }
+
+    fn cursor_cache(home: &Path) -> PathBuf {
+        let dir = home.join(".config/tokscale/cursor-cache");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cursor_scan(home: &Path, settings: &ScannerSettings) -> Vec<PathBuf> {
+        scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["cursor".to_string()],
+            false,
+            settings,
+        )
+        .get(ClientId::Cursor)
+        .to_vec()
+    }
+
+    #[test]
+    fn test_cursor_scan_json_only_and_json_wins_over_csv_per_account() {
+        let dir = TempDir::new().unwrap();
+        let cache = cursor_cache(dir.path());
+        // active: json + csv -> json. team-a: json only. team-b: csv only.
+        for name in [
+            "usage.json",
+            "usage.csv",
+            "usage.team-a.json",
+            "usage.team-b.csv",
+            "usage.last-sync-attempt",
+        ] {
+            File::create(cache.join(name)).unwrap();
+        }
+        let files = cursor_scan(dir.path(), &ScannerSettings::default());
+        assert_eq!(
+            names_of(&files),
+            vec!["usage.json", "usage.team-a.json", "usage.team-b.csv"]
+        );
+
+        let csv_only = TempDir::new().unwrap();
+        File::create(cursor_cache(csv_only.path()).join("usage.csv")).unwrap();
+        assert_eq!(
+            names_of(&cursor_scan(csv_only.path(), &ScannerSettings::default())),
+            vec!["usage.csv"]
+        );
+    }
+
+    #[test]
+    fn test_prefer_cursor_json_over_csv_is_per_directory() {
+        let a = PathBuf::from("/a");
+        let b = PathBuf::from("/b");
+        let mut files = vec![
+            a.join("usage.json"),
+            a.join("usage.csv"),
+            b.join("usage.csv"),
+        ];
+        prefer_cursor_json_over_csv(&mut files);
+        assert_eq!(files, vec![a.join("usage.json"), b.join("usage.csv")]);
+    }
+
+    /// The takeover seam (Syrtis cursor sync): excluding the default cache root
+    /// and adding another directory leaves only the other directory's file.
+    #[test]
+    #[serial]
+    fn test_cursor_takeover_excluded_default_root_plus_extra_dir() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let cli_cache = cursor_cache(home);
+        File::create(cli_cache.join("usage.csv")).unwrap();
+        File::create(cli_cache.join("usage.json")).unwrap();
+        let sync_dir = home.join("sync");
+        fs::create_dir_all(&sync_dir).unwrap();
+        File::create(sync_dir.join("usage.synced.json")).unwrap();
+
+        let extra = BTreeMap::from([("cursor".to_string(), vec![sync_dir.clone()])]);
+        let both = cursor_scan(
+            home,
+            &ScannerSettings {
+                extra_scan_paths: extra.clone(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            both.iter().any(|p| p.starts_with(&cli_cache))
+                && both.iter().any(|p| p.starts_with(&sync_dir)),
+            "fixture is inert: {both:?}"
+        );
+
+        let settings = ScannerSettings {
+            extra_scan_paths: extra,
+            excluded_scan_paths: BTreeMap::from([("cursor".to_string(), vec![cli_cache.clone()])]),
+            ..Default::default()
+        };
+        let taken = cursor_scan(home, &settings);
+        assert_eq!(taken, vec![sync_dir.join("usage.synced.json")]);
+
+        // Same seam through a captured source context.
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home.to_path_buf()), false, settings).unwrap();
+        let via_context = scan_all_clients_with_source_context(&context, &["cursor".to_string()])
+            .unwrap()
+            .get(ClientId::Cursor)
+            .to_vec();
+        assert_eq!(via_context, vec![sync_dir.join("usage.synced.json")]);
     }
 
     #[test]
@@ -3228,7 +3415,8 @@ mod tests {
             );
         }
         assert!(
-            with.iter().any(|path| path.starts_with(home.join(".claude"))),
+            with.iter()
+                .any(|path| path.starts_with(home.join(".claude"))),
             "the exclusion removed the primary root too: {with:?}"
         );
     }

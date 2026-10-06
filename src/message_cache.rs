@@ -895,7 +895,12 @@ fn parser_version(client: ClientId) -> u32 {
         // of being reduced by `Input (w/o Cache Write)`, and any numeric
         // exported Cost (including an explicit `$0.00`) is provider-reported
         // (upstream #1154). Cached rows hold the old tokens and cost source.
-        ClientId::Cursor => 3,
+        // 4: the scanner now also discovers `usage[.account].json` (usage-events
+        // JSON, upstream #1247). Unchanged CSV shards stay valid by content, but
+        // the bump makes every Cursor shard re-parse once so a cache written
+        // while only CSV was scanned cannot mask the JSON-era file set. One
+        // Cursor re-parse for consumers.
+        ClientId::Cursor => 4,
         // 2: Pi messages now carry a cross-session dedup key (upstream #1323),
         // and a cached v1 entry has none, so fork copies would keep counting
         // once per session file until re-parsed.
@@ -5997,8 +6002,9 @@ mod tests {
         // 3 is the `.zst` archive decode plus checkpoint exclusion (#1285,
         // #1293): unchanged archives must re-parse instead of replaying empty.
         assert_eq!(parser_version(ClientId::OpenClaw), 3);
-        // 3 reads Cursor's cache-write column as its own bucket (#1154).
-        assert_eq!(parser_version(ClientId::Cursor), 3);
+        // 4 follows the 3 that reads the cache-write column as its own bucket
+        // (#1154) with scanner discovery of usage-events `usage*.json` (#1247).
+        assert_eq!(parser_version(ClientId::Cursor), 4);
         // 3 drops Pi entries cached for OMP files once `omp` owns that root
         // (2 carried the cross-session Pi dedup key, #1323).
         assert_eq!(parser_version(ClientId::Pi), 3);
