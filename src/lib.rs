@@ -5724,6 +5724,8 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     // lane (a `*.db` glob, no dedicated ScanResult field), so probe their `-wal`
     // sidecars here too — a WAL-only write would otherwise leave the change
     // token unchanged and the live tail would never re-parse the new usage.
+    // `prune_scan_result_by_mtime` folds the same `-wal` into its threshold
+    // check for this lane; keep the two in lockstep.
     dbs.extend(scan_result.get(ClientId::AntigravityCli).iter().cloned());
     // micode `.db` files likewise arrive via the generic `*.db` glob and are
     // WAL-mode SQLite, so probe their `-wal` sidecars for the live-tail change
@@ -6029,12 +6031,15 @@ fn grok_source_mtime_ms(source_path: &Path) -> Option<u64> {
 /// Drop file-backed session logs older than `threshold_ms` (unix ms, mtime)
 /// from a scan. Sources whose freshness is not captured by their scanned
 /// file's own mtime are left untouched, because a sibling can change without
-/// touching it: the Hermes/Zed/Antigravity-CLI/micode lanes hold SQLite dbs
-/// (WAL writes may not bump the main `.db` mtime), while the jcode lane holds a
+/// touching it: the Hermes/Zed/micode lanes hold SQLite dbs (WAL writes may
+/// not bump the main `.db` mtime), while the jcode lane holds a
 /// `session_*.json` snapshot whose sibling `.journal.jsonl` is appended between
 /// snapshot rewrites. Those lanes remain exempt. Roo-family, Droid, legacy Kimi,
-/// Kiro file sources, and Grok sources can still be bounded by folding every
-/// parser dependency into their newest mtime.
+/// Kiro file sources, Grok sources, and Antigravity CLI dbs can still be
+/// bounded by folding every parser dependency into their newest mtime (for
+/// Antigravity CLI: the db and its `-wal`; a missing `-wal` is ignored). Each
+/// Antigravity CLI db is parsed independently and every message timestamp it
+/// yields is no later than its last write, which moves the db or `-wal` mtime.
 /// Any stat failure keeps the file — over-parsing is safe, silently skipping is
 /// not.
 fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_ms: u64) {
@@ -6046,12 +6051,12 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
     }
 
     // Lanes whose scanned file's mtime does not reflect a sibling write
-    // (SQLite `-wal` or jcode's `.journal.jsonl`); kept in lockstep with the
-    // sibling probes in `latest_source_mtime_ms`.
+    // (SQLite `-wal` or jcode's `.journal.jsonl`) and that have no sibling-aware
+    // retain below; kept in lockstep with the sibling probes in
+    // `latest_source_mtime_ms`.
     let db_lanes = [
         ClientId::Hermes as usize,
         ClientId::Zed as usize,
-        ClientId::AntigravityCli as usize,
         ClientId::MiMoCode as usize,
         ClientId::Jcode as usize,
     ];
@@ -6068,6 +6073,15 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
             continue;
         }
         if db_lanes.contains(&lane) {
+            continue;
+        }
+        if lane == ClientId::AntigravityCli as usize {
+            files.retain(|path| {
+                let mut wal = path.clone().into_os_string();
+                wal.push("-wal");
+                source_with_related_mtime_ms(path, std::iter::once(PathBuf::from(wal)))
+                    .is_none_or(|mtime| mtime >= threshold_ms)
+            });
             continue;
         }
         if roo_lanes.contains(&lane) {
@@ -17663,43 +17677,118 @@ mod tests {
         assert_eq!(parsed.messages[0].session_id, "hermes-wal-session");
     }
 
-    #[test]
-    fn test_modified_after_never_prunes_antigravity_cli_dbs() {
-        // Antigravity CLI conversation `.db` files arrive via the generic
-        // `files` lane (a `*.db` glob), but they are SQLite — WAL writes may
-        // leave the main db mtime untouched, so they must be exempt from mtime
-        // pruning like Hermes/Zed. A plain-file client with the same old mtime
-        // is still pruned (control).
+    const AGY_PRUNE_THRESHOLD_MS: u64 = 1_700_000_000_000;
+
+    /// Set a file's mtime to `AGY_PRUNE_THRESHOLD_MS + offset_ms`.
+    fn set_mtime_relative_to_agy_threshold(path: &std::path::Path, offset_ms: i64) {
+        let ms = (AGY_PRUNE_THRESHOLD_MS as i64 + offset_ms) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+            .unwrap();
+    }
+
+    /// Prune a scan holding one Antigravity CLI db (plus an old Claude log as a
+    /// control) and report whether the db survived. `db_offset_ms` is the db
+    /// mtime relative to the threshold, `wal_offset_ms` the optional `-wal`
+    /// sidecar's. The Claude control must always be pruned.
+    fn antigravity_cli_db_survives_prune(db_offset_ms: i64, wal_offset_ms: Option<i64>) -> bool {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let cli_db = temp_dir.path().join("conv.db");
         std::fs::File::create(&cli_db).unwrap();
+        set_mtime_relative_to_agy_threshold(&cli_db, db_offset_ms);
+        if let Some(offset) = wal_offset_ms {
+            let wal = temp_dir.path().join("conv.db-wal");
+            std::fs::File::create(&wal).unwrap();
+            set_mtime_relative_to_agy_threshold(&wal, offset);
+        }
         let claude_log = temp_dir.path().join("session.jsonl");
         std::fs::File::create(&claude_log).unwrap();
+        set_mtime_relative_to_agy_threshold(&claude_log, -1_000);
 
         let mut scan_result = scanner::ScanResult::default();
         scan_result
             .get_mut(ClientId::AntigravityCli)
             .push(cli_db.clone());
-        scan_result
-            .get_mut(ClientId::Claude)
-            .push(claude_log.clone());
+        scan_result.get_mut(ClientId::Claude).push(claude_log);
+        crate::prune_scan_result_by_mtime(&mut scan_result, AGY_PRUNE_THRESHOLD_MS);
 
-        // A threshold in the future would prune any real on-disk mtime.
-        let future_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            + 3_600_000;
-        crate::prune_scan_result_by_mtime(&mut scan_result, future_ms);
-
-        assert_eq!(
-            scan_result.get(ClientId::AntigravityCli),
-            std::slice::from_ref(&cli_db),
-            "Antigravity CLI .db (a WAL-mode SQLite source) must survive mtime pruning"
-        );
         assert!(
             scan_result.get(ClientId::Claude).is_empty(),
-            "a plain-file client's stale log is still pruned"
+            "control: a plain-file client's stale log is pruned"
+        );
+        !scan_result.get(ClientId::AntigravityCli).is_empty()
+    }
+
+    #[test]
+    fn test_modified_after_prunes_old_antigravity_cli_db_without_wal() {
+        assert!(!antigravity_cli_db_survives_prune(-1_000, None));
+    }
+
+    #[test]
+    fn test_modified_after_prunes_antigravity_cli_db_when_db_and_wal_are_old() {
+        assert!(!antigravity_cli_db_survives_prune(-2_000, Some(-1_000)));
+    }
+
+    #[test]
+    fn test_modified_after_keeps_antigravity_cli_db_when_only_wal_is_fresh() {
+        assert!(antigravity_cli_db_survives_prune(-1_000, Some(1_000)));
+    }
+
+    #[test]
+    fn test_modified_after_keeps_fresh_antigravity_cli_db_without_wal() {
+        assert!(antigravity_cli_db_survives_prune(1_000, None));
+    }
+
+    #[test]
+    fn test_modified_after_keeps_antigravity_cli_db_when_stat_fails() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let missing_db = temp_dir.path().join("gone.db");
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result
+            .get_mut(ClientId::AntigravityCli)
+            .push(missing_db.clone());
+        crate::prune_scan_result_by_mtime(&mut scan_result, AGY_PRUNE_THRESHOLD_MS);
+        assert_eq!(
+            scan_result.get(ClientId::AntigravityCli),
+            std::slice::from_ref(&missing_db),
+            "a db whose freshness cannot be established must fail open"
+        );
+    }
+
+    #[test]
+    fn test_modified_after_parses_antigravity_cli_db_only_when_db_or_wal_is_fresh() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let conversations_dir = temp_dir.path().join(".gemini/antigravity-cli/conversations");
+        write_antigravity_cli_db(&conversations_dir, "conv-e2e", "resp-e2e");
+        let db = conversations_dir.join("conv-e2e.db");
+        let wal = conversations_dir.join("conv-e2e.db-wal");
+        std::fs::File::create(&wal).unwrap();
+        set_mtime_relative_to_agy_threshold(&db, -2_000);
+
+        let parse = || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["antigravity-cli".to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: Some(AGY_PRUNE_THRESHOLD_MS),
+            })
+            .unwrap()
+        };
+
+        set_mtime_relative_to_agy_threshold(&wal, 1_000);
+        assert_eq!(parse().messages.len(), 1, "fresh -wal keeps the db parsed");
+
+        set_mtime_relative_to_agy_threshold(&wal, -1_000);
+        assert!(
+            parse().messages.is_empty(),
+            "db and -wal both older than the threshold are not parsed"
         );
     }
 
