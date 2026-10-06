@@ -6000,8 +6000,8 @@ mod tests {
         // 3 is the `.zst` archive decode plus checkpoint exclusion (#1285,
         // #1293): unchanged archives must re-parse instead of replaying empty.
         assert_eq!(parser_version(ClientId::OpenClaw), 3);
-        // 4 follows the 3 that reads the cache-write column as its own bucket
-        // (#1154) with scanner discovery of usage-events `usage*.json` (#1247).
+        // 3 reads the cache-write column as its own bucket (#1154). Usage-events
+        // JSON (#1247) deliberately has no bump: the cache is keyed per path.
         assert_eq!(parser_version(ClientId::Cursor), 3);
         // 3 drops Pi entries cached for OMP files once `omp` owns that root
         // (2 carried the cross-session Pi dedup key, #1323).
