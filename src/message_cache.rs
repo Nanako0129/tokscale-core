@@ -2438,7 +2438,7 @@ fn file_fingerprint_parts(
     Some((size, modified_ns, sample_hashes, content_hash))
 }
 
-fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut os = OsString::from(path.as_os_str());
     os.push(suffix);
     PathBuf::from(os)
