@@ -6041,8 +6041,10 @@ fn grok_source_mtime_ms(source_path: &Path) -> Option<u64> {
 /// Kiro file sources, Grok sources, and Antigravity CLI dbs can still be
 /// bounded by folding every parser dependency into their newest mtime.
 ///
-/// Antigravity CLI: the db and the `-wal` SQLite keeps beside the db's resolved
-/// path (a symlinked db's WAL sits next to its target); a missing `-wal` is
+/// Antigravity CLI: the db and its `-wal`, probed both beside the scanned path
+/// and beside the db's resolved target, because SQLite's unix VFS follows a
+/// symlinked db to its target and its Windows VFS does not (libsqlite3-sys
+/// 0.30.1's `unixFullPathname` / `winFullPathname`); a missing `-wal` is
 /// ignored. SQLite appends a write to `-wal` in WAL mode and rewrites the db in
 /// rollback mode, and every timestamp the parser yields is written by agy or is
 /// the db mtime, so a db older than the threshold holds nothing dated after it.
@@ -6088,12 +6090,18 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
         }
         if lane == ClientId::AntigravityCli as usize {
             files.retain(|path| {
-                // SQLite resolves a symlinked db and keeps `-wal` beside the target.
-                let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-                let mut wal = target.into_os_string();
-                wal.push("-wal");
-                source_with_related_mtime_ms(path, std::iter::once(PathBuf::from(wal)))
-                    .is_none_or(|mtime| mtime >= threshold_ms)
+                // `-wal` sits beside the path SQLite opened: the target of a
+                // symlinked db on unix, the link itself on Windows. Probe both.
+                let wal_of = |db: &Path| {
+                    let mut wal = db.as_os_str().to_owned();
+                    wal.push("-wal");
+                    PathBuf::from(wal)
+                };
+                let mut wals = vec![wal_of(path)];
+                if let Ok(target) = std::fs::canonicalize(path) {
+                    wals.push(wal_of(&target));
+                }
+                source_with_related_mtime_ms(path, wals).is_none_or(|mtime| mtime >= threshold_ms)
             });
             continue;
         }
@@ -17764,8 +17772,9 @@ mod tests {
         assert!(antigravity_cli_db_survives_prune(1_000, Some(-1_000)));
     }
 
-    /// SQLite resolves a symlinked db and writes its WAL beside the target, so
-    /// the `-wal` that proves freshness is the target's, not the link's.
+    /// A symlinked db's WAL sits beside the target on unix and beside the link
+    /// on Windows (SQLite resolves the link only in its unix VFS), so a fresh
+    /// `-wal` in either place keeps the db.
     #[cfg(unix)]
     #[test]
     fn test_modified_after_reads_wal_beside_a_symlinked_antigravity_cli_db() {
@@ -17773,20 +17782,27 @@ mod tests {
         let target = temp_dir.path().join("elsewhere.db");
         std::fs::File::create(&target).unwrap();
         set_mtime_relative_to_agy_threshold(&target, -2_000);
-        let wal = temp_dir.path().join("elsewhere.db-wal");
-        std::fs::File::create(&wal).unwrap();
-        set_mtime_relative_to_agy_threshold(&wal, 1_000);
         let link = temp_dir.path().join("conv.db");
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        let target_wal = temp_dir.path().join("elsewhere.db-wal");
+        let link_wal = temp_dir.path().join("conv.db-wal");
+        let survives = || {
+            let mut scan_result = scanner::ScanResult::default();
+            scan_result.get_mut(ClientId::AntigravityCli).push(link.clone());
+            crate::prune_scan_result_by_mtime(&mut scan_result, AGY_PRUNE_THRESHOLD_MS);
+            !scan_result.get(ClientId::AntigravityCli).is_empty()
+        };
 
-        let mut scan_result = scanner::ScanResult::default();
-        scan_result.get_mut(ClientId::AntigravityCli).push(link.clone());
-        crate::prune_scan_result_by_mtime(&mut scan_result, AGY_PRUNE_THRESHOLD_MS);
-        assert_eq!(scan_result.get(ClientId::AntigravityCli), std::slice::from_ref(&link));
+        std::fs::File::create(&target_wal).unwrap();
+        set_mtime_relative_to_agy_threshold(&target_wal, 1_000);
+        assert!(survives(), "fresh -wal beside the target (unix)");
 
-        set_mtime_relative_to_agy_threshold(&wal, -1_000);
-        crate::prune_scan_result_by_mtime(&mut scan_result, AGY_PRUNE_THRESHOLD_MS);
-        assert!(scan_result.get(ClientId::AntigravityCli).is_empty());
+        set_mtime_relative_to_agy_threshold(&target_wal, -1_000);
+        assert!(!survives(), "every -wal old");
+
+        std::fs::File::create(&link_wal).unwrap();
+        set_mtime_relative_to_agy_threshold(&link_wal, 1_000);
+        assert!(survives(), "fresh -wal beside the link (Windows)");
     }
 
     #[test]
