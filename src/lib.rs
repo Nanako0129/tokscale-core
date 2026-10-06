@@ -6011,6 +6011,32 @@ fn copilot_desktop_source_mtime_ms(db_path: &Path) -> Option<u64> {
     source_with_related_mtime_ms(db_path, std::iter::once(wal).chain(events))
 }
 
+/// Newest mtime of an Antigravity CLI db and its `<db>-wal` (a missing `-wal` is
+/// ignored), or `None` to keep the db without a decision: a symlinked db, whose
+/// WAL sits beside the link or the target depending on the writer's SQLite
+/// build, or any other stat failure. `-wal` is read before the db because a
+/// closing checkpoint writes the db and then unlinks `-wal`: reading the db
+/// second, a just-removed `-wal` cannot leave it looking older than that write.
+/// A read-only open creates an empty `-wal` and `-shm` when none exists
+/// (observed with SQLite 3.53.4), which only keeps a db longer and moves the
+/// change token once.
+fn antigravity_cli_db_mtime_ms(db: &Path) -> Option<u64> {
+    let ms = |meta: std::fs::Metadata| -> Option<u64> {
+        let since_epoch = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(since_epoch.as_millis() as u64)
+    };
+    let wal = match std::fs::metadata(message_cache::append_path_suffix(db, "-wal")) {
+        Ok(meta) => Some(ms(meta)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+    if std::fs::symlink_metadata(db).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let db_ms = ms(std::fs::metadata(db).ok()?)?;
+    Some(wal.map_or(db_ms, |wal_ms| wal_ms.max(db_ms)))
+}
+
 /// Newest mtime for a Grok source and every file that affects its parse. The
 /// unified log is self-contained; legacy updates include metadata siblings kept
 /// in lockstep with `SourceFingerprint::from_grok_path`. `None` keeps the source
@@ -6043,16 +6069,15 @@ fn grok_source_mtime_ms(source_path: &Path) -> Option<u64> {
 /// Kiro file sources, Grok sources, and Antigravity CLI dbs can still be
 /// bounded by folding every parser dependency into their newest mtime.
 ///
-/// Antigravity CLI: the db and its `-wal` (a missing `-wal` is ignored). SQLite
-/// appends a write to `-wal` in WAL mode and rewrites the db in rollback mode,
-/// and every timestamp the parser yields is written by agy or is the db mtime,
-/// so a db older than the threshold holds nothing dated after it. That bounds
-/// `parse_local_clients`, which parses each db on its own; the streaming lane's
-/// cross-file responseId gate is not covered by this argument. Checked against
-/// real agy data on APFS. Kept unpruned: a symlinked db, whose WAL sits beside
-/// the link or the target depending on the writer's SQLite build, and every db
-/// on Windows, where NTFS mtime behaviour has not been measured. A read-only
-/// open can create or touch `-wal`, which only keeps a db longer.
+/// Antigravity CLI: the db and its `-wal` (see `antigravity_cli_db_mtime_ms`).
+/// SQLite appends a write to `-wal` in WAL mode and rewrites the db in rollback
+/// mode, and every timestamp the parser yields is written by agy or is the db
+/// mtime, so a db older than the threshold holds nothing dated after it. That
+/// bounds `parse_local_clients`, which parses each db on its own; the streaming
+/// lane's cross-file responseId gate is not covered by this argument. The
+/// real-data check (APFS) exercised dbs whose own mtime moved; a write held
+/// only in `-wal` is covered by the hermetic WAL-frame test. Every db stays
+/// unpruned on Windows, where NTFS mtime behaviour has not been measured.
 ///
 /// Any stat failure keeps the file — over-parsing is safe, silently skipping is
 /// not.
@@ -6094,14 +6119,7 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
                 continue; // unmeasured on NTFS; see the doc comment
             }
             files.retain(|path| {
-                let symlinked = std::fs::symlink_metadata(path)
-                    .map_or(true, |meta| meta.file_type().is_symlink());
-                symlinked
-                    || source_with_related_mtime_ms(
-                        path,
-                        std::iter::once(message_cache::append_path_suffix(path, "-wal")),
-                    )
-                    .is_none_or(|mtime| mtime >= threshold_ms)
+                antigravity_cli_db_mtime_ms(path).is_none_or(|mtime| mtime >= threshold_ms)
             });
             continue;
         }
@@ -17821,6 +17839,26 @@ mod tests {
         );
     }
 
+    /// A `-wal` stat that fails for a reason other than absence keeps the db.
+    /// Here the `-wal` name is one byte past NAME_MAX (255), so it fails with
+    /// ENAMETOOLONG while the old db itself stats fine.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_modified_after_keeps_antigravity_cli_db_when_wal_stat_fails() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = temp_dir.path().join(format!("{}.db", "a".repeat(252 - 3)));
+        std::fs::File::create(&db).unwrap();
+        set_mtime_relative_to_agy_threshold(&db, -1_000);
+        let wal_error = std::fs::metadata(message_cache::append_path_suffix(&db, "-wal"))
+            .unwrap_err();
+        assert_ne!(wal_error.kind(), std::io::ErrorKind::NotFound, "fixture: not a missing -wal");
+
+        let mut scan_result = scanner::ScanResult::default();
+        scan_result.get_mut(ClientId::AntigravityCli).push(db.clone());
+        crate::prune_scan_result_by_mtime(&mut scan_result, AGY_PRUNE_THRESHOLD_MS);
+        assert_eq!(scan_result.get(ClientId::AntigravityCli), std::slice::from_ref(&db));
+    }
+
     /// agy writes in WAL mode: a turn lands in `-wal` frames and the db's mtime
     /// stays put until a checkpoint. The writer stays open with automatic
     /// checkpoints off, so the only copy of the message is in the WAL.
@@ -19178,8 +19216,9 @@ mod tests {
 
     // micode `.db` is WAL-mode SQLite reached via the generic `*.db` glob, so it
     // must be exempt from mtime pruning (a WAL-only write leaves the main db's
-    // mtime untouched) — same treatment as Hermes / Zed (Antigravity CLI is instead
-    // pruned by the newer of its db and `-wal` mtimes).
+    // mtime untouched) — same treatment as Hermes / Zed. Antigravity CLI is instead
+    // pruned by its db and `-wal` mtimes, except symlinked dbs and on Windows
+    // (`antigravity_cli_db_mtime_ms`, `prune_scan_result_by_mtime`).
     #[test]
     fn test_modified_after_never_prunes_micode_dbs() {
         let temp_dir = tempfile::TempDir::new().unwrap();
