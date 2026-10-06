@@ -12118,6 +12118,47 @@ mod tests {
         ));
     }
 
+    /// Usage-events JSON (what the tokscale CLI writes today) must flow through
+    /// scan and parse; before the JSON lane only `usage*.csv` was discovered, so
+    /// a JSON-only cache produced no Cursor rows. When the same account also has
+    /// a CSV, only the JSON is counted.
+    #[test]
+    #[serial_test::serial]
+    fn test_cursor_usage_json_only_and_json_wins_over_csv() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache = temp_dir.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let json = r#"{"totalUsageEventsCount":1,"usageEventsDisplay":[{"timestamp":"1760000000000","model":"gpt-5","kind":"k","conversationId":"c1","tokenUsage":{"inputTokens":11,"outputTokens":2,"cacheReadTokens":3,"totalCents":50}}]}"#;
+        std::fs::write(cache.join("usage.json"), json).unwrap();
+        std::fs::write(cache.join("usage.last-sync-attempt"), "1760000000").unwrap();
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let parse = || {
+            parse_all_messages_with_pricing(
+                temp_dir.path().to_str().unwrap(),
+                &["cursor".to_string()],
+                Some(&pricing),
+            )
+        };
+
+        let messages = parse();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "c1");
+        assert_eq!(messages[0].tokens.input, 11);
+        assert!((messages[0].cost - 0.5).abs() < 1e-9);
+
+        // A legacy CSV for the same account must not be counted beside it.
+        let csv = "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n\"2025-10-09T08:00:00.000Z\",\"Included\",\"gpt-5\",\"No\",\"0\",\"9\",\"0\",\"1\",\"10\",\"0.10\"";
+        std::fs::write(cache.join("usage.csv"), csv).unwrap();
+        let messages = parse();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "c1");
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_cursor_parse_path_reprices_missing_cost_composer_1_5_rows() {
