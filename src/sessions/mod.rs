@@ -15,6 +15,7 @@ pub mod copilot_desktop;
 pub mod crush;
 pub mod cursor;
 pub mod droid;
+pub mod dsh;
 pub mod gemini;
 pub mod gjc;
 pub mod goose;

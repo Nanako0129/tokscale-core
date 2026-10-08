@@ -990,6 +990,12 @@ fn parser_version(client: ClientId) -> u32 {
         // cross-session keys). Shared with Pi, Kimchi and Senpi: bump all four
         // together.
         ClientId::Omp => 1,
+        // 1: DSH's projcache parser (`parse_dsh_file`, one request row per
+        // message). Vendor-local numbering: no upstream DSH parser exists.
+        // 2: totals fallback for seeded sessions whose timeline is null
+        // (`dsh:<session>:totals` aggregate anchored on the file mtime).
+        // Without the bump, a file cached as empty keeps serving empty.
+        ClientId::Dsh => 2,
         _ => 1,
     }
 }

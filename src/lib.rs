@@ -4588,6 +4588,7 @@ where
     );
     simple_lane!(ClientId::Muse, sessions::muse::parse_muse_file);
     simple_lane!(ClientId::Reasonix, sessions::reasonix::parse_reasonix_file);
+    simple_lane!(ClientId::Dsh, sessions::dsh::parse_dsh_file);
     simple_lane!(ClientId::Qwen, sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
     // sibling api_conversation_history.json (which parse_roo_kilo_file reads for
@@ -6621,6 +6622,22 @@ fn parse_local_clients_inner(
     let reasonix_count = summed_parsed_message_count(&reasonix_msgs);
     counts.set(ClientId::Reasonix, reasonix_count);
     messages.extend(reasonix_msgs);
+
+    // DSH projcache snapshots: one request row per message.
+    let dsh_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Dsh)
+        .par_iter()
+        .flat_map(|path| sessions::dsh::parse_dsh_file(path))
+        .collect();
+    let mut dsh_seen: HashSet<String> = HashSet::new();
+    let dsh_msgs: Vec<ParsedMessage> = dsh_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut dsh_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let dsh_count = summed_parsed_message_count(&dsh_msgs);
+    counts.set(ClientId::Dsh, dsh_count);
+    messages.extend(dsh_msgs);
 
     // Parse Qwen JSONL files in parallel
     let qwen_msgs: Vec<ParsedMessage> = scan_result
