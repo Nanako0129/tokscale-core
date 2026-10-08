@@ -2,10 +2,18 @@
 //!
 //! DeepSeek Harness (DSH) persists per-project session snapshots under
 //! `~/.dsh/storages/session_projcache/sessions/session-*.json`. Each file
-//! holds one session's `record.rows` state; the authoritative per-step usage
-//! lives at `record.rows.contextTimeline.val.requests[]`, one entry per LLM
-//! step with cumulative prompt context (`prompt`), the cache-hit slice of it
-//! (`cacheRead`, absent on older snapshots), and fresh output (`output`).
+//! holds one session's `record.rows` state. Usage arrives in two shapes:
+//!
+//! - **Per-step rows** (primary): `record.rows.contextTimeline.val.requests[]`,
+//!   one entry per LLM step with cumulative prompt context (`prompt`), the
+//!   cache-hit slice of it (`cacheRead`, absent on older snapshots), and fresh
+//!   output (`output`). One entry maps to one message.
+//! - **Session totals** (fallback): `record.rows.tokenUsage.val.totals`
+//!   (`uncachedInputTokens`, `cacheReadTokens`, `outputTokens`,
+//!   `cacheWriteTokens`). Some snapshots (notably `isSeeded` sessions whose
+//!   timeline was never written) carry a null `contextTimeline.val` while the
+//!   totals are large. Those map to a single aggregate message anchored on the
+//!   snapshot file's mtime, deduped by `dsh:<session>:totals`.
 //!
 //! Token mapping (verified against `record.rows.tokenUsage.val.totals` on a
 //! 7-file real corpus: per-file `sum(prompt - cacheRead)`, `sum(cacheRead)`
@@ -22,12 +30,16 @@
 //!
 //! Identity: `provider`/`model` come from
 //! `record.rows.modelSelection.val.lastUsed`, falling back to the timeline's
-//! `provider`/`model`/`lastModel`. The workspace is the session's
-//! `record.identity.cwd`. Cost is left at 0.0 for the pricing pipeline:
-//! free-tier `-free` models resolve through `custom-pricing.json` shadow
-//! prices, paid rows through the built-in catalogs.
+//! `provider`/`model`/`lastModel` (unknown when the timeline is absent). The
+//! workspace is the session's `record.identity.cwd`. Cost is left at 0.0 for
+//! the pricing pipeline: free-tier `-free` models resolve through
+//! `custom-pricing.json` shadow prices, paid rows through the built-in
+//! catalogs.
 
-use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
+use super::{
+    normalize_workspace_key, workspace_label_from_key, UnifiedMessage,
+};
+use super::utils::file_modified_timestamp_ms;
 use crate::{pricing, provider_identity, TokenBreakdown};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -59,6 +71,8 @@ struct DshRows {
     context_timeline: RowEnvelope<DshTimeline>,
     #[serde(default, rename = "modelSelection")]
     model_selection: RowEnvelope<DshModelSelection>,
+    #[serde(default, rename = "tokenUsage")]
+    token_usage: RowEnvelope<DshTokenUsage>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -104,6 +118,35 @@ struct DshModelSelection {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct DshTokenUsage {
+    #[serde(default)]
+    totals: Option<DshTotals>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DshTotals {
+    #[serde(default, rename = "uncachedInputTokens")]
+    uncached_input: i64,
+    #[serde(default, rename = "cacheReadTokens")]
+    cache_read: i64,
+    #[serde(default, rename = "outputTokens")]
+    output: i64,
+    #[serde(default, rename = "cacheWriteTokens")]
+    cache_write: i64,
+}
+
+impl Default for DshTotals {
+    fn default() -> Self {
+        Self {
+            uncached_input: 0,
+            cache_read: 0,
+            output: 0,
+            cache_write: 0,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct DshLastUsed {
     #[serde(default)]
     provider: Option<String>,
@@ -113,8 +156,11 @@ struct DshLastUsed {
 
 /// Parse one DSH `session-*.json` projcache snapshot.
 ///
-/// Missing/unreadable files, malformed JSON, and snapshots without a request
-/// list yield no messages. Zero-usage heartbeat rows are skipped.
+/// Missing/unreadable files and malformed JSON yield no messages. A snapshot
+/// with per-step `requests[]` maps one message per row. A snapshot whose
+/// timeline is absent but whose `tokenUsage.val.totals` is non-zero maps a
+/// single aggregate message anchored on the file's mtime. Zero-usage rows
+/// (and zero totals) are skipped.
 pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -125,20 +171,14 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
         Err(_) => return Vec::new(),
     };
 
-    let timeline = match file.record.rows.context_timeline.val {
-        Some(timeline) => timeline,
-        None => return Vec::new(),
-    };
-    if timeline.requests.is_empty() {
-        return Vec::new();
-    }
-
     let last_used = file.record.rows.model_selection.val.and_then(|s| s.last_used);
+    let timeline = file.record.rows.context_timeline.val;
+
     let model_raw = last_used
         .as_ref()
         .and_then(|u| u.model.as_deref())
-        .or(timeline.model.as_deref())
-        .or(timeline.last_model.as_deref())
+        .or(timeline.as_ref().and_then(|t| t.model.as_deref()))
+        .or(timeline.as_ref().and_then(|t| t.last_model.as_deref()))
         .unwrap_or("unknown");
     let model_id = pricing::aliases::resolve_alias(model_raw)
         .unwrap_or(model_raw)
@@ -146,7 +186,7 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
     let provider_raw = last_used
         .as_ref()
         .and_then(|u| u.provider.as_deref())
-        .or(timeline.provider.as_deref())
+        .or(timeline.as_ref().and_then(|t| t.provider.as_deref()))
         .unwrap_or("unknown");
     let provider_id = provider_identity::canonical_provider(provider_raw)
         .unwrap_or_else(|| provider_raw.to_string());
@@ -173,51 +213,102 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
     let mut prev_turn: Option<i64> = None;
-    for req in &timeline.requests {
-        if req.time <= 0 {
-            continue;
+    if let Some(timeline) = timeline.as_ref().filter(|t| !t.requests.is_empty()) {
+        for req in &timeline.requests {
+            if req.time <= 0 {
+                continue;
+            }
+            let cache_read = req.cache_read.unwrap_or(0).max(0);
+            let prompt = req.prompt.max(0);
+            let output = req.output.max(0);
+            let input = prompt.saturating_sub(cache_read);
+            if input == 0 && cache_read == 0 && output == 0 {
+                continue;
+            }
+            let tokens = TokenBreakdown {
+                input,
+                output,
+                cache_read,
+                cache_write: 0,
+                cache_write_1h: 0,
+                reasoning: 0,
+            };
+            let dedup_key = format!(
+                "dsh:{}:{}:{}:{}:{}:{}:{}:{}",
+                session_id, req.seq, req.turn, req.step, model_id, input, output, cache_read,
+            );
+            if !seen.insert(dedup_key.clone()) {
+                continue;
+            }
+            let mut message = UnifiedMessage::new_with_dedup(
+                "dsh",
+                model_id.clone(),
+                provider_id.clone(),
+                &session_id,
+                req.time,
+                tokens,
+                0.0,
+                Some(dedup_key),
+            );
+            if prev_turn.is_none_or(|prev| prev != req.turn) {
+                message.is_turn_start = true;
+            }
+            prev_turn = Some(req.turn);
+            if workspace_key.is_some() || workspace_label.is_some() {
+                message.set_workspace(workspace_key.clone(), workspace_label.clone());
+            }
+            messages.push(message);
         }
-        let cache_read = req.cache_read.unwrap_or(0).max(0);
-        let prompt = req.prompt.max(0);
-        let output = req.output.max(0);
-        let input = prompt.saturating_sub(cache_read);
-        if input == 0 && cache_read == 0 && output == 0 {
-            continue;
-        }
-        let tokens = TokenBreakdown {
-            input,
-            output,
-            cache_read,
-            cache_write: 0,
-            cache_write_1h: 0,
-            reasoning: 0,
-        };
-        let dedup_key = format!(
-            "dsh:{}:{}:{}:{}:{}:{}:{}:{}",
-            session_id, req.seq, req.turn, req.step, model_id, input, output, cache_read,
-        );
-        if !seen.insert(dedup_key.clone()) {
-            continue;
-        }
-        let mut message = UnifiedMessage::new_with_dedup(
-            "dsh",
-            model_id.clone(),
-            provider_id.clone(),
-            &session_id,
-            req.time,
-            tokens,
-            0.0,
-            Some(dedup_key),
-        );
-        if prev_turn.is_none_or(|prev| prev != req.turn) {
-            message.is_turn_start = true;
-        }
-        prev_turn = Some(req.turn);
-        if workspace_key.is_some() || workspace_label.is_some() {
-            message.set_workspace(workspace_key.clone(), workspace_label.clone());
-        }
-        messages.push(message);
     }
+
+    if !messages.is_empty() {
+        return messages;
+    }
+
+    // Fallback: timeline absent (or no rows), but the session totals are
+    // non-zero. Emit one aggregate message anchored on the file's mtime so
+    // the usage still reaches the reports instead of vanishing. The totals
+    // buckets are already split the way TokenBreakdown wants them.
+    let Some(totals) = file.record.rows.token_usage.val.and_then(|usage| usage.totals) else {
+        return Vec::new();
+    };
+    let input = totals.uncached_input.max(0);
+    let cache_read = totals.cache_read.max(0);
+    let output = totals.output.max(0);
+    // cache_write is authoritative-zero on every observed file; a future
+    // nonzero write still must not leak into the input bucket.
+    let cache_write = totals.cache_write.max(0);
+    if input == 0 && cache_read == 0 && output == 0 && cache_write == 0 {
+        return Vec::new();
+    }
+    let timestamp = file_modified_timestamp_ms(path);
+    if timestamp <= 0 {
+        return Vec::new();
+    }
+    let tokens = TokenBreakdown {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        cache_write_1h: 0,
+        reasoning: 0,
+    };
+    let dedup_key = format!("dsh:{session_id}:totals");
+    let mut message = UnifiedMessage::new_with_dedup(
+        "dsh",
+        model_id,
+        provider_id,
+        &session_id,
+        timestamp,
+        tokens,
+        0.0,
+        Some(dedup_key),
+    );
+    message.is_turn_start = true;
+    if workspace_key.is_some() || workspace_label.is_some() {
+        message.set_workspace(workspace_key, workspace_label);
+    }
+    messages.push(message);
 
     messages
 }
@@ -386,6 +477,97 @@ mod tests {
     }
 
     #[test]
+    fn totals_fallback_when_timeline_absent() {
+        // Seeded sessions whose timeline was never written: totals are large,
+        // `contextTimeline` is absent entirely. One aggregate message anchored
+        // on the file's mtime, deduped by `dsh:<session>:totals`.
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"version":7,"record":{"identity":{"formatVersion":4,"createdAt":1791349276317,"cwd":"C:\\chatbot","isSeeded":true},"rows":{"tokenUsage":{"ver":1,"seq":100,"val":{"totals":{"uncachedInputTokens":1243037,"outputTokens":596044,"cacheReadTokens":376403209,"cacheWriteTokens":0}}},"modelSelection":{"ver":2,"seq":100,"val":{"lastUsed":{"provider":"opencode2dsh","model":"muse-spark-1.3-contributor-free"}}}}}}"#;
+        let path = write_session(&dir, "session-e7ee0d32.json", content);
+
+        let messages = parse_dsh_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].client, "dsh");
+        assert_eq!(messages[0].model_id, "muse-spark-1.3-contributor-free");
+        assert_eq!(messages[0].provider_id, "opencode2dsh");
+        assert_eq!(messages[0].session_id, "session-e7ee0d32");
+        assert_eq!(messages[0].tokens.input, 1243037);
+        assert_eq!(messages[0].tokens.cache_read, 376403209);
+        assert_eq!(messages[0].tokens.output, 596044);
+        assert_eq!(messages[0].tokens.cache_write, 0);
+        assert_eq!(messages[0].tokens.reasoning, 0);
+        assert_eq!(messages[0].cost, 0.0);
+        assert!(messages[0].is_turn_start);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("dsh:session-e7ee0d32:totals")
+        );
+        // Anchored on the snapshot file's mtime, not on any request.
+        assert!(messages[0].timestamp > 0);
+        assert!(!messages[0].date.is_empty());
+        assert_eq!(
+            messages[0].workspace_key.as_deref(),
+            Some("C:/chatbot")
+        );
+        assert_eq!(messages[0].workspace_label.as_deref(), Some("chatbot"));
+    }
+
+    #[test]
+    fn timeline_rows_win_over_totals_no_double_count() {
+        // Both present: the per-step rows are authoritative, totals must not
+        // add a second aggregate message.
+        let dir = TempDir::new().unwrap();
+        let content = serde_json::json!({
+            "version": 7,
+            "record": {
+                "identity": {"formatVersion": 4, "cwd": "C:\\chatbot"},
+                "rows": {
+                    "contextTimeline": {"ver": 24, "seq": 2, "val": {
+                        "model": "muse-spark-1.3-contributor-free",
+                        "provider": "opencode2dsh",
+                        "requests": [
+                            {"time": 1791349276317i64, "seq": 1, "turn": 1, "step": 1,
+                             "prompt": 1000, "cacheRead": 100, "output": 50}
+                        ]
+                    }},
+                    "modelSelection": {"ver": 2, "seq": 2, "val": {
+                        "lastUsed": {"provider": "opencode2dsh",
+                                     "model": "muse-spark-1.3-contributor-free"}
+                    }},
+                    "tokenUsage": {"ver": 1, "seq": 2, "val": {
+                        "totals": {"uncachedInputTokens": 999999,
+                                   "outputTokens": 888888,
+                                   "cacheReadTokens": 777777,
+                                   "cacheWriteTokens": 0}
+                    }}
+                }
+            }
+        })
+        .to_string();
+        let path = write_session(&dir, "session-both.json", &content);
+
+        let messages = parse_dsh_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 900);
+        assert_eq!(messages[0].tokens.cache_read, 100);
+        assert_eq!(messages[0].tokens.output, 50);
+        assert!(messages[0]
+            .dedup_key
+            .as_deref()
+            .unwrap()
+            .starts_with("dsh:session-both:1:"));
+    }
+
+    #[test]
+    fn zero_totals_yield_nothing() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"version":7,"record":{"identity":{"formatVersion":4,"cwd":"C:\\chatbot"},"rows":{"tokenUsage":{"ver":1,"seq":1,"val":{"totals":{"uncachedInputTokens":0,"outputTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0}}},"modelSelection":{"ver":2,"seq":1,"val":{"lastUsed":{"provider":"opencode2dsh","model":"muse-spark-1.3-contributor-free"}}}}}}"#;
+        let path = write_session(&dir, "session-zero.json", content);
+
+        assert!(parse_dsh_file(&path).is_empty());
+    }
+
+    #[test]
     fn malformed_and_empty_inputs_yield_nothing() {
         let dir = TempDir::new().unwrap();
         let bad = write_session(&dir, "session-bad.json", "not json at all");
@@ -404,6 +586,14 @@ mod tests {
             r#"{"version":7,"record":{"identity":{"cwd":"C:\\x"},"rows":{}}}"#,
         );
         assert!(parse_dsh_file(&no_timeline).is_empty());
+
+        // Absent timeline AND absent totals: nothing to aggregate.
+        let no_timeline_no_totals = write_session(
+            &dir,
+            "session-notimeline-nototals.json",
+            r#"{"version":7,"record":{"identity":{"cwd":"C:\\x"},"rows":{"modelSelection":{"ver":2,"seq":1,"val":{"lastUsed":{"provider":"p","model":"m"}}}}}}"#,
+        );
+        assert!(parse_dsh_file(&no_timeline_no_totals).is_empty());
 
         assert!(parse_dsh_file(dir.path().join("does-not-exist.json").as_path()).is_empty());
     }
