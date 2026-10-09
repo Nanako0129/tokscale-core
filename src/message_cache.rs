@@ -898,7 +898,9 @@ fn parser_version(client: ClientId) -> u32 {
         // No bump for usage-events JSON (#1247): the CSV parse is unchanged, and
         // the source cache is keyed per path, so a new `usage[.account].json`
         // has no entry to be stale.
-        ClientId::Cursor => 3,
+        // 4: events whose model starts with `grok-bot` are tagged client
+        // `grok-bot` instead of `cursor`; cached parses hold the old tag.
+        ClientId::Cursor => 4,
         // 2: Pi messages now carry a cross-session dedup key (upstream #1323),
         // and a cached v1 entry has none, so fork copies would keep counting
         // once per session file until re-parsed.
@@ -4799,6 +4801,90 @@ mod tests {
         run_grok_parser_same_fingerprint_rebuild(1);
     }
 
+    /// Cursor parser identity 3 -> 4: events whose model starts with `grok-bot`
+    /// are tagged client `grok-bot` instead of `cursor`. A synced or CLI
+    /// `usage*.json` is unchanged on disk, so its fingerprint is unchanged and
+    /// only the identity bump can deliver the new tag to a cached parse.
+    ///
+    /// The control step caches the old-tag parse at the CURRENT identity and
+    /// shows it is served as a hit (so the harness is not inert); relabelling
+    /// the same shard to parser_version 3 must then force a re-parse.
+    #[test]
+    #[serial_test::serial]
+    fn test_cursor_parser_v3_same_fingerprint_reparses_grok_bot_tag() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source_home = TempDir::new().unwrap();
+        let cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let source = cache_dir.join("usage.json");
+        std::fs::write(
+            &source,
+            r#"{"usageEventsDisplay":[{"timestamp":"1760000000000","model":"grok-bot-default","kind":"k","conversationId":"bot-1","tokenUsage":{"inputTokens":100,"outputTokens":10,"totalCents":200}}]}"#,
+        )
+        .unwrap();
+        let home = source_home.path().to_str().unwrap().to_string();
+        let parse = || {
+            let pricing =
+                crate::pricing::PricingService::new(Default::default(), Default::default());
+            crate::parse_all_messages_with_pricing_with_env_strategy(
+                &home,
+                // Both ids: the materialized path keeps only requested clients,
+                // and the tag decides which of the two a message carries.
+                &["cursor".to_string(), "grok-bot".to_string()],
+                Some(&pricing),
+                false,
+                &crate::scanner::ScannerSettings::default(),
+                None,
+            )
+        };
+        let current = CacheIdentity::for_client(ClientId::Cursor);
+
+        // Populate the cache with a current parse, then rewrite its message to
+        // what a parser_version 3 build cached: client `cursor`.
+        let first = parse();
+        // Key the cache by the scanner's own spelling of the path (mixed
+        // separators on Windows), not the one the fixture was written with.
+        let source = crate::scanner::scan_all_clients_with_scanner_settings(
+            &home,
+            &["cursor".to_string()],
+            false,
+            &crate::scanner::ScannerSettings::default(),
+        )
+        .get(ClientId::Cursor)[0]
+            .clone();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].client, "grok-bot");
+        let mut cache = SourceMessageCache::load();
+        let entry = cache
+            .get(current, &source)
+            .expect("cursor shard written")
+            .clone();
+        let mut old_messages = entry.messages.clone();
+        old_messages[0].client = "cursor".to_string();
+        cache.insert(CachedSourceEntry::new(
+            current,
+            &source,
+            entry.fingerprint.clone(),
+            old_messages,
+            entry.fallback_timestamp_indices.clone(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        // Control: same identity, unchanged source -> the cached old tag is served.
+        assert_eq!(
+            parse()[0].client,
+            "cursor",
+            "control: cache hit serves the old tag"
+        );
+
+        // The shard as a parser_version 3 build left it -> stale -> re-parsed.
+        set_shard_parser_version_for_test(current, 3);
+        assert_eq!(parse()[0].client, "grok-bot");
+        restore_cache_env(prev_env);
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_grok_parser_v2_same_fingerprint_rebuilds_model_attribution() {
@@ -6000,9 +6086,9 @@ mod tests {
         // 3 is the `.zst` archive decode plus checkpoint exclusion (#1285,
         // #1293): unchanged archives must re-parse instead of replaying empty.
         assert_eq!(parser_version(ClientId::OpenClaw), 3);
-        // 3 reads the cache-write column as its own bucket (#1154). Usage-events
-        // JSON (#1247) deliberately has no bump: the cache is keyed per path.
-        assert_eq!(parser_version(ClientId::Cursor), 3);
+        // 4 retags `grok-bot*` events (3 read the cache-write column as its own
+        // bucket, #1154; usage-events JSON, #1247, has no bump of its own).
+        assert_eq!(parser_version(ClientId::Cursor), 4);
         // 3 drops Pi entries cached for OMP files once `omp` owns that root
         // (2 carried the cross-session Pi dedup key, #1323).
         assert_eq!(parser_version(ClientId::Pi), 3);

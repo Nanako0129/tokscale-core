@@ -52,6 +52,15 @@ fn account_id_from_cursor_cache_path(path: &Path) -> String {
     "unknown".to_string()
 }
 
+/// Events billed to Grok Bot (`grok-bot-default`, ...) arrive in the Cursor
+/// usage-events feed. They are attributed to the `grok-bot` client, not Cursor.
+fn cursor_client_for_model(model: &str) -> &'static str {
+    match model.as_bytes().get(..8) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(b"grok-bot") => "grok-bot",
+        _ => "cursor",
+    }
+}
+
 /// Provider inference from model name
 fn infer_provider(model: &str) -> &'static str {
     provider_identity::inferred_provider_from_model(model).unwrap_or("cursor")
@@ -320,7 +329,7 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
         let cost = metered_cents.map(|cents| cents / 100.0);
 
         let mut message = UnifiedMessage::new(
-            "cursor",
+            cursor_client_for_model(model),
             model,
             infer_provider(model),
             session_id,
@@ -451,7 +460,7 @@ fn parse_cursor_csv_file(path: &Path) -> Vec<UnifiedMessage> {
         // the sum of all four columns. Subtracting one from the other
         // under-counted cache writes.
         let mut message = UnifiedMessage::new(
-            "cursor",
+            cursor_client_for_model(model),
             model,
             infer_provider(model),
             format!("cursor-{}-{}", account_id, date_str),

@@ -1167,6 +1167,23 @@ pub fn scan_all_clients_with_env_strategy(
     )
 }
 
+/// Scan lanes for a request. `grok-bot` is not a `ClientId`: it is produced by
+/// the Cursor parser (events billed to Grok Bot), so requesting it scans the
+/// Cursor lane, like `cc-mirror/*` rides the Claude lane.
+fn enabled_clients(clients: &[String], all: bool) -> HashSet<ClientId> {
+    if all {
+        return ClientId::iter().collect();
+    }
+    let mut enabled: HashSet<ClientId> = clients
+        .iter()
+        .filter_map(|s| ClientId::from_str(s))
+        .collect();
+    if clients.iter().any(|s| s == "grok-bot") {
+        enabled.insert(ClientId::Cursor);
+    }
+    enabled
+}
+
 fn scan_all_clients_resolved_inner(
     context: &ResolvedLocalSourceContext,
     clients: &[String],
@@ -1178,14 +1195,7 @@ fn scan_all_clients_resolved_inner(
 
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
-    let enabled: HashSet<ClientId> = if include_all || include_synthetic {
-        ClientId::iter().collect()
-    } else {
-        clients
-            .iter()
-            .filter_map(|s| ClientId::from_str(s))
-            .collect()
-    };
+    let enabled = enabled_clients(clients, include_all || include_synthetic);
     let headless_roots = headless_roots_with_source_context(context)?;
     let mut tasks: Vec<(ClientId, PathBuf, &'static str)> = Vec::new();
     let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
@@ -1588,14 +1598,7 @@ fn scan_all_clients_with_env_strategy_inner(
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
 
-    let enabled: HashSet<ClientId> = if include_all || include_synthetic {
-        ClientId::iter().collect()
-    } else {
-        clients
-            .iter()
-            .filter_map(|s| ClientId::from_str(s))
-            .collect()
-    };
+    let enabled = enabled_clients(clients, include_all || include_synthetic);
 
     let headless_roots = headless_roots_with_env_strategy(home_dir, use_env_roots);
 

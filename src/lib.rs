@@ -4,6 +4,8 @@ mod aggregator;
 mod cc_mirror;
 pub mod clients;
 pub mod fs_atomic;
+#[cfg(test)]
+mod grok_bot_attribution_tests;
 mod message_cache;
 pub mod model_alias;
 mod parser;
@@ -2701,6 +2703,9 @@ fn resolve_report_clients(options: &ReportOptions) -> Vec<String> {
             .map(|c| c.as_str().to_string())
             .collect();
         clients.push("synthetic".to_string());
+        // Not a `ClientId`: Cursor-billed Grok Bot events (see sessions/cursor.rs).
+        // Without it a `None` report's client gate would drop them.
+        clients.push("grok-bot".to_string());
         clients
     })
 }
@@ -2730,6 +2735,10 @@ fn split_report_client_filter(options: &ReportOptions) -> (Vec<String>, Option<H
     let mut lanes: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for id in requested {
+        // `grok-bot` stays its own lane id: the streaming gate (`passes_client`)
+        // compares each message's client with this list, and `enabled_clients`
+        // already maps it to the Cursor scan. Mapping it to `cursor` here
+        // would drop the very events requested.
         let lane = if id.starts_with("cc-mirror/") {
             "claude".to_string()
         } else {
