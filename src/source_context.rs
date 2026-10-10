@@ -2771,15 +2771,26 @@ mod tests {
         // all is what makes an accidental change to the fingerprint's inputs,
         // which is what an approved source-scope token binds to, fail loudly
         // instead of silently re-scoping a live grant.
+        //
+        // Adding `dsh` (id, `.dsh/sessions`, `session*.jsonl.zstd` in field
+        // 9) moves the descriptor, so both goldens move with it. Linux was
+        // measured on x86_64 under Rust 1.96.1. macOS was computed on the same
+        // host with every `target_os` branch switched to macOS, a run that
+        // reproduces the macOS goldens measured on real hardware for `522ee8f`
+        // and `045d6282` exactly; CI's `macos-latest` leg is the confirmation.
+        // A new `ClientId` also means every previously approved remote scope
+        // stops matching and needs re-approval: the identity is the
+        // approved-scope fingerprint, and `RESOLVER_CONTRACT_VERSION` covers
+        // rule changes, not client-list growth.
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:85f904fde7032b048ef1da457ade49604c4f9655703a3beac3258e42f44d24a3"
+            "sc1:ca821233bffd644504cee0d2e6beceefbfa20763bbdc42a446ca894c1adebd6e"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:33b6dc95546e5d7c6cfd5358c77b808c4fd2aa55b3ff09ab31d1697740589c82"
+            "sc1:5c0e4536eff8bd5b3d286cdb216bc54eba99e011e65b9a44465d95d8294a88d5"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely
