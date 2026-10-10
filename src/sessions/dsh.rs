@@ -1,132 +1,116 @@
 //! DeepSeek Harness session parser.
 //!
-//! DeepSeek Harness (DSH) persists per-project session snapshots under
-//! `~/.dsh/storages/session_projcache/sessions/session-*.json`. Each file
-//! holds one session's `record.rows` state. Usage arrives in two shapes:
+//! DeepSeek Harness (DSH) appends every session's events to a zstd-compressed
+//! JSONL log at `~/.dsh/sessions/<project>/<session>/session.v4.jsonl.zstd`
+//! (`session.jsonl.zstd` for sessions recorded before format 4). The log is
+//! the source of truth: the projcache snapshots under
+//! `~/.dsh/storages/session_projcache` are projections of it, and which
+//! projections a snapshot carries varies between installs of the same DSH
+//! release (some carry `contextTimeline` / `contextActivity`, some neither).
 //!
-//! - **Per-step rows** (primary): `record.rows.contextTimeline.val.requests[]`,
-//!   one entry per LLM step with cumulative prompt context (`prompt`), the
-//!   cache-hit slice of it (`cacheRead`, absent on older snapshots), and fresh
-//!   output (`output`). One entry maps to one message.
-//! - **Session totals** (fallback): `record.rows.tokenUsage.val.totals`
-//!   (`uncachedInputTokens`, `cacheReadTokens`, `outputTokens`,
-//!   `cacheWriteTokens`). Some snapshots (notably `isSeeded` sessions whose
-//!   timeline was never written) carry a null `contextTimeline.val` while the
-//!   totals are large. Those map to a single aggregate message anchored on the
-//!   snapshot file's mtime, deduped by `dsh:<session>:totals`.
+//! Usage comes from two event types, one message each:
 //!
-//! Token mapping (verified against `record.rows.tokenUsage.val.totals` on a
-//! 7-file real corpus: per-file `sum(prompt - cacheRead)`, `sum(cacheRead)`
-//! and `sum(output)` match `uncachedInputTokens`, `cacheReadTokens` and
-//! `outputTokens` exactly):
+//! - `assistant/message`: one completed LLM step. `data.usage` holds
+//!   `inputTokens` (the uncached slice), `cacheReadTokens`, `outputTokens`
+//!   and, when reported, `cacheWriteTokens`. `data.message.source` names the
+//!   step's own `provider` / `model`, and the event `time` is the step's own
+//!   timestamp, so a mid-session model switch or a session spanning several
+//!   days is attributed step by step.
+//! - `compaction/summary`: the LLM call that summarizes a compacted history,
+//!   with its own `provider` / `model` / `usage`. DSH's own session totals
+//!   leave it out, but it is a billed call, so it is counted here.
 //!
-//! - `input = max(prompt - cacheRead, 0)` (the uncached slice)
-//! - `cache_read = cacheRead`
-//! - `output = output`
-//! - `cache_write = 0` (Harness reports no write bucket; every observed
-//!   `totals.cacheWriteTokens` is 0)
-//! - `reasoning = 0` (no reasoning split is reported; `output` is taken whole
-//!   so nothing is double-counted)
+//! `assistant/attempt` (a failed attempt that was retried) and the streaming
+//! `assistant/chunk` events are not counted: the completed step carries the
+//! usage once.
 //!
-//! Identity: `provider`/`model` come from
-//! `record.rows.modelSelection.val.lastUsed`, falling back to the timeline's
-//! `provider`/`model`/`lastModel` (unknown when the timeline is absent). The
-//! workspace is the session's `record.identity.cwd`. Cost is left at 0.0 for
-//! the pricing pipeline: free-tier `-free` models resolve through
+//! Token mapping: `input = inputTokens`, `cache_read = cacheReadTokens`,
+//! `output = outputTokens` (whole; no reasoning split is reported, so
+//! `reasoning = 0` and nothing is double-counted), `cache_write =
+//! cacheWriteTokens` (absent to 0). Summed over `assistant/message`, these
+//! equal the session's `tokenUsage.val.totals` in the projcache snapshot.
+//!
+//! Dedup keys carry no session id and no `seq`, on purpose:
+//!
+//! - A seeded session (`isSeeded`, `inheritedEventCount = n`) starts with a
+//!   verbatim copy of its parent's first `n` events, the parent's usage
+//!   included. Keyed by `time`, turn, step, model and tokens, a copied step
+//!   has the same key as the original, so it is counted once whether the
+//!   parent's log is present or not (if it was deleted, the child carries it).
+//! - A session migrated to format 4 keeps its old `session.jsonl.zstd` next
+//!   to the new log. Both record the same steps with the same `time` and
+//!   tokens but different `seq` numbering, so the same key collapses them.
+//!
+//! Subagent sessions live in sibling directories named by a bare UUID
+//! (`delegationDepth >= 1`, `parentSession` in the header). Their usage is not
+//! part of the parent's log or totals, so each is parsed as its own session.
+//!
+//! Identity: the session id is the log's directory name, and the workspace is
+//! the `cwd` of the log's `session` header. Cost is left at 0.0 for the
+//! pricing pipeline: free-tier `-free` models resolve through
 //! `custom-pricing.json` shadow prices, paid rows through the built-in
 //! catalogs.
 
-use super::{
-    normalize_workspace_key, workspace_label_from_key, UnifiedMessage,
-};
-use super::utils::file_modified_timestamp_ms;
+use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{pricing, provider_identity, TokenBreakdown};
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
-struct DshFile {
-    #[serde(default)]
-    record: DshRecord,
-}
+/// Upper bound on the decoded log, so a corrupt stream cannot run unbounded.
+/// Real logs are a few MB to a few tens of MB.
+const MAX_LOG_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Default, Deserialize)]
-struct DshRecord {
-    #[serde(default)]
-    identity: DshIdentity,
-    #[serde(default)]
-    rows: DshRows,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DshIdentity {
-    #[serde(default)]
-    cwd: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DshRows {
-    #[serde(default, rename = "contextTimeline")]
-    context_timeline: RowEnvelope<DshTimeline>,
-    #[serde(default, rename = "modelSelection")]
-    model_selection: RowEnvelope<DshModelSelection>,
-    #[serde(default, rename = "tokenUsage")]
-    token_usage: RowEnvelope<DshTokenUsage>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RowEnvelope<T> {
-    #[serde(default)]
-    val: Option<T>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DshTimeline {
-    #[serde(default)]
-    requests: Vec<DshRequest>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default, rename = "lastModel")]
-    last_model: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DshRequest {
+struct DshEvent {
+    #[serde(default, rename = "type")]
+    kind: String,
     #[serde(default)]
     time: i64,
     #[serde(default)]
-    seq: i64,
+    cwd: Option<String>,
     #[serde(default)]
-    turn: i64,
-    #[serde(default)]
-    step: i64,
-    #[serde(default)]
-    prompt: i64,
-    #[serde(default, rename = "cacheRead")]
-    cache_read: Option<i64>,
-    #[serde(default)]
-    output: i64,
+    data: Option<DshEventData>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct DshModelSelection {
-    #[serde(default, rename = "lastUsed")]
-    last_used: Option<DshLastUsed>,
+struct DshEventData {
+    #[serde(default)]
+    turn: Option<i64>,
+    #[serde(default)]
+    step: Option<i64>,
+    #[serde(default)]
+    message: Option<DshMessage>,
+    #[serde(default)]
+    usage: Option<DshUsage>,
+    // `compaction/summary` carries its provider/model at the top of `data`.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default, rename = "compactionId")]
+    compaction_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct DshTokenUsage {
+struct DshMessage {
     #[serde(default)]
-    totals: Option<DshTotals>,
+    source: Option<DshSource>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DshTotals {
-    #[serde(default, rename = "uncachedInputTokens")]
-    uncached_input: i64,
+#[derive(Debug, Default, Deserialize)]
+struct DshSource {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DshUsage {
+    #[serde(default, rename = "inputTokens")]
+    input: i64,
     #[serde(default, rename = "cacheReadTokens")]
     cache_read: i64,
     #[serde(default, rename = "outputTokens")]
@@ -135,466 +119,553 @@ struct DshTotals {
     cache_write: i64,
 }
 
-impl Default for DshTotals {
-    fn default() -> Self {
-        Self {
-            uncached_input: 0,
-            cache_read: 0,
-            output: 0,
-            cache_write: 0,
-        }
-    }
+/// Only these lines are decoded as JSON; everything else in the log (tool
+/// results, chunks, prompts) is skipped by a substring check first.
+fn is_candidate_line(line: &str) -> bool {
+    line.contains("\"type\":\"assistant/message\"")
+        || line.contains("\"type\":\"compaction/summary\"")
+        || line.contains("\"type\":\"session\"")
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct DshLastUsed {
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-}
-
-/// Parse one DSH `session-*.json` projcache snapshot.
+/// Parse one DSH `session*.jsonl.zstd` event log.
 ///
-/// Missing/unreadable files and malformed JSON yield no messages. A snapshot
-/// with per-step `requests[]` maps one message per row. A snapshot whose
-/// timeline is absent but whose `tokenUsage.val.totals` is non-zero maps a
-/// single aggregate message anchored on the file's mtime. Zero-usage rows
-/// (and zero totals) are skipped.
+/// A missing or undecodable file yields no messages. A malformed line is
+/// skipped and the lines after it are still read; a stream that fails to
+/// decode partway keeps the steps read before the failure, since every
+/// completed step is final once written.
 pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return Vec::new(),
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
     };
-    let file: DshFile = match serde_json::from_str(&content) {
-        Ok(file) => file,
-        Err(_) => return Vec::new(),
+    let Ok(decoder) = zstd::stream::read::Decoder::new(file) else {
+        return Vec::new();
     };
-
-    let last_used = file.record.rows.model_selection.val.and_then(|s| s.last_used);
-    let timeline = file.record.rows.context_timeline.val;
-
-    let model_raw = last_used
-        .as_ref()
-        .and_then(|u| u.model.as_deref())
-        .or(timeline.as_ref().and_then(|t| t.model.as_deref()))
-        .or(timeline.as_ref().and_then(|t| t.last_model.as_deref()))
-        .unwrap_or("unknown");
-    let model_id = pricing::aliases::resolve_alias(model_raw)
-        .unwrap_or(model_raw)
-        .to_string();
-    let provider_raw = last_used
-        .as_ref()
-        .and_then(|u| u.provider.as_deref())
-        .or(timeline.as_ref().and_then(|t| t.provider.as_deref()))
-        .unwrap_or("unknown");
-    let provider_id = provider_identity::canonical_provider(provider_raw)
-        .unwrap_or_else(|| provider_raw.to_string());
+    let mut reader = BufReader::new(decoder.take(MAX_LOG_BYTES));
 
     let session_id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.trim().is_empty())
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
         .unwrap_or("unknown")
         .to_string();
 
-    let (workspace_key, workspace_label) = file
-        .record
-        .identity
-        .cwd
-        .as_deref()
-        .and_then(normalize_workspace_key)
-        .map(|key| {
-            let label = workspace_label_from_key(&key);
-            (Some(key), label)
-        })
-        .unwrap_or((None, None));
-
+    let mut workspace: Option<(Option<String>, Option<String>)> = None;
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
-    let mut prev_turn: Option<i64> = None;
-    if let Some(timeline) = timeline.as_ref().filter(|t| !t.requests.is_empty()) {
-        for req in &timeline.requests {
-            if req.time <= 0 {
-                continue;
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            continue;
+        };
+        if !is_candidate_line(line) {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<DshEvent>(line) else {
+            continue;
+        };
+        match event.kind.as_str() {
+            "session" if workspace.is_none() => {
+                workspace = Some(
+                    event
+                        .cwd
+                        .as_deref()
+                        .and_then(normalize_workspace_key)
+                        .map(|key| {
+                            let label = workspace_label_from_key(&key);
+                            (Some(key), label)
+                        })
+                        .unwrap_or((None, None)),
+                );
             }
-            let cache_read = req.cache_read.unwrap_or(0).max(0);
-            let prompt = req.prompt.max(0);
-            let output = req.output.max(0);
-            let input = prompt.saturating_sub(cache_read);
-            if input == 0 && cache_read == 0 && output == 0 {
-                continue;
+            "assistant/message" | "compaction/summary" => {
+                if let Some(message) = usage_message(&event, &session_id, &mut seen) {
+                    messages.push(message);
+                }
             }
-            let tokens = TokenBreakdown {
-                input,
-                output,
-                cache_read,
-                cache_write: 0,
-                cache_write_1h: 0,
-                reasoning: 0,
-            };
-            let dedup_key = format!(
-                "dsh:{}:{}:{}:{}:{}:{}:{}:{}",
-                session_id, req.seq, req.turn, req.step, model_id, input, output, cache_read,
-            );
-            if !seen.insert(dedup_key.clone()) {
-                continue;
-            }
-            let mut message = UnifiedMessage::new_with_dedup(
-                "dsh",
-                model_id.clone(),
-                provider_id.clone(),
-                &session_id,
-                req.time,
-                tokens,
-                0.0,
-                Some(dedup_key),
-            );
-            if prev_turn.is_none_or(|prev| prev != req.turn) {
-                message.is_turn_start = true;
-            }
-            prev_turn = Some(req.turn);
-            if workspace_key.is_some() || workspace_label.is_some() {
-                message.set_workspace(workspace_key.clone(), workspace_label.clone());
-            }
-            messages.push(message);
+            _ => {}
         }
     }
 
-    if !messages.is_empty() {
-        return messages;
+    if let Some((key, label)) = workspace {
+        if key.is_some() || label.is_some() {
+            for message in &mut messages {
+                message.set_workspace(key.clone(), label.clone());
+            }
+        }
     }
+    messages
+}
 
-    // Fallback: timeline absent (or no rows), but the session totals are
-    // non-zero. Emit one aggregate message anchored on the file's mtime so
-    // the usage still reaches the reports instead of vanishing. The totals
-    // buckets are already split the way TokenBreakdown wants them.
-    let Some(totals) = file.record.rows.token_usage.val.and_then(|usage| usage.totals) else {
-        return Vec::new();
-    };
-    let input = totals.uncached_input.max(0);
-    let cache_read = totals.cache_read.max(0);
-    let output = totals.output.max(0);
-    // cache_write is authoritative-zero on every observed file; a future
-    // nonzero write still must not leak into the input bucket.
-    let cache_write = totals.cache_write.max(0);
-    if input == 0 && cache_read == 0 && output == 0 && cache_write == 0 {
-        return Vec::new();
-    }
-    let timestamp = file_modified_timestamp_ms(path);
-    if timestamp <= 0 {
-        return Vec::new();
+fn usage_message(
+    event: &DshEvent,
+    session_id: &str,
+    seen: &mut HashSet<String>,
+) -> Option<UnifiedMessage> {
+    let data = event.data.as_ref()?;
+    let usage = data.usage.as_ref()?;
+    if event.time <= 0 {
+        return None;
     }
     let tokens = TokenBreakdown {
-        input,
-        output,
-        cache_read,
-        cache_write,
+        input: usage.input.max(0),
+        output: usage.output.max(0),
+        cache_read: usage.cache_read.max(0),
+        cache_write: usage.cache_write.max(0),
         cache_write_1h: 0,
         reasoning: 0,
     };
-    let dedup_key = format!("dsh:{session_id}:totals");
+    if tokens.input == 0 && tokens.output == 0 && tokens.cache_read == 0 && tokens.cache_write == 0
+    {
+        return None;
+    }
+
+    let is_compaction = event.kind == "compaction/summary";
+    let source = data.message.as_ref().and_then(|m| m.source.as_ref());
+    let (provider_raw, model_raw) = if is_compaction {
+        (data.provider.as_deref(), data.model.as_deref())
+    } else {
+        (
+            source.and_then(|s| s.provider.as_deref()),
+            source.and_then(|s| s.model.as_deref()),
+        )
+    };
+    let provider_raw = provider_raw.unwrap_or("unknown");
+    let model_raw = model_raw.unwrap_or("unknown");
+
+    let dedup_key = match (is_compaction, data.compaction_id.as_deref()) {
+        (true, Some(id)) => format!("dsh:compaction:{id}"),
+        _ => format!(
+            "dsh:{}:{}:{}:{}/{}:{}:{}:{}:{}",
+            event.time,
+            data.turn.unwrap_or(0),
+            data.step.unwrap_or(0),
+            provider_raw,
+            model_raw,
+            tokens.input,
+            tokens.cache_read,
+            tokens.output,
+            tokens.cache_write,
+        ),
+    };
+    if !seen.insert(dedup_key.clone()) {
+        return None;
+    }
+
+    let model_id = pricing::aliases::resolve_alias(model_raw)
+        .unwrap_or(model_raw)
+        .to_string();
+    let provider_id = provider_identity::canonical_provider(provider_raw)
+        .unwrap_or_else(|| provider_raw.to_string());
     let mut message = UnifiedMessage::new_with_dedup(
         "dsh",
         model_id,
         provider_id,
-        &session_id,
-        timestamp,
+        session_id,
+        event.time,
         tokens,
         0.0,
         Some(dedup_key),
     );
-    message.is_turn_start = true;
-    if workspace_key.is_some() || workspace_label.is_some() {
-        message.set_workspace(workspace_key, workspace_label);
-    }
-    messages.push(message);
-
-    messages
+    message.is_turn_start = !is_compaction && data.step == Some(1);
+    Some(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use serde_json::{json, Value};
     use tempfile::TempDir;
 
-    fn write_session(dir: &TempDir, name: &str, content: &str) -> std::path::PathBuf {
-        let path = dir.path().join(name);
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(content.as_bytes()).unwrap();
-        file.flush().unwrap();
+    /// Write `events` as a zstd JSONL log at `<dir>/<session>/<name>`.
+    fn write_log(dir: &TempDir, session: &str, name: &str, events: &[Value]) -> std::path::PathBuf {
+        let session_dir = dir.path().join(session);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut jsonl = String::new();
+        for event in events {
+            jsonl.push_str(&event.to_string());
+            jsonl.push('\n');
+        }
+        let path = session_dir.join(name);
+        std::fs::write(&path, zstd::encode_all(jsonl.as_bytes(), 3).unwrap()).unwrap();
         path
     }
 
-    fn minimal_file(
-        cwd: &str,
+    fn header(cwd: &str, extra: Value) -> Value {
+        let mut event = json!({
+            "type": "session",
+            "version": 4,
+            "id": "session-x",
+            "createdAt": 1791661487168i64,
+            "cwd": cwd,
+            "isSeeded": false,
+            "delegationDepth": 0
+        });
+        if let (Some(event), Some(extra)) = (event.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                event.insert(key.clone(), value.clone());
+            }
+        }
+        event
+    }
+
+    fn step(
+        seq: i64,
+        time: i64,
+        turn: i64,
+        step: i64,
         provider: &str,
         model: &str,
-        requests: &str,
-    ) -> String {
-        let requests_val: Vec<serde_json::Value> =
-            serde_json::from_str(&format!("[{requests}]")).unwrap();
-        serde_json::json!({
-            "version": 7,
-            "record": {
-                "identity": {
-                    "formatVersion": 4,
-                    "createdAt": 1791194458614i64,
-                    "cwd": cwd,
-                    "isSeeded": false
+        usage: Value,
+    ) -> Value {
+        json!({
+            "type": "assistant/message",
+            "seq": seq,
+            "time": time,
+            "data": {
+                "turn": turn,
+                "step": step,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "source": {"kind": "model", "provider": provider, "model": model}
                 },
-                "rows": {
-                    "contextTimeline": {
-                        "ver": 24,
-                        "seq": 280,
-                        "val": {
-                            "model": model,
-                            "provider": provider,
-                            "requests": requests_val
-                        }
-                    },
-                    "modelSelection": {
-                        "ver": 2,
-                        "seq": 280,
-                        "val": {
-                            "lastUsed": {
-                                "provider": provider,
-                                "model": model
-                            }
-                        }
-                    }
-                }
+                "usage": usage
             }
         })
-        .to_string()
+    }
+
+    fn usage(input: i64, cache_read: i64, output: i64) -> Value {
+        json!({"inputTokens": input, "cacheReadTokens": cache_read, "outputTokens": output})
+    }
+
+    fn keys(messages: &[UnifiedMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| m.dedup_key.clone())
+            .collect()
     }
 
     #[test]
-    fn parses_requests_with_prompt_minus_cache_mapping() {
+    fn maps_steps_with_their_own_model_and_time() {
         let dir = TempDir::new().unwrap();
-        let requests = concat!(
-            r#"{"time":1791194523506,"seq":17,"system":1505,"tools":8372,"user":11,"inject":132,"skill":622,"assistant":0,"tool":0,"total":10642,"turn":1,"step":1,"prompt":10741,"cacheRead":113,"output":387},"#,
-            r#"{"time":1791194578634,"seq":25,"system":1505,"tools":8372,"user":26,"inject":132,"skill":622,"assistant":36,"tool":0,"total":10693,"turn":2,"step":1,"prompt":10811,"cacheRead":113,"output":412}"#,
+        let path = write_log(
+            &dir,
+            "session-abc",
+            "session.v4.jsonl.zstd",
+            &[
+                header("C:\\Users\\alice\\repo", json!({})),
+                json!({"type": "turn/start", "seq": 4, "time": 1791231855464i64, "data": {"turn": 1}}),
+                step(
+                    15,
+                    1791231857486,
+                    1,
+                    1,
+                    "opencode2dsh",
+                    "muse-spark-1.3-contributor-free",
+                    usage(11409, 143, 101),
+                ),
+                step(
+                    23,
+                    1791318257486,
+                    1,
+                    2,
+                    "opencode2dsh",
+                    "space-bunny-free",
+                    usage(630, 8049, 372),
+                ),
+            ],
         );
-        let content = minimal_file(
-            "C:\\Users\\alice\\repo",
-            "opencode2dsh",
-            "muse-spark-1.3-contributor-free",
-            requests,
-        );
-        let path = write_session(&dir, "session-abc.json", &content);
 
         let messages = parse_dsh_file(&path);
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].client, "dsh");
-        assert_eq!(messages[0].model_id, "muse-spark-1.3-contributor-free");
-        assert_eq!(messages[0].provider_id, "opencode2dsh");
-        assert_eq!(messages[0].session_id, "session-abc");
-        // prompt - cacheRead = uncached input.
-        assert_eq!(messages[0].tokens.input, 10741 - 113);
-        assert_eq!(messages[0].tokens.cache_read, 113);
-        assert_eq!(messages[0].tokens.output, 387);
-        assert_eq!(messages[0].tokens.cache_write, 0);
-        assert_eq!(messages[0].tokens.reasoning, 0);
-        assert_eq!(messages[0].timestamp, 1791194523506);
-        assert_eq!(messages[0].cost, 0.0);
-        assert!(messages[0].dedup_key.as_deref().unwrap().starts_with("dsh:session-abc:17:"));
-        // First step of each turn starts a turn.
-        assert!(messages[0].is_turn_start);
-        assert!(messages[1].is_turn_start);
-        // Workspace comes from identity.cwd.
-        assert_eq!(
-            messages[0].workspace_key.as_deref(),
-            Some("C:/Users/alice/repo")
-        );
-        assert_eq!(messages[0].workspace_label.as_deref(), Some("repo"));
-    }
-
-    #[test]
-    fn second_step_of_same_turn_is_not_turn_start() {
-        let dir = TempDir::new().unwrap();
-        let content = minimal_file(
-            "C:\\Users\\alice\\repo",
-            "openrouter",
-            "stealth/ox-alpha",
-            r#"{"time":1791194523506,"seq":17,"turn":1,"step":1,"prompt":100,"cacheRead":10,"output":5},{"time":1791194524506,"seq":18,"turn":1,"step":2,"prompt":200,"cacheRead":20,"output":6}"#,
-        );
-        let path = write_session(&dir, "session-turn.json", &content);
-
-        let messages = parse_dsh_file(&path);
-        assert_eq!(messages.len(), 2);
-        assert!(messages[0].is_turn_start);
+        let first = &messages[0];
+        assert_eq!(first.client, "dsh");
+        assert_eq!(first.session_id, "session-abc");
+        assert_eq!(first.model_id, "muse-spark-1.3-contributor-free");
+        assert_eq!(first.provider_id, "opencode2dsh");
+        assert_eq!(first.timestamp, 1791231857486);
+        assert_eq!(first.tokens.input, 11409);
+        assert_eq!(first.tokens.cache_read, 143);
+        assert_eq!(first.tokens.output, 101);
+        assert_eq!(first.tokens.cache_write, 0);
+        assert_eq!(first.tokens.reasoning, 0);
+        assert!(first.is_turn_start);
+        assert_eq!(first.workspace_label.as_deref(), Some("repo"));
+        // A model switch and a later day stay on the step that made them.
+        assert_eq!(messages[1].model_id, "space-bunny-free");
+        assert_eq!(messages[1].timestamp, 1791318257486);
         assert!(!messages[1].is_turn_start);
     }
 
     #[test]
-    fn missing_cache_read_defaults_to_zero() {
-        // Older snapshots (e.g. 2026-08) carry no cacheRead key at all.
+    fn provider_is_canonicalized_and_cache_write_is_read() {
         let dir = TempDir::new().unwrap();
-        let content = minimal_file(
-            "C:\\Users\\alice\\repo",
-            "openrouter",
-            "stealth/ox-alpha",
-            r#"{"time":1787497454467,"seq":15,"system":1632,"tools":6769,"user":9,"inject":131,"skill":0,"assistant":0,"tool":0,"total":8541,"turn":1,"step":1,"prompt":7841,"output":178}"#,
+        let path = write_log(
+            &dir,
+            "session-flash",
+            "session.v4.jsonl.zstd",
+            &[
+                header("C:\\x", json!({})),
+                step(
+                    9,
+                    1790935688620,
+                    1,
+                    1,
+                    "deepseek-account",
+                    "deepseek-flash",
+                    json!({"inputTokens": 8157, "outputTokens": 817, "cacheReadTokens": 0,
+                           "cacheWriteTokens": 12, "totalTokens": 8986}),
+                ),
+            ],
         );
-        let path = write_session(&dir, "session-old.json", &content);
-
-        let messages = parse_dsh_file(&path);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].tokens.input, 7841);
-        assert_eq!(messages[0].tokens.cache_read, 0);
-        assert_eq!(messages[0].tokens.output, 178);
-    }
-
-    #[test]
-    fn skips_zero_usage_heartbeat_rows() {
-        let dir = TempDir::new().unwrap();
-        let content = minimal_file(
-            "C:\\Users\\alice\\repo",
-            "openrouter",
-            "stealth/ox-alpha",
-            r#"{"time":1791194523506,"seq":17,"turn":1,"step":1,"prompt":0,"cacheRead":0,"output":0},{"time":1791194524506,"seq":18,"turn":1,"step":2,"prompt":100,"cacheRead":10,"output":5}"#,
-        );
-        let path = write_session(&dir, "session-heartbeat.json", &content);
-
-        let messages = parse_dsh_file(&path);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].timestamp, 1791194524506);
-    }
-
-    #[test]
-    fn falls_back_to_timeline_model_when_last_used_missing() {
-        let dir = TempDir::new().unwrap();
-        let content = r#"{"version":7,"record":{"identity":{"formatVersion":4,"cwd":"C:\\Users\\alice\\repo"},"rows":{"contextTimeline":{"ver":24,"seq":1,"val":{"model":"deepseek-flash","provider":"deepseek-account","requests":[{"time":1790935688620,"seq":18,"turn":1,"step":1,"prompt":8157,"cacheRead":0,"output":817}]}},"modelSelection":{"ver":2,"seq":1,"val":{"lastUsed":null}}}}}"#;
-        let path = write_session(&dir, "session-fallback.json", content);
-
         let messages = parse_dsh_file(&path);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "deepseek-flash");
-        // Provider ids are canonicalized (`-` -> `_`), same as every other lane.
         assert_eq!(messages[0].provider_id, "deepseek_account");
+        assert_eq!(messages[0].tokens.cache_write, 12);
     }
 
     #[test]
-    fn totals_fallback_when_timeline_absent() {
-        // Seeded sessions whose timeline was never written: totals are large,
-        // `contextTimeline` is absent entirely. One aggregate message anchored
-        // on the file's mtime, deduped by `dsh:<session>:totals`.
+    fn seeded_child_shares_keys_with_its_parent_for_inherited_steps() {
+        // Shape measured on DSH 0.2.0-rc.2: the child's first
+        // `inheritedEventCount` events are a verbatim copy of the parent's,
+        // usage included, followed by the child's own steps.
         let dir = TempDir::new().unwrap();
-        let content = r#"{"version":7,"record":{"identity":{"formatVersion":4,"createdAt":1791349276317,"cwd":"C:\\chatbot","isSeeded":true},"rows":{"tokenUsage":{"ver":1,"seq":100,"val":{"totals":{"uncachedInputTokens":1243037,"outputTokens":596044,"cacheReadTokens":376403209,"cacheWriteTokens":0}}},"modelSelection":{"ver":2,"seq":100,"val":{"lastUsed":{"provider":"opencode2dsh","model":"muse-spark-1.3-contributor-free"}}}}}}"#;
-        let path = write_session(&dir, "session-e7ee0d32.json", content);
+        let parent_events = vec![
+            header("C:\\proj", json!({})),
+            step(
+                16,
+                1791662639676,
+                1,
+                1,
+                "opencode2dsh",
+                "muse-spark-1.3-contributor-free",
+                usage(7792, 0, 146),
+            ),
+            step(
+                24,
+                1791662658328,
+                2,
+                1,
+                "opencode2dsh",
+                "muse-spark-1.3-contributor-free",
+                usage(7875, 0, 262),
+            ),
+        ];
+        let parent = write_log(
+            &dir,
+            "session-parent",
+            "session.v4.jsonl.zstd",
+            &parent_events,
+        );
+        let mut child_events = vec![header(
+            "C:\\proj",
+            json!({"isSeeded": true, "inheritedEventCount": 3, "parentSession": "session-parent"}),
+        )];
+        child_events.extend(parent_events[1..].iter().cloned());
+        child_events.push(
+            json!({"type": "session/end-seed", "seq": 40, "time": 1791662744274i64, "data": {}}),
+        );
+        child_events.push(step(
+            50,
+            1791662882361,
+            4,
+            1,
+            "opencode2dsh",
+            "muse-spark-1.3-contributor-free",
+            usage(123, 8049, 976),
+        ));
+        let child = write_log(
+            &dir,
+            "session-child",
+            "session.v4.jsonl.zstd",
+            &child_events,
+        );
 
+        let parent_messages = parse_dsh_file(&parent);
+        let child_messages = parse_dsh_file(&child);
+        assert_eq!(parent_messages.len(), 2);
+        // The child file alone still reports what it holds (parent absent).
+        assert_eq!(child_messages.len(), 3);
+
+        // Both present: the inherited steps collapse onto the parent's keys,
+        // leaving the parent's two steps plus the child's own one.
+        let parent_keys = keys(&parent_messages);
+        let mut all: HashSet<String> = parent_keys.iter().cloned().collect();
+        all.extend(keys(&child_messages));
+        assert_eq!(all.len(), 3);
+        let own: Vec<_> = child_messages
+            .iter()
+            .filter(|m| !parent_keys.contains(m.dedup_key.as_ref().unwrap()))
+            .collect();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].tokens.input, 123);
+        assert_eq!(own[0].tokens.cache_read, 8049);
+        assert_eq!(own[0].tokens.output, 976);
+    }
+
+    #[test]
+    fn migrated_session_logs_share_keys_despite_different_seq() {
+        // A format-4 migration keeps `session.jsonl.zstd` beside the new log:
+        // same steps, same time and tokens, renumbered `seq`.
+        let dir = TempDir::new().unwrap();
+        let old = write_log(
+            &dir,
+            "session-mig",
+            "session.jsonl.zstd",
+            &[
+                json!({"type": "session", "version": 0, "cwd": "C:\\proj"}),
+                step(
+                    81,
+                    1787497454467,
+                    1,
+                    1,
+                    "openrouter",
+                    "stealth/ox-alpha",
+                    usage(7841, 0, 178),
+                ),
+                json!({"type": "assistant/chunk", "seq": 82, "time": 1787497454470i64,
+                       "data": {"chunk": {"usage": {"inputTokens": 7841, "outputTokens": 178}}}}),
+            ],
+        );
+        let new = write_log(
+            &dir,
+            "session-mig",
+            "session.v4.jsonl.zstd",
+            &[
+                header("C:\\proj", json!({})),
+                step(
+                    15,
+                    1787497454467,
+                    1,
+                    1,
+                    "openrouter",
+                    "stealth/ox-alpha",
+                    usage(7841, 0, 178),
+                ),
+            ],
+        );
+        let old_keys = keys(&parse_dsh_file(&old));
+        let new_keys = keys(&parse_dsh_file(&new));
+        assert_eq!(old_keys.len(), 1, "the streaming chunk is not counted");
+        assert_eq!(old_keys, new_keys);
+    }
+
+    #[test]
+    fn compaction_summary_is_counted_once_by_its_id() {
+        let dir = TempDir::new().unwrap();
+        let summary = json!({
+            "type": "compaction/summary",
+            "seq": 54157,
+            "time": 1787512178236i64,
+            "data": {
+                "compactionId": "500f304a-ed00-473a-968c-0699b5233483",
+                "summary": [{"type": "text", "text": "summary"}],
+                "provider": "openrouter",
+                "model": "stealth/ox-alpha",
+                "usage": {"inputTokens": 171220, "outputTokens": 5270}
+            }
+        });
+        let path = write_log(
+            &dir,
+            "session-cmp",
+            "session.v4.jsonl.zstd",
+            &[header("C:\\proj", json!({})), summary.clone(), summary],
+        );
         let messages = parse_dsh_file(&path);
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].client, "dsh");
-        assert_eq!(messages[0].model_id, "muse-spark-1.3-contributor-free");
-        assert_eq!(messages[0].provider_id, "opencode2dsh");
-        assert_eq!(messages[0].session_id, "session-e7ee0d32");
-        assert_eq!(messages[0].tokens.input, 1243037);
-        assert_eq!(messages[0].tokens.cache_read, 376403209);
-        assert_eq!(messages[0].tokens.output, 596044);
-        assert_eq!(messages[0].tokens.cache_write, 0);
-        assert_eq!(messages[0].tokens.reasoning, 0);
-        assert_eq!(messages[0].cost, 0.0);
-        assert!(messages[0].is_turn_start);
+        assert_eq!(messages[0].model_id, "stealth/ox-alpha");
+        assert_eq!(messages[0].tokens.input, 171220);
+        assert_eq!(messages[0].tokens.output, 5270);
+        assert!(!messages[0].is_turn_start);
         assert_eq!(
             messages[0].dedup_key.as_deref(),
-            Some("dsh:session-e7ee0d32:totals")
+            Some("dsh:compaction:500f304a-ed00-473a-968c-0699b5233483")
         );
-        // Anchored on the snapshot file's mtime, not on any request.
-        assert!(messages[0].timestamp > 0);
-        assert!(!messages[0].date.is_empty());
-        assert_eq!(
-            messages[0].workspace_key.as_deref(),
-            Some("C:/chatbot")
-        );
-        assert_eq!(messages[0].workspace_label.as_deref(), Some("chatbot"));
     }
 
     #[test]
-    fn timeline_rows_win_over_totals_no_double_count() {
-        // Both present: the per-step rows are authoritative, totals must not
-        // add a second aggregate message.
+    fn subagent_log_is_its_own_session() {
         let dir = TempDir::new().unwrap();
-        let content = serde_json::json!({
-            "version": 7,
-            "record": {
-                "identity": {"formatVersion": 4, "cwd": "C:\\chatbot"},
-                "rows": {
-                    "contextTimeline": {"ver": 24, "seq": 2, "val": {
-                        "model": "muse-spark-1.3-contributor-free",
-                        "provider": "opencode2dsh",
-                        "requests": [
-                            {"time": 1791349276317i64, "seq": 1, "turn": 1, "step": 1,
-                             "prompt": 1000, "cacheRead": 100, "output": 50}
-                        ]
-                    }},
-                    "modelSelection": {"ver": 2, "seq": 2, "val": {
-                        "lastUsed": {"provider": "opencode2dsh",
-                                     "model": "muse-spark-1.3-contributor-free"}
-                    }},
-                    "tokenUsage": {"ver": 1, "seq": 2, "val": {
-                        "totals": {"uncachedInputTokens": 999999,
-                                   "outputTokens": 888888,
-                                   "cacheReadTokens": 777777,
-                                   "cacheWriteTokens": 0}
-                    }}
-                }
-            }
-        })
-        .to_string();
-        let path = write_session(&dir, "session-both.json", &content);
-
+        let path = write_log(
+            &dir,
+            "92aab9a4-1111-2222-3333-444455556666",
+            "session.v4.jsonl.zstd",
+            &[
+                header(
+                    "C:\\proj",
+                    json!({"delegationDepth": 1, "parentSession": "session-parent", "origin": "subagent"}),
+                ),
+                step(
+                    14,
+                    1791613241996,
+                    1,
+                    1,
+                    "opencode2dsh",
+                    "muse-spark-1.3-contributor-free",
+                    usage(8415, 0, 184),
+                ),
+            ],
+        );
         let messages = parse_dsh_file(&path);
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].tokens.input, 900);
-        assert_eq!(messages[0].tokens.cache_read, 100);
-        assert_eq!(messages[0].tokens.output, 50);
-        assert!(messages[0]
-            .dedup_key
-            .as_deref()
-            .unwrap()
-            .starts_with("dsh:session-both:1:"));
+        assert_eq!(
+            messages[0].session_id,
+            "92aab9a4-1111-2222-3333-444455556666"
+        );
+        assert_eq!(messages[0].workspace_label.as_deref(), Some("proj"));
     }
 
     #[test]
-    fn zero_totals_yield_nothing() {
+    fn skips_attempts_zero_usage_and_malformed_lines() {
         let dir = TempDir::new().unwrap();
-        let content = r#"{"version":7,"record":{"identity":{"formatVersion":4,"cwd":"C:\\chatbot"},"rows":{"tokenUsage":{"ver":1,"seq":1,"val":{"totals":{"uncachedInputTokens":0,"outputTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0}}},"modelSelection":{"ver":2,"seq":1,"val":{"lastUsed":{"provider":"opencode2dsh","model":"muse-spark-1.3-contributor-free"}}}}}}"#;
-        let path = write_session(&dir, "session-zero.json", content);
+        let session_dir = dir.path().join("session-mixed");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut jsonl = String::new();
+        for event in [
+            header("C:\\proj", json!({})),
+            json!({"type": "assistant/attempt", "seq": 5, "time": 1791194523000i64,
+                   "data": {"stream": [{"chunk": {"usage": {"inputTokens": 900, "outputTokens": 9}}}]}}),
+            step(6, 1791194523506, 1, 1, "p", "m", usage(0, 0, 0)),
+            step(7, 1791194524506, 1, 2, "p", "m", usage(100, 10, 5)),
+        ] {
+            jsonl.push_str(&event.to_string());
+            jsonl.push('\n');
+        }
+        jsonl.push_str("{\"type\":\"assistant/message\", not json\n");
+        jsonl.push_str(&step(8, 1791194525506, 1, 3, "p", "m", usage(200, 20, 6)).to_string());
+        let path = session_dir.join("session.v4.jsonl.zstd");
+        std::fs::write(&path, zstd::encode_all(jsonl.as_bytes(), 3).unwrap()).unwrap();
 
-        assert!(parse_dsh_file(&path).is_empty());
+        let messages = parse_dsh_file(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[1].tokens.input, 200);
     }
 
     #[test]
-    fn malformed_and_empty_inputs_yield_nothing() {
+    fn unreadable_inputs_yield_nothing() {
         let dir = TempDir::new().unwrap();
-        let bad = write_session(&dir, "session-bad.json", "not json at all");
-        assert!(parse_dsh_file(&bad).is_empty());
+        assert!(parse_dsh_file(&dir.path().join("missing/session.v4.jsonl.zstd")).is_empty());
 
-        let no_requests = write_session(
+        let session_dir = dir.path().join("session-bad");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let not_zstd = session_dir.join("session.v4.jsonl.zstd");
+        std::fs::write(&not_zstd, b"not a zstd stream").unwrap();
+        assert!(parse_dsh_file(&not_zstd).is_empty());
+
+        let header_only = write_log(
             &dir,
-            "session-empty.json",
-            r#"{"version":7,"record":{"identity":{"cwd":"C:\\x"},"rows":{"contextTimeline":{"ver":24,"seq":1,"val":{"model":"m","provider":"p","requests":[]}},"modelSelection":{"ver":2,"seq":1,"val":{}}}}}"#,
+            "session-empty",
+            "session.v4.jsonl.zstd",
+            &[header("C:\\x", json!({}))],
         );
-        assert!(parse_dsh_file(&no_requests).is_empty());
-
-        let no_timeline = write_session(
-            &dir,
-            "session-notimeline.json",
-            r#"{"version":7,"record":{"identity":{"cwd":"C:\\x"},"rows":{}}}"#,
-        );
-        assert!(parse_dsh_file(&no_timeline).is_empty());
-
-        // Absent timeline AND absent totals: nothing to aggregate.
-        let no_timeline_no_totals = write_session(
-            &dir,
-            "session-notimeline-nototals.json",
-            r#"{"version":7,"record":{"identity":{"cwd":"C:\\x"},"rows":{"modelSelection":{"ver":2,"seq":1,"val":{"lastUsed":{"provider":"p","model":"m"}}}}}}"#,
-        );
-        assert!(parse_dsh_file(&no_timeline_no_totals).is_empty());
-
-        assert!(parse_dsh_file(dir.path().join("does-not-exist.json").as_path()).is_empty());
+        assert!(parse_dsh_file(&header_only).is_empty());
     }
 }

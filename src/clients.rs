@@ -717,16 +717,16 @@ define_clients!(
         parse_local: true,
         submit_default: true
     },
-    // DeepSeek Harness (DSH) persists per-project session snapshots as
-    // `session-*.json` under `~/.dsh/storages/session_projcache/sessions`.
-    // Each file holds one session's `record.rows`; the authoritative
-    // per-step usage is `record.rows.contextTimeline.val.requests[]`.
-    // Vendor-local client (no upstream number yet).
+    // DeepSeek Harness (DSH) appends each session's events to a zstd JSONL
+    // log at `~/.dsh/sessions/<project>/<session>/session.v4.jsonl.zstd`
+    // (`session.jsonl.zstd` before format 4); subagent sessions sit beside
+    // them in UUID-named directories. Every completed step's usage is an
+    // `assistant/message` event. Vendor-local client (no upstream number yet).
     Dsh = 41 => {
         id: "dsh",
         root: PathRoot::Home,
-        relative: ".dsh/storages/session_projcache/sessions",
-        pattern: "session-*.json",
+        relative: ".dsh/sessions",
+        pattern: "session*.jsonl.zstd",
         headless: false,
         parse_local: true,
         submit_default: true
@@ -830,9 +830,9 @@ mod tests {
             client
                 .data()
                 .resolve_path_with_env_strategy("/tmp/home", false),
-            "/tmp/home/.dsh/storages/session_projcache/sessions"
+            "/tmp/home/.dsh/sessions"
         );
-        assert_eq!(client.data().pattern, "session-*.json");
+        assert_eq!(client.data().pattern, "session*.jsonl.zstd");
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);
