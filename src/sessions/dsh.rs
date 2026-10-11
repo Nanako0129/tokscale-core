@@ -65,15 +65,19 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// Upper bound on the decoded log, so a corrupt stream cannot run unbounded.
-/// Real logs are a few MB to a few tens of MB.
+/// Real logs are a few MB to a few tens of MB. Reaching the cap ends the read
+/// like EOF: steps past it are dropped, and the shorter result is what gets
+/// cached for that file until it changes.
 const MAX_LOG_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Default, Deserialize)]
 struct DshEvent {
     #[serde(default, rename = "type")]
     kind: String,
+    // Numbers are `Option` throughout so a JSON `null` drops one field, not
+    // the whole event.
     #[serde(default)]
-    time: i64,
+    time: Option<i64>,
     // The `session` header only.
     #[serde(default)]
     cwd: Option<String>,
@@ -121,13 +125,13 @@ struct DshSource {
 #[derive(Debug, Default, Deserialize)]
 struct DshUsage {
     #[serde(default, rename = "inputTokens")]
-    input: i64,
+    input: Option<i64>,
     #[serde(default, rename = "cacheReadTokens")]
-    cache_read: i64,
+    cache_read: Option<i64>,
     #[serde(default, rename = "outputTokens")]
-    output: i64,
+    output: Option<i64>,
     #[serde(default, rename = "cacheWriteTokens")]
-    cache_write: i64,
+    cache_write: Option<i64>,
 }
 
 /// Only these lines are decoded as JSON; everything else in the log (tool
@@ -239,15 +243,12 @@ fn usage_message(
 ) -> Option<UnifiedMessage> {
     let data = event.data.as_ref()?;
     let usage = data.usage.as_ref()?;
-    if event.time <= 0 {
-        return None;
-    }
-    let time = event.time;
+    let time = event.time.filter(|time| *time > 0)?;
     let tokens = TokenBreakdown {
-        input: usage.input.max(0),
-        output: usage.output.max(0),
-        cache_read: usage.cache_read.max(0),
-        cache_write: usage.cache_write.max(0),
+        input: usage.input.unwrap_or(0).max(0),
+        output: usage.output.unwrap_or(0).max(0),
+        cache_read: usage.cache_read.unwrap_or(0).max(0),
+        cache_write: usage.cache_write.unwrap_or(0).max(0),
         cache_write_1h: 0,
         reasoning: 0,
     };
@@ -576,6 +577,65 @@ mod tests {
             messages[0].session_id,
             "043682af-3599-4bfa-bc4e-08c73e8551b3"
         );
+    }
+
+    #[test]
+    fn null_numbers_drop_one_field_not_the_step() {
+        let dir = TempDir::new().unwrap();
+        let path = write_log(
+            &dir,
+            "session-nulls",
+            "session.v4.jsonl.zstd",
+            &[
+                header("C:\\proj", json!({})),
+                step(
+                    5,
+                    1791194523506,
+                    1,
+                    1,
+                    "p",
+                    "m",
+                    json!({"inputTokens": 100, "cacheReadTokens": null,
+                           "outputTokens": 5, "cacheWriteTokens": null}),
+                ),
+                json!({"type": "assistant/message", "seq": 6, "time": null,
+                       "data": {"turn": 1, "step": 2, "usage": {"inputTokens": 7}}}),
+            ],
+        );
+        let messages = parse_dsh_file(&path);
+        // The step with null token fields counts what it has; the one with
+        // no usable time has nothing to date it by and is skipped.
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.cache_read, 0);
+        assert_eq!(messages[0].tokens.output, 5);
+    }
+
+    #[test]
+    fn a_truncated_last_frame_keeps_the_steps_before_it() {
+        // DSH appends one zstd frame per write, so a log read mid-append ends
+        // in a partial frame. The steps in the complete frames before it are
+        // still counted.
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("session-cut");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut bytes = Vec::new();
+        for event in [
+            header("C:\\proj", json!({})),
+            step(5, 1791194523506, 1, 1, "p", "m", usage(100, 10, 5)),
+            step(6, 1791194524506, 1, 2, "p", "m", usage(200, 20, 6)),
+            step(7, 1791194525506, 1, 3, "p", "m", usage(300, 30, 7)),
+        ] {
+            let line = format!("{event}\n");
+            bytes.extend(zstd::encode_all(line.as_bytes(), 3).unwrap());
+        }
+        bytes.truncate(bytes.len() - 6);
+        let path = session_dir.join("session.v4.jsonl.zstd");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let messages = parse_dsh_file(&path);
+        let inputs: Vec<_> = messages.iter().map(|m| m.tokens.input).collect();
+        assert_eq!(inputs, [100, 200]);
     }
 
     #[test]
