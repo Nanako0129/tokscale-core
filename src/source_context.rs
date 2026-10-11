@@ -2774,14 +2774,12 @@ mod tests {
         //
         // Adding `dsh` (id, `.dsh/sessions`, `session*.jsonl.zstd` in field
         // 9) moves the descriptor, so both goldens move with it. Linux was
-        // measured on x86_64 under Rust 1.96.1. macOS was computed on the same
-        // host with every `target_os` branch switched to macOS, a run that
-        // reproduces the macOS goldens measured on real hardware for `522ee8f`
-        // and `045d6282` exactly; CI's `macos-latest` leg is the confirmation.
-        // A new `ClientId` also means every previously approved remote scope
-        // stops matching and needs re-approval: the identity is the
-        // approved-scope fingerprint, and `RESOLVER_CONTRACT_VERSION` covers
-        // rule changes, not client-list growth.
+        // measured on x86_64 under Rust 1.96.1, macOS on Apple hardware under
+        // Rust 1.96.1 (on `d49978f7`). A new `ClientId` also means every
+        // previously approved remote scope stops matching and needs
+        // re-approval: the identity is the approved-scope fingerprint, and
+        // `RESOLVER_CONTRACT_VERSION` covers rule changes, not client-list
+        // growth.
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
