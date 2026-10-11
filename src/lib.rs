@@ -23593,10 +23593,30 @@ mod tests {
         let shape = |messages: &[UnifiedMessage]| {
             let mut shape: Vec<_> = messages
                 .iter()
-                .map(|m| (m.dedup_key.clone(), m.timestamp, m.tokens.clone()))
+                .map(|m| {
+                    (
+                        m.dedup_key.clone(),
+                        m.session_id.clone(),
+                        m.timestamp,
+                        m.tokens.clone(),
+                    )
+                })
                 .collect();
             shape.sort_by(|a, b| a.0.cmp(&b.0));
             shape
+        };
+        let stream = || {
+            let mut streamed = Vec::new();
+            scan_messages_streaming(
+                home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |message| streamed.push(message.clone()),
+            );
+            streamed
         };
 
         let materialized = parse_all_messages_with_pricing(home, &clients, None);
@@ -23607,18 +23627,29 @@ mod tests {
             total,
             (1000 + 50) + (2000 + 100 + 60) + (300 + 400 + 70) + (500 + 600 + 80)
         );
-
-        let mut streamed = Vec::new();
-        scan_messages_streaming(
-            home,
-            &clients,
-            None,
-            false,
-            &scanner::ScannerSettings::default(),
-            &|_| true,
-            &mut |message| streamed.push(message.clone()),
+        // The inherited steps belong to the parent even though the child's
+        // log sorts first.
+        let mut owners: Vec<_> = materialized.iter().map(|m| m.session_id.as_str()).collect();
+        owners.sort();
+        assert_eq!(
+            owners,
+            [
+                "92aab9a4-1111-2222-3333-444455556666",
+                "session-child",
+                "session-parent",
+                "session-parent",
+            ]
         );
-        assert_eq!(shape(&streamed), shape(&materialized));
+
+        assert_eq!(shape(&stream()), shape(&materialized));
+        // Keep working in the parent after the fork: its log becomes a cache
+        // miss while the idle child is a hit, and the streaming lane emits
+        // hits first. Ownership must not flip.
+        parent.push(serde_json::json!({
+            "type": "turn/start", "seq": 30, "time": 1791662700000i64, "data": {"turn": 3}
+        }));
+        write_log("session-parent", "session.v4.jsonl.zstd", &parent);
+        assert_eq!(shape(&stream()), shape(&materialized));
 
         let counted = parse_local_clients(LocalParseOptions {
             home_dir: Some(home.to_string()),

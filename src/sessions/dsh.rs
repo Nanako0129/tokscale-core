@@ -36,7 +36,12 @@
 //!   verbatim copy of its parent's first `n` events, the parent's usage
 //!   included. Keyed by `time`, turn, step, model and tokens, a copied step
 //!   has the same key as the original, so it is counted once whether the
-//!   parent's log is present or not (if it was deleted, the child carries it).
+//!   parent's log is present or not. The copied steps also carry the
+//!   parent's session id: the header's `parentSession` is the parent's
+//!   directory name (`session-<uuid>`, checked on real seeded and subagent
+//!   logs), so both logs emit identical messages and the step belongs to the
+//!   parent whichever log a lane reads first, or to the parent's id alone if
+//!   its log was deleted.
 //! - A session migrated to format 4 keeps its old `session.jsonl.zstd` next
 //!   to the new log. Both record the same steps with the same `time` and
 //!   tokens but different `seq` numbering, so the same key collapses them.
@@ -45,8 +50,9 @@
 //! (`delegationDepth >= 1`, `parentSession` in the header). Their usage is not
 //! part of the parent's log or totals, so each is parsed as its own session.
 //!
-//! Identity: the session id is the log's directory name, and the workspace is
-//! the `cwd` of the log's `session` header. Cost is left at 0.0 for the
+//! Identity: the session id is the log's directory name (the parent's, for
+//! inherited steps), and the workspace is the `cwd` of the log's `session`
+//! header. Cost is left at 0.0 for the
 //! pricing pipeline: free-tier `-free` models resolve through
 //! `custom-pricing.json` shadow prices, paid rows through the built-in
 //! catalogs.
@@ -68,8 +74,13 @@ struct DshEvent {
     kind: String,
     #[serde(default)]
     time: i64,
+    // The `session` header only.
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default, rename = "parentSession")]
+    parent_session: Option<String>,
+    #[serde(default, rename = "inheritedEventCount")]
+    inherited_event_count: Option<i64>,
     #[serde(default)]
     data: Option<DshEventData>,
 }
@@ -151,6 +162,12 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
         .to_string();
 
     let mut workspace: Option<(Option<String>, Option<String>)> = None;
+    // Events at index < `inherited` were copied from `parent_session`. The
+    // index counts every non-empty line of the log, header included, as
+    // `inheritedEventCount` does.
+    let mut inherited: i64 = 0;
+    let mut parent_session: Option<String> = None;
+    let mut index: i64 = -1;
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
     let mut raw = Vec::new();
@@ -160,6 +177,10 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
+        if raw.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        index += 1;
         let Ok(line) = std::str::from_utf8(&raw) else {
             continue;
         };
@@ -171,6 +192,11 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
         };
         match event.kind.as_str() {
             "session" if workspace.is_none() => {
+                parent_session = event
+                    .parent_session
+                    .clone()
+                    .filter(|id| !id.trim().is_empty());
+                inherited = event.inherited_event_count.unwrap_or(0).max(0);
                 workspace = Some(
                     event
                         .cwd
@@ -184,7 +210,11 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 );
             }
             "assistant/message" | "compaction/summary" => {
-                if let Some(message) = usage_message(&event, &session_id, &mut seen) {
+                let owner = match parent_session.as_deref() {
+                    Some(parent) if index < inherited => parent,
+                    _ => session_id.as_str(),
+                };
+                if let Some(message) = usage_message(&event, owner, &mut seen) {
                     messages.push(message);
                 }
             }
@@ -212,6 +242,7 @@ fn usage_message(
     if event.time <= 0 {
         return None;
     }
+    let time = event.time;
     let tokens = TokenBreakdown {
         input: usage.input.max(0),
         output: usage.output.max(0),
@@ -242,7 +273,7 @@ fn usage_message(
         (true, Some(id)) => format!("dsh:compaction:{id}"),
         _ => format!(
             "dsh:{}:{}:{}:{}/{}:{}:{}:{}:{}",
-            event.time,
+            time,
             data.turn.unwrap_or(0),
             data.step.unwrap_or(0),
             provider_raw,
@@ -267,7 +298,7 @@ fn usage_message(
         model_id,
         provider_id,
         session_id,
-        event.time,
+        time,
         tokens,
         0.0,
         Some(dedup_key),
@@ -491,23 +522,60 @@ mod tests {
         let parent_messages = parse_dsh_file(&parent);
         let child_messages = parse_dsh_file(&child);
         assert_eq!(parent_messages.len(), 2);
-        // The child file alone still reports what it holds (parent absent).
+        // The child file alone still reports what it holds (parent absent),
+        // with the inherited steps under the parent's id.
         assert_eq!(child_messages.len(), 3);
+        let owners: Vec<_> = child_messages
+            .iter()
+            .map(|m| m.session_id.as_str())
+            .collect();
+        assert_eq!(
+            owners,
+            ["session-parent", "session-parent", "session-child"]
+        );
 
-        // Both present: the inherited steps collapse onto the parent's keys,
-        // leaving the parent's two steps plus the child's own one.
+        // Both present: each inherited step comes out of the child's log
+        // exactly as it comes out of the parent's, so whichever log a lane
+        // reads first, the step keeps its key and its owner.
+        let identity = |m: &UnifiedMessage| (m.dedup_key.clone(), m.session_id.clone());
+        let parent_view: Vec<_> = parent_messages.iter().map(identity).collect();
+        let child_view: Vec<_> = child_messages[..2].iter().map(identity).collect();
+        assert_eq!(child_view, parent_view);
+
         let parent_keys = keys(&parent_messages);
         let mut all: HashSet<String> = parent_keys.iter().cloned().collect();
         all.extend(keys(&child_messages));
         assert_eq!(all.len(), 3);
-        let own: Vec<_> = child_messages
-            .iter()
-            .filter(|m| !parent_keys.contains(m.dedup_key.as_ref().unwrap()))
-            .collect();
-        assert_eq!(own.len(), 1);
-        assert_eq!(own[0].tokens.input, 123);
-        assert_eq!(own[0].tokens.cache_read, 8049);
-        assert_eq!(own[0].tokens.output, 976);
+        let own = &child_messages[2];
+        assert!(!parent_keys.contains(own.dedup_key.as_ref().unwrap()));
+        assert_eq!(own.tokens.input, 123);
+        assert_eq!(own.tokens.cache_read, 8049);
+        assert_eq!(own.tokens.output, 976);
+    }
+
+    #[test]
+    fn subagent_parent_link_does_not_move_its_steps() {
+        // Subagents name their parent too, but inherit nothing: without
+        // `inheritedEventCount` every step stays with the subagent.
+        let dir = TempDir::new().unwrap();
+        let path = write_log(
+            &dir,
+            "043682af-3599-4bfa-bc4e-08c73e8551b3",
+            "session.v4.jsonl.zstd",
+            &[
+                header(
+                    "C:\\proj",
+                    json!({"delegationDepth": 1, "parentSession": "session-parent"}),
+                ),
+                step(14, 1791613241996, 1, 1, "p", "m", usage(8415, 0, 184)),
+            ],
+        );
+        let messages = parse_dsh_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].session_id,
+            "043682af-3599-4bfa-bc4e-08c73e8551b3"
+        );
     }
 
     #[test]
