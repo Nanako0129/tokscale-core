@@ -558,6 +558,66 @@ mod tests {
     }
 
     #[test]
+    fn appending_to_the_log_leaves_earlier_steps_unchanged() {
+        // DSH appends to the live log. A later write, here a new turn a day
+        // later, must not move, re-key or re-size the steps already counted:
+        // reports keep the same totals for past days, and the steps a cache
+        // entry already holds match the ones a re-parse produces.
+        let dir = TempDir::new().unwrap();
+        let mut events = vec![
+            header("C:\\proj", json!({})),
+            step(
+                15,
+                1791231857486,
+                1,
+                1,
+                "opencode2dsh",
+                "muse-spark-1.3-contributor-free",
+                usage(11409, 143, 101),
+            ),
+            step(
+                23,
+                1791231860453,
+                1,
+                2,
+                "opencode2dsh",
+                "muse-spark-1.3-contributor-free",
+                usage(630, 8049, 372),
+            ),
+        ];
+        let path = write_log(&dir, "session-live", "session.v4.jsonl.zstd", &events);
+        let before = parse_dsh_file(&path);
+        assert_eq!(before.len(), 2);
+
+        events.push(
+            json!({"type": "turn/start", "seq": 30, "time": 1791318257000i64, "data": {"turn": 2}}),
+        );
+        events.push(step(
+            31,
+            1791318257486,
+            2,
+            1,
+            "opencode2dsh",
+            "space-bunny-free",
+            usage(500, 9000, 80),
+        ));
+        let path = write_log(&dir, "session-live", "session.v4.jsonl.zstd", &events);
+        let after = parse_dsh_file(&path);
+        assert_eq!(after.len(), 3);
+
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!(old.dedup_key, new.dedup_key);
+            assert_eq!(old.timestamp, new.timestamp);
+            assert_eq!(old.tokens, new.tokens);
+            assert_eq!(old.model_id, new.model_id);
+            assert_eq!(old.is_turn_start, new.is_turn_start);
+        }
+        assert_eq!(after[2].timestamp, 1791318257486);
+        assert_eq!(after[2].model_id, "space-bunny-free");
+        assert!(after[2].is_turn_start);
+    }
+
+    #[test]
     fn compaction_summary_is_counted_once_by_its_id() {
         let dir = TempDir::new().unwrap();
         let summary = json!({
