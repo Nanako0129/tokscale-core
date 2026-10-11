@@ -2041,6 +2041,36 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // DSH event logs: one message per completed step. Keys carry no session
+    // id, so a seeded child's copied steps and a migrated session's old log
+    // collapse onto the original step through this per-client set, as they
+    // do in the streaming and count lanes.
+    let dsh_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Dsh)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                path,
+                message_cache::CacheIdentity::for_client(ClientId::Dsh),
+                &source_cache,
+                pricing,
+                sessions::dsh::parse_dsh_file,
+            )
+        })
+        .collect();
+    let mut dsh_seen: HashSet<String> = HashSet::new();
+    for outcome in dsh_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut dsh_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // Parse Qwen files
     let qwen_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Qwen)
@@ -4597,6 +4627,7 @@ where
     );
     simple_lane!(ClientId::Muse, sessions::muse::parse_muse_file);
     simple_lane!(ClientId::Reasonix, sessions::reasonix::parse_reasonix_file);
+    simple_lane!(ClientId::Dsh, sessions::dsh::parse_dsh_file);
     simple_lane!(ClientId::Qwen, sessions::qwen::parse_qwen_file);
     // roo family: fingerprint via from_roo_path so a history-only rewrite of the
     // sibling api_conversation_history.json (which parse_roo_kilo_file reads for
@@ -6630,6 +6661,23 @@ fn parse_local_clients_inner(
     let reasonix_count = summed_parsed_message_count(&reasonix_msgs);
     counts.set(ClientId::Reasonix, reasonix_count);
     messages.extend(reasonix_msgs);
+
+    // DSH event logs: one message per completed step, same dedup as the
+    // materialized and streaming lanes.
+    let dsh_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Dsh)
+        .par_iter()
+        .flat_map(|path| sessions::dsh::parse_dsh_file(path))
+        .collect();
+    let mut dsh_seen: HashSet<String> = HashSet::new();
+    let dsh_msgs: Vec<ParsedMessage> = dsh_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut dsh_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let dsh_count = summed_parsed_message_count(&dsh_msgs);
+    counts.set(ClientId::Dsh, dsh_count);
+    messages.extend(dsh_msgs);
 
     // Parse Qwen JSONL files in parallel
     let qwen_msgs: Vec<ParsedMessage> = scan_result
@@ -23470,6 +23518,157 @@ mod tests {
         .unwrap();
         assert_eq!(counted.counts.get(ClientId::Augment), 2);
         assert_eq!(counted.messages.len(), 2);
+    }
+
+    // ---- DSH: event logs agree across all three lanes ----
+    // A parent, a seeded child that copies the parent's steps, the parent's
+    // pre-format-4 log, and a subagent: every completed step counts once, in
+    // every lane, whichever files carry a copy of it.
+    #[test]
+    #[serial_test::serial]
+    fn test_dsh_lanes_agree_on_seeded_migrated_and_subagent_logs() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = opencode_test_env(cache_home.path(), source_home.path());
+        let project = source_home.path().join(".dsh/sessions/--C-chatbot--");
+        let write_log = |session: &str, name: &str, events: &[serde_json::Value]| {
+            let dir = project.join(session);
+            std::fs::create_dir_all(&dir).unwrap();
+            let jsonl: String = events.iter().map(|e| format!("{e}\n")).collect();
+            std::fs::write(
+                dir.join(name),
+                zstd::encode_all(jsonl.as_bytes(), 3).unwrap(),
+            )
+            .unwrap();
+        };
+        let header = |extra: serde_json::Value| {
+            let mut event = serde_json::json!({
+                "type": "session", "version": 4, "createdAt": 1791661487168i64,
+                "cwd": "C:\\chatbot", "isSeeded": false, "delegationDepth": 0
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                event[key] = value.clone();
+            }
+            event
+        };
+        let step = |seq: i64, time: i64, turn: i64, input: i64, cache_read: i64, output: i64| {
+            serde_json::json!({
+                "type": "assistant/message", "seq": seq, "time": time,
+                "data": {
+                    "turn": turn, "step": 1,
+                    "message": {"source": {"provider": "opencode2dsh",
+                                           "model": "muse-spark-1.3-contributor-free"}},
+                    "usage": {"inputTokens": input, "cacheReadTokens": cache_read,
+                              "outputTokens": output}
+                }
+            })
+        };
+        let parent_steps = [
+            step(16, 1791662639676, 1, 1000, 0, 50),
+            step(24, 1791662658328, 2, 2000, 100, 60),
+        ];
+        let mut parent = vec![header(serde_json::json!({}))];
+        parent.extend(parent_steps.iter().cloned());
+        write_log("session-parent", "session.v4.jsonl.zstd", &parent);
+        // The same steps under the old format's own `seq` numbering.
+        write_log(
+            "session-parent",
+            "session.jsonl.zstd",
+            &[
+                serde_json::json!({"type": "session", "version": 0, "cwd": "C:\\chatbot"}),
+                step(81, 1791662639676, 1, 1000, 0, 50),
+                step(124, 1791662658328, 2, 2000, 100, 60),
+            ],
+        );
+        let mut child = vec![header(serde_json::json!({
+            "isSeeded": true, "inheritedEventCount": 3, "parentSession": "session-parent"
+        }))];
+        child.extend(parent_steps.iter().cloned());
+        child.push(step(50, 1791662882361, 3, 300, 400, 70));
+        write_log("session-child", "session.v4.jsonl.zstd", &child);
+        write_log(
+            "92aab9a4-1111-2222-3333-444455556666",
+            "session.v4.jsonl.zstd",
+            &[
+                header(
+                    serde_json::json!({"delegationDepth": 1, "parentSession": "session-parent"}),
+                ),
+                step(14, 1791613241996, 1, 500, 600, 80),
+            ],
+        );
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["dsh".to_string()];
+
+        let shape = |messages: &[UnifiedMessage]| {
+            let mut shape: Vec<_> = messages
+                .iter()
+                .map(|m| {
+                    (
+                        m.dedup_key.clone(),
+                        m.session_id.clone(),
+                        m.timestamp,
+                        m.tokens.clone(),
+                    )
+                })
+                .collect();
+            shape.sort_by(|a, b| a.0.cmp(&b.0));
+            shape
+        };
+        let stream = || {
+            let mut streamed = Vec::new();
+            scan_messages_streaming(
+                home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_| true,
+                &mut |message| streamed.push(message.clone()),
+            );
+            streamed
+        };
+
+        let materialized = parse_all_messages_with_pricing(home, &clients, None);
+        // Parent's two steps, the child's own step, the subagent's step.
+        assert_eq!(materialized.len(), 4);
+        let total: i64 = materialized.iter().map(|m| m.tokens.total()).sum();
+        assert_eq!(
+            total,
+            (1000 + 50) + (2000 + 100 + 60) + (300 + 400 + 70) + (500 + 600 + 80)
+        );
+        // The inherited steps belong to the parent even though the child's
+        // log sorts first.
+        let mut owners: Vec<_> = materialized.iter().map(|m| m.session_id.as_str()).collect();
+        owners.sort();
+        assert_eq!(
+            owners,
+            [
+                "92aab9a4-1111-2222-3333-444455556666",
+                "session-child",
+                "session-parent",
+                "session-parent",
+            ]
+        );
+
+        assert_eq!(shape(&stream()), shape(&materialized));
+        // Keep working in the parent after the fork: its log becomes a cache
+        // miss while the idle child is a hit, and the streaming lane emits
+        // hits first. Ownership must not flip.
+        parent.push(serde_json::json!({
+            "type": "turn/start", "seq": 30, "time": 1791662700000i64, "data": {"turn": 3}
+        }));
+        write_log("session-parent", "session.v4.jsonl.zstd", &parent);
+        assert_eq!(shape(&stream()), shape(&materialized));
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Dsh), 4);
+        assert_eq!(counted.messages.len(), 4);
     }
 
     // ---- Hindsight: ledger rows across monthly files, three lanes ----

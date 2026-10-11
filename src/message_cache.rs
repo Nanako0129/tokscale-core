@@ -992,6 +992,11 @@ fn parser_version(client: ClientId) -> u32 {
         // cross-session keys). Shared with Pi, Kimchi and Senpi: bump all four
         // together.
         ClientId::Omp => 1,
+        // 1: DSH's event-log parser (`parse_dsh_file`, one message per
+        // completed step). Vendor-local numbering: no upstream DSH parser
+        // exists. DSH is a new client, so no shipped cache holds an older
+        // DSH entry to invalidate.
+        ClientId::Dsh => 1,
         _ => 1,
     }
 }

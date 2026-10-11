@@ -475,6 +475,11 @@ fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
                 "session-*.json" => {
                     file_name.starts_with("session-") && file_name.ends_with(".json")
                 }
+                // DeepSeek Harness event logs: `session.v4.jsonl.zstd`, and
+                // `session.jsonl.zstd` from before format 4.
+                "session*.jsonl.zstd" => {
+                    file_name.starts_with("session") && file_name.ends_with(".jsonl.zstd")
+                }
                 // jcode session snapshots; the `.journal.jsonl` sidecar ends in
                 // `.jsonl` so it is correctly excluded (read as a sibling, not
                 // scanned).
@@ -2398,6 +2403,48 @@ mod tests {
             let name = p.file_name().unwrap().to_str().unwrap();
             name.starts_with("session-") && name.ends_with(".json")
         }));
+    }
+
+    #[test]
+    fn test_scan_directory_dsh_event_log_pattern() {
+        // DSH nests each log one directory down per project and per session;
+        // subagent sessions use a bare-UUID directory name.
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("--C-Users-alice-repo--");
+        for (session, file) in [
+            ("session-a", "session.v4.jsonl.zstd"),
+            ("session-a", "session.jsonl.zstd"),
+            (
+                "92aab9a4-1111-2222-3333-444455556666",
+                "session.v4.jsonl.zstd",
+            ),
+            ("session-b", "session.v4.jsonl"),
+            ("session-b", "notes.jsonl.zstd"),
+        ] {
+            fs::create_dir_all(project.join(session)).unwrap();
+            File::create(project.join(session).join(file)).unwrap();
+        }
+
+        let mut names: Vec<String> =
+            scan_directory(dir.path().to_str().unwrap(), "session*.jsonl.zstd")
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}/{}",
+                        p.parent().unwrap().file_name().unwrap().to_str().unwrap(),
+                        p.file_name().unwrap().to_str().unwrap()
+                    )
+                })
+                .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "92aab9a4-1111-2222-3333-444455556666/session.v4.jsonl.zstd",
+                "session-a/session.jsonl.zstd",
+                "session-a/session.v4.jsonl.zstd",
+            ]
+        );
     }
 
     #[test]
