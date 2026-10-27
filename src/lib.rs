@@ -2420,35 +2420,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         all_messages.extend(crush_messages);
     }
 
-    let antigravity_messages: Vec<UnifiedMessage> = scan_result
-        .get(ClientId::Antigravity)
-        .par_iter()
-        .flat_map(|path| {
-            sessions::antigravity::parse_antigravity_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    all_messages.extend(antigravity_messages);
-
-    let antigravity_cli_messages: Vec<UnifiedMessage> = scan_result
-        .get(ClientId::AntigravityCli)
-        .par_iter()
-        .flat_map(|path| {
-            sessions::antigravity_cli::parse_antigravity_cli_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    all_messages.extend(antigravity_cli_messages);
+    for_each_antigravity_family_message(&scan_result, pricing, |message| {
+        all_messages.push(message)
+    });
 
     // Trae API dump uses exact dollar_float totals, so pricing lookup is not needed.
     let trae_messages: Vec<UnifiedMessage> = scan_result
@@ -2813,6 +2787,110 @@ fn dedup_gate_passes(key: &str, seen: &mut HashSet<String>) -> bool {
     }
     seen.insert(key.to_owned());
     true
+}
+
+/// Rule (b): how the Antigravity family (`antigravity` IDE cache,
+/// `antigravity-cli`, `antigravity-extension`) is deduplicated, identically in
+/// the materialized, streaming and count lanes.
+///
+/// * Within a CLI/extension source a repeat is a message with the same
+///   `session_id:responseId` (a responseId is unique only inside one
+///   conversation; `session_id` is the db file stem). The IDE cache has no
+///   within-source gate.
+/// * Across sources, in the fixed order IDE -> CLI -> extension, a message
+///   whose non-empty bare responseId an EARLIER source already recorded is
+///   dropped; the earlier copy, and its `client`, survives. This deliberately
+///   differs from upstream tokscale #1362 (one family-wide bare-id set), which
+///   would also collapse two independent conversations of one source.
+/// * Ids are recorded as messages are parsed, i.e. before the caller's client
+///   filter and date/report filter, so a copy outside the requested window or
+///   client set still suppresses the later copy. A source that was not
+///   scanned (not in the requested clients, or mtime-pruned) records nothing.
+/// * A missing/empty id is never deduplicated.
+#[derive(Default)]
+struct AntigravityFamilyGate {
+    earlier_sources: HashSet<String>,
+    this_source: HashSet<String>,
+    within_source: HashSet<String>,
+}
+
+impl AntigravityFamilyGate {
+    fn admit(&mut self, message: &UnifiedMessage, within_source_gate: bool) -> bool {
+        let Some(id) = message.dedup_key.as_deref().filter(|key| !key.is_empty()) else {
+            return true;
+        };
+        // The parser already drops repeats inside one db and `session_id` is
+        // the file stem, so this fires only when two scanned files share a
+        // stem (e.g. an extra scan path that overlaps the default root).
+        if within_source_gate
+            && !dedup_gate_passes(
+                &format!("{}:{}", message.session_id, id),
+                &mut self.within_source,
+            )
+        {
+            return false;
+        }
+        if self.earlier_sources.contains(id) {
+            return false;
+        }
+        self.this_source.insert(id.to_owned());
+        true
+    }
+
+    fn finish_source(&mut self) {
+        self.earlier_sources.extend(self.this_source.drain());
+        self.within_source.clear();
+    }
+}
+
+/// Parse the three Antigravity sources in rule (b) order and hand every
+/// surviving message (priced when `pricing` is given) to `visit`, before any
+/// client or date filter.
+fn for_each_antigravity_family_message(
+    scan_result: &scanner::ScanResult,
+    pricing: Option<&pricing::PricingService>,
+    mut visit: impl FnMut(UnifiedMessage),
+) {
+    type Parser = fn(&Path) -> Vec<UnifiedMessage>;
+    let sources: [(ClientId, Parser, bool); 3] = [
+        (
+            ClientId::Antigravity,
+            sessions::antigravity::parse_antigravity_file,
+            false,
+        ),
+        (
+            ClientId::AntigravityCli,
+            sessions::antigravity_cli::parse_antigravity_cli_file,
+            true,
+        ),
+        (
+            ClientId::AntigravityExtension,
+            sessions::antigravity_cli::parse_antigravity_extension_file,
+            true,
+        ),
+    ];
+    let mut gate = AntigravityFamilyGate::default();
+    for (client, parse, within_source_gate) in sources {
+        let parsed: Vec<Vec<UnifiedMessage>> = scan_result
+            .get(client)
+            .par_iter()
+            .map(|path| {
+                // Pricing does not depend on the gate, so it stays parallel;
+                // only the gate runs in order.
+                let mut messages = parse(path);
+                for message in &mut messages {
+                    apply_pricing_if_available(message, pricing);
+                }
+                messages
+            })
+            .collect();
+        for message in parsed.into_iter().flatten() {
+            if gate.admit(&message, within_source_gate) {
+                visit(message);
+            }
+        }
+        gate.finish_source();
+    }
 }
 
 /// Cross-store OpenCode source identity. A migrated SQLite message can carry
@@ -4952,34 +5030,13 @@ where
         }
     }
 
-    // ---- Antigravity CLI (.db protobuf, own dedup set on responseId) ----
-    {
-        let mut antigravity_cli_seen: HashSet<String> = HashSet::new();
-        for path in scan_result.get(ClientId::AntigravityCli) {
-            for mut m in sessions::antigravity_cli::parse_antigravity_cli_file(path) {
-                apply_pricing_if_available(&mut m, pricing);
-                if !passes_client(&m) {
-                    continue;
-                }
-                // A responseId is unique only within a conversation DB (the
-                // parser already drops repeats per-file), so namespace the
-                // cross-file gate by session to avoid collapsing two independent
-                // conversations that happen to reuse a responseId. Upstream has
-                // no cross-file gate here at all; this keeps the streaming lane's
-                // numbers identical to it while staying collision-proof.
-                let keep = m.dedup_key.as_ref().is_none_or(|k| {
-                    k.is_empty()
-                        || dedup_gate_passes(
-                            &format!("{}:{}", m.session_id, k),
-                            &mut antigravity_cli_seen,
-                        )
-                });
-                if keep && filter(&m) {
-                    sink(&m);
-                }
-            }
+    // ---- Antigravity family: IDE cache -> CLI -> extension, rule (b) ----
+    // IDE first: an earlier source's copy is the one that survives.
+    for_each_antigravity_family_message(&scan_result, pricing, |m| {
+        if passes_client(&m) && filter(&m) {
+            sink(&m);
         }
-    }
+    });
 
     // ---- gjc (gajae-code) JSONL with cost provenance ----
     // Route every message through the shared pricing policy. Provider-reported
@@ -5077,23 +5134,6 @@ where
             apply_pricing_if_available(&mut m, pricing);
             if passes_client(&m) && filter(&m) {
                 sink(&m);
-            }
-        }
-    }
-
-    // ---- Antigravity ----
-    {
-        let parsed: Vec<Vec<UnifiedMessage>> = scan_result
-            .get(ClientId::Antigravity)
-            .par_iter()
-            .map(|path| sessions::antigravity::parse_antigravity_file(path))
-            .collect();
-        for msgs in parsed {
-            for mut m in msgs {
-                apply_pricing_if_available(&mut m, pricing);
-                if passes_client(&m) && filter(&m) {
-                    sink(&m);
-                }
             }
         }
     }
@@ -5760,7 +5800,7 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     dbs.extend(scan_result.hermes_db_paths());
     dbs.extend(scan_result.zed_db_paths());
     dbs.extend(scan_result.crush_dbs.iter().map(|c| c.db_path.clone()));
-    // Antigravity CLI conversation `.db` files arrive via the generic `files`
+    // Antigravity CLI and extension conversation `.db` files arrive via the generic `files`
     // lane (a `*.db` glob, no dedicated ScanResult field), so probe their `-wal`
     // sidecars here too — a WAL-only write would otherwise leave the change
     // token unchanged and the live tail would never re-parse the new usage.
@@ -5770,6 +5810,12 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     // keeps such a db unpruned, but a WAL-only write there does not move the
     // token (a gap older than the pruning).
     dbs.extend(scan_result.get(ClientId::AntigravityCli).iter().cloned());
+    dbs.extend(
+        scan_result
+            .get(ClientId::AntigravityExtension)
+            .iter()
+            .cloned(),
+    );
     // micode `.db` files likewise arrive via the generic `*.db` glob and are
     // WAL-mode SQLite, so probe their `-wal` sidecars for the live-tail change
     // token too.
@@ -5879,9 +5925,15 @@ fn local_source_change_token_inner(scan_result: &scanner::ScanResult) -> Result<
             .iter()
             .map(|source| source.db_path.clone()),
     );
-    // Antigravity CLI: the same `<path>-wal` as `latest_source_mtime_ms_from_scan`
+    // Antigravity CLI and extension: the same `<path>-wal` as `latest_source_mtime_ms_from_scan`
     // and the retain in `prune_scan_result_by_mtime`; keep the three in lockstep.
     dbs.extend(scan_result.get(ClientId::AntigravityCli).iter().cloned());
+    dbs.extend(
+        scan_result
+            .get(ClientId::AntigravityExtension)
+            .iter()
+            .cloned(),
+    );
     dbs.extend(scan_result.get(ClientId::MiMoCode).iter().cloned());
     for db in dbs {
         paths.push(db.clone());
@@ -6109,12 +6161,17 @@ fn grok_source_mtime_ms(source_path: &Path) -> Option<u64> {
 /// Kiro file sources, Grok sources, and Antigravity CLI dbs can still be
 /// bounded by folding every parser dependency into their newest mtime.
 ///
-/// Antigravity CLI: the db and its `-wal` (see `antigravity_cli_db_mtime_ms`).
+/// Antigravity CLI and extension: the db and its `-wal` (see
+/// `antigravity_cli_db_mtime_ms`). Pruning interacts with rule (b)
+/// (`AntigravityFamilyGate`): an older IDE/CLI copy of a response can be pruned
+/// while the extension db that holds the same response id stays, in which case
+/// the extension copy is the one counted in a pruned window (the same
+/// request-set dependence as an unrequested earlier source).
 /// SQLite appends a write to `-wal` in WAL mode and rewrites the db in rollback
 /// mode, and every timestamp the parser yields is written by agy or is the db
 /// mtime, so a db older than the threshold holds nothing dated after it. That
-/// bounds `parse_local_clients`, which parses each db on its own; the streaming
-/// lane's cross-file responseId gate is not covered by this argument. The
+/// bounds what each db contributes on its own; which copy of a response the
+/// rule (b) gate keeps under pruning is the dependence described above. The
 /// real-data check (APFS) exercised dbs whose own mtime moved; a write held
 /// only in `-wal` is covered by the hermetic WAL-frame test. Every db stays
 /// unpruned on Windows, where NTFS mtime behaviour has not been measured.
@@ -6154,7 +6211,9 @@ fn prune_scan_result_by_mtime(scan_result: &mut scanner::ScanResult, threshold_m
         if db_lanes.contains(&lane) {
             continue;
         }
-        if lane == ClientId::AntigravityCli as usize {
+        if lane == ClientId::AntigravityCli as usize
+            || lane == ClientId::AntigravityExtension as usize
+        {
             if cfg!(windows) {
                 continue; // unmeasured on NTFS; see the doc comment
             }
@@ -6913,33 +6972,31 @@ fn parse_local_clients_inner(
     counts.set(ClientId::Crush, crush_count);
     messages.extend(crush_msgs);
 
-    let antigravity_msgs: Vec<ParsedMessage> = scan_result
-        .get(ClientId::Antigravity)
-        .par_iter()
-        .flat_map(|path| {
-            sessions::antigravity::parse_antigravity_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    let antigravity_count = antigravity_msgs.len() as i32;
-    counts.set(ClientId::Antigravity, antigravity_count);
+    let (mut antigravity_msgs, mut antigravity_cli_msgs, mut antigravity_extension_msgs) =
+        (Vec::new(), Vec::new(), Vec::new());
+    for_each_antigravity_family_message(&scan_result, None, |message| {
+        let lane = match message.client.as_str() {
+            "antigravity-cli" => &mut antigravity_cli_msgs,
+            "antigravity-extension" => &mut antigravity_extension_msgs,
+            _ => &mut antigravity_msgs,
+        };
+        lane.push(unified_to_parsed(&message));
+    });
+    counts.set(
+        ClientId::Antigravity,
+        summed_parsed_message_count(&antigravity_msgs),
+    );
+    counts.set(
+        ClientId::AntigravityCli,
+        summed_parsed_message_count(&antigravity_cli_msgs),
+    );
+    counts.set(
+        ClientId::AntigravityExtension,
+        summed_parsed_message_count(&antigravity_extension_msgs),
+    );
     messages.extend(antigravity_msgs);
-
-    let antigravity_cli_msgs: Vec<ParsedMessage> = scan_result
-        .get(ClientId::AntigravityCli)
-        .par_iter()
-        .flat_map(|path| {
-            sessions::antigravity_cli::parse_antigravity_cli_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    let antigravity_cli_count = summed_parsed_message_count(&antigravity_cli_msgs);
-    counts.set(ClientId::AntigravityCli, antigravity_cli_count);
     messages.extend(antigravity_cli_msgs);
+    messages.extend(antigravity_extension_msgs);
 
     let trae_msgs: Vec<ParsedMessage> = {
         let unique_trae_messages = dedupe_latest_trae_messages(
@@ -18074,8 +18131,46 @@ mod tests {
         }
     }
 
+    /// Add a `steps` row dating `response_id`'s generation at `seconds`
+    /// (steps.metadata = {#1: {#1: seconds}, #9: {#11: responseId}}).
+    fn add_antigravity_step_time(
+        conversations_dir: &std::path::Path,
+        file_stem: &str,
+        response_id: &str,
+        seconds: u64,
+    ) {
+        let mut ts = vec![0x08];
+        let mut v = seconds;
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            ts.push(if v == 0 { byte } else { byte | 0x80 });
+            if v == 0 {
+                break;
+            }
+        }
+        let resp = response_id.as_bytes();
+        let mut m9 = vec![(11 << 3) | 2, resp.len() as u8];
+        m9.extend_from_slice(resp);
+        let mut metadata = vec![(1 << 3) | 2, ts.len() as u8];
+        metadata.extend(ts);
+        metadata.extend([(9 << 3) | 2, m9.len() as u8]);
+        metadata.extend(m9);
+        let conn =
+            rusqlite::Connection::open(conversations_dir.join(format!("{file_stem}.db"))).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx integer, step_type integer, metadata blob);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            rusqlite::params![metadata],
+        )
+        .unwrap();
+    }
+
     // The `steps` turn time must date the row identically on the materialized,
-    // streaming and count lanes; each lane calls the parser on its own.
+    // streaming and count lanes; each lane calls the parser on its own. The
+    // extension db goes through the same lanes and the same parser, and its rows
+    // keep the `antigravity-extension` client.
     #[test]
     #[serial_test::serial]
     fn test_antigravity_cli_three_lanes_parity_with_step_timestamp() {
@@ -18089,71 +18184,344 @@ mod tests {
         let conv_dir = source_home
             .path()
             .join(".gemini/antigravity-cli/conversations");
-        write_antigravity_cli_db(&conv_dir, "conv-parity", "resp-parity-1");
-
-        // steps.metadata = {#1: {#1: seconds}, #9: {#11: responseId}}
+        let ext_dir = source_home.path().join(".gemini/antigravity/conversations");
         let step_seconds: u64 = 1_789_200_000;
-        let mut ts = vec![0x08];
-        let mut v = step_seconds;
-        loop {
-            let byte = (v & 0x7f) as u8;
-            v >>= 7;
-            ts.push(if v == 0 { byte } else { byte | 0x80 });
-            if v == 0 {
-                break;
-            }
-        }
-        let resp = b"resp-parity-1";
-        let mut m9 = vec![(11 << 3) | 2, resp.len() as u8];
-        m9.extend_from_slice(resp);
-        let mut metadata = vec![(1 << 3) | 2, ts.len() as u8];
-        metadata.extend(ts);
-        metadata.extend([(9 << 3) | 2, m9.len() as u8]);
-        metadata.extend(m9);
-        let conn = rusqlite::Connection::open(conv_dir.join("conv-parity.db")).unwrap();
-        conn.execute_batch("CREATE TABLE steps (idx integer, step_type integer, metadata blob);")
-            .unwrap();
-        conn.execute(
-            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
-            rusqlite::params![metadata],
-        )
-        .unwrap();
-        drop(conn);
+        write_antigravity_cli_db(&conv_dir, "conv-parity", "resp-parity-1");
+        add_antigravity_step_time(&conv_dir, "conv-parity", "resp-parity-1", step_seconds);
+        write_antigravity_cli_db(&ext_dir, "ext-parity", "resp-parity-2");
+        add_antigravity_step_time(&ext_dir, "ext-parity", "resp-parity-2", step_seconds);
         let expected_ts = step_seconds as i64 * 1000;
+        let clients = vec![
+            "antigravity-cli".to_string(),
+            "antigravity-extension".to_string(),
+        ];
+        let sorted_clients_ts = |rows: Vec<(String, i64)>| {
+            let mut rows = rows;
+            rows.sort();
+            rows
+        };
+        let expected = vec![
+            ("antigravity-cli".to_string(), expected_ts),
+            ("antigravity-extension".to_string(), expected_ts),
+        ];
 
         let mat_messages = parse_all_messages_with_pricing_with_env_strategy(
             source_home.path().to_str().unwrap(),
-            &["antigravity-cli".to_string()],
+            &clients,
             None,
             false,
             &scanner::ScannerSettings::default(),
             None,
         );
-        assert_eq!(mat_messages.len(), 1);
-        assert_eq!(mat_messages[0].timestamp, expected_ts);
+        assert_eq!(
+            sorted_clients_ts(
+                mat_messages
+                    .iter()
+                    .map(|m| (m.client.clone(), m.timestamp))
+                    .collect()
+            ),
+            expected
+        );
 
         let mut stream_messages = Vec::new();
         scan_messages_streaming(
             source_home.path().to_str().unwrap(),
-            &["antigravity-cli".to_string()],
+            &clients,
             None,
             false,
             &scanner::ScannerSettings::default(),
             &|_m: &UnifiedMessage| true,
-            &mut |m: &UnifiedMessage| stream_messages.push(m.clone()),
+            &mut |m: &UnifiedMessage| stream_messages.push((m.client.clone(), m.timestamp)),
         );
-        assert_eq!(stream_messages.len(), 1);
-        assert_eq!(stream_messages[0].timestamp, expected_ts);
+        assert_eq!(sorted_clients_ts(stream_messages), expected);
 
         let count_result = parse_local_clients(LocalParseOptions {
             home_dir: Some(source_home.path().to_string_lossy().to_string()),
-            clients: Some(vec!["antigravity-cli".to_string()]),
+            clients: Some(clients.clone()),
             use_env_roots: false,
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(count_result.messages.len(), 1);
-        assert_eq!(count_result.messages[0].timestamp, expected_ts);
+        assert_eq!(
+            sorted_clients_ts(
+                count_result
+                    .messages
+                    .iter()
+                    .map(|m| (m.client.clone(), m.timestamp))
+                    .collect()
+            ),
+            expected
+        );
+    }
+
+    /// Per-client `(messages, input tokens)` of one request through all three
+    /// lanes, with an optional `since` date (`YYYY-MM-DD`, inclusive) applied by
+    /// each lane's own date filter. Asserts the lanes agree and returns the
+    /// totals. Fixture dbs carry 500 input tokens, IDE rows 100.
+    fn antigravity_family_lane_totals(
+        home: &std::path::Path,
+        clients: &[&str],
+        since: Option<&str>,
+    ) -> std::collections::BTreeMap<String, (i64, i64)> {
+        use std::collections::BTreeMap;
+        let clients: Vec<String> = clients.iter().map(|c| c.to_string()).collect();
+        let tally = |rows: Vec<(String, String, i64)>| {
+            let mut totals: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+            for (client, date, input) in rows {
+                if since.is_some_and(|since| date.as_str() < since) {
+                    continue;
+                }
+                let entry = totals.entry(client).or_default();
+                entry.0 += 1;
+                entry.1 += input;
+            }
+            totals
+        };
+
+        let materialized = tally(
+            parse_all_messages_with_pricing_with_env_strategy(
+                home.to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                None,
+            )
+            .into_iter()
+            .map(|m| (m.client, m.date, m.tokens.input))
+            .collect(),
+        );
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            home.to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|m: &UnifiedMessage| since.is_none_or(|since| m.date.as_str() >= since),
+            &mut |m: &UnifiedMessage| {
+                streamed.push((m.client.clone(), m.date.clone(), m.tokens.input))
+            },
+        );
+        let streaming = tally(streamed);
+
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string_lossy().to_string()),
+            clients: Some(clients.clone()),
+            use_env_roots: false,
+            since: since.map(str::to_string),
+            ..Default::default()
+        })
+        .unwrap();
+        let count_lane = tally(
+            counted
+                .messages
+                .iter()
+                .map(|m| (m.client.clone(), m.date.clone(), m.input))
+                .collect(),
+        );
+        // The count lane's per-client counters come from the same gated list.
+        if since.is_none() {
+            for client in AGX_ALL {
+                let id = ClientId::from_str(client).unwrap();
+                let expected = count_lane.get(client).map_or(0, |(n, _)| *n as i32);
+                if clients.iter().any(|c| c == client) {
+                    assert_eq!(counted.counts.get(id), expected, "{client} count");
+                }
+            }
+        }
+
+        assert_eq!(materialized, streaming, "materialized vs streaming");
+        assert_eq!(materialized, count_lane, "materialized vs count lane");
+        materialized
+    }
+
+    /// Fixture rows of the Antigravity family: `(source, file stem, responseId,
+    /// date)`. IDE rows are jsonl lines under the config dir, CLI and extension
+    /// rows are conversation dbs; a `None` date means "no steps row".
+    fn write_antigravity_family_fixture(
+        home: &std::path::Path,
+        rows: &[(&str, &str, &str, Option<u64>)],
+    ) {
+        for (source, stem, response_id, seconds) in rows {
+            match *source {
+                "ide" => {
+                    let dir = ClientId::Antigravity
+                        .data()
+                        .resolve_path_with_env_strategy(home.to_str().unwrap(), false);
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let id_field = if response_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(r#","responseId":"{response_id}""#)
+                    };
+                    let ms = seconds.unwrap_or(1_789_200_000) * 1000;
+                    std::fs::write(
+                        dir.join(format!("{stem}.jsonl")),
+                        format!(
+                            r#"{{"type":"usage","sessionId":"{stem}","modelId":"gemini-3-flash-a","timestamp":{ms},"input":100,"output":10{id_field}}}"#
+                        ) + "\n",
+                    )
+                    .unwrap();
+                }
+                source => {
+                    let dir = home.join(match source {
+                        "cli" => ".gemini/antigravity-cli/conversations",
+                        "ext" => ".gemini/antigravity/conversations",
+                        other => panic!("unknown source {other}"),
+                    });
+                    write_antigravity_cli_db(&dir, stem, response_id);
+                    if let Some(seconds) = seconds {
+                        add_antigravity_step_time(&dir, stem, response_id, *seconds);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2026-08-01 12:00 UTC and 2026-09-15 12:00 UTC (noon: the local date is the
+    // same in every timezone).
+    const AGX_AUG: u64 = 1_785_585_600;
+    const AGX_SEP: u64 = 1_789_473_600;
+    const AGX_ALL: [&str; 3] = ["antigravity", "antigravity-cli", "antigravity-extension"];
+
+    fn agx_totals(entries: &[(&str, i64, i64)]) -> std::collections::BTreeMap<String, (i64, i64)> {
+        entries
+            .iter()
+            .map(|(client, n, input)| (client.to_string(), (*n, *input)))
+            .collect()
+    }
+
+    fn agx_env(cache_home: &tempfile::TempDir) -> EnvGuard {
+        EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ])
+    }
+
+    // Rule (b), cases (i)-(v): each through all three lanes with equal totals,
+    // asserting which copy (client) survives.
+    #[test]
+    #[serial_test::serial]
+    fn test_antigravity_family_rule_b_cross_source_cases() {
+        type Row = (&'static str, &'static str, &'static str, Option<u64>);
+        type Case = (
+            &'static str,
+            &'static [Row],
+            &'static [(&'static str, i64, i64)],
+        );
+        let cases: &[Case] = &[
+            (
+                "(i) IDE + CLI same id: IDE kept, CLI dropped",
+                &[("ide", "ide-1", "R1", None), ("cli", "cli-1", "R1", None)],
+                &[("antigravity", 1, 100)],
+            ),
+            (
+                "(ii) two CLI + extension same id: both CLI kept, extension dropped",
+                &[
+                    ("cli", "cli-a", "R1", None),
+                    ("cli", "cli-b", "R1", None),
+                    ("ext", "ext-1", "R1", None),
+                ],
+                &[("antigravity-cli", 2, 1000)],
+            ),
+            (
+                "(iii) IDE + extension same id: IDE kept",
+                &[("ide", "ide-1", "R1", None), ("ext", "ext-1", "R1", None)],
+                &[("antigravity", 1, 100)],
+            ),
+            (
+                "(iii') CLI + extension same id: CLI kept",
+                &[("cli", "cli-1", "R1", None), ("ext", "ext-1", "R1", None)],
+                &[("antigravity-cli", 1, 500)],
+            ),
+            (
+                "(iv) distinct ids: all kept",
+                &[
+                    ("ide", "ide-1", "R1", None),
+                    ("cli", "cli-1", "R2", None),
+                    ("ext", "ext-1", "R3", None),
+                    ("ext", "ext-2", "R4", None),
+                ],
+                &[
+                    ("antigravity", 1, 100),
+                    ("antigravity-cli", 1, 500),
+                    ("antigravity-extension", 2, 1000),
+                ],
+            ),
+            (
+                "(v) missing id: never deduplicated",
+                &[
+                    ("ide", "ide-1", "", None),
+                    ("cli", "cli-1", "", None),
+                    ("cli", "cli-2", "", None),
+                    ("ext", "ext-1", "", None),
+                    ("ext", "ext-2", "", None),
+                ],
+                &[
+                    ("antigravity", 1, 100),
+                    ("antigravity-cli", 2, 1000),
+                    ("antigravity-extension", 2, 1000),
+                ],
+            ),
+            (
+                "same-source collision across conversations: both kept",
+                &[("ext", "ext-1", "R1", None), ("ext", "ext-2", "R1", None)],
+                &[("antigravity-extension", 2, 1000)],
+            ),
+        ];
+        for (label, rows, expected) in cases {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = agx_env(&cache_home);
+            write_antigravity_family_fixture(source_home.path(), rows);
+            let totals = antigravity_family_lane_totals(source_home.path(), &AGX_ALL, None);
+            assert_eq!(totals, agx_totals(expected), "{label}");
+        }
+    }
+
+    // Case (vi): the cross-source set is filled before the client and date
+    // filters (rule (b) section 3), and an unrequested earlier source cannot
+    // gate (section 4). CLI copy dated August, extension copy dated September.
+    #[test]
+    #[serial_test::serial]
+    fn test_antigravity_family_rule_b_request_set_and_date_window() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = agx_env(&cache_home);
+        write_antigravity_family_fixture(
+            source_home.path(),
+            &[
+                ("cli", "cli-1", "R1", Some(AGX_AUG)),
+                ("ext", "ext-1", "R1", Some(AGX_SEP)),
+            ],
+        );
+        let home = source_home.path();
+
+        // No window: CLI (earlier) survives.
+        assert_eq!(
+            antigravity_family_lane_totals(home, &AGX_ALL, None),
+            agx_totals(&[("antigravity-cli", 1, 500)])
+        );
+        // September window: the August CLI copy is outside it but still gates,
+        // so the in-window extension copy is dropped and nothing is counted.
+        assert_eq!(
+            antigravity_family_lane_totals(home, &AGX_ALL, Some("2026-09-01")),
+            agx_totals(&[])
+        );
+        // Extension-only request: the CLI db is not scanned, cannot gate, and
+        // the extension copy counts (documented request-set dependence).
+        assert_eq!(
+            antigravity_family_lane_totals(home, &["antigravity-extension"], Some("2026-09-01")),
+            agx_totals(&[("antigravity-extension", 1, 500)])
+        );
+        // CLI-only request in the September window: nothing in the window.
+        assert_eq!(
+            antigravity_family_lane_totals(home, &["antigravity-cli"], Some("2026-09-01")),
+            agx_totals(&[])
+        );
     }
 
     // jcode (`~/.jcode/sessions/session_*.json`) must be discovered by the
