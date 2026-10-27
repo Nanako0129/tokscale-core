@@ -1,8 +1,10 @@
-//! Antigravity CLI session parser
+//! Antigravity generation database parser
 //!
 //! The Antigravity CLI (the terminal agent, distinct from the Antigravity IDE)
 //! stores each conversation as a SQLite database under
-//! `~/.gemini/antigravity-cli/conversations/<uuid>.db`. Unlike the IDE-backed
+//! `~/.gemini/antigravity-cli/conversations/<uuid>.db`; IDE extensions write the
+//! same format under `~/.gemini/antigravity/conversations/<uuid>.db`, parsed
+//! here for the `antigravity-extension` client. Unlike the IDE-backed
 //! [`super::antigravity`] source — which depends on a *running* language server
 //! reachable over RPC and caches JSONL under the config dir — the CLI usage is
 //! already on disk and can be read directly. No RPC, no `antigravity sync`.
@@ -70,7 +72,7 @@ fn parse_antigravity_db_file(path: &Path, client: &'static str) -> Vec<UnifiedMe
 
     let mut stmt = match conn.prepare("SELECT idx, data FROM gen_metadata ORDER BY idx") {
         Ok(stmt) => stmt,
-        // Not an Antigravity CLI database (table missing) — nothing to count.
+        // Not an Antigravity generation database (table missing) — nothing to count.
         Err(_) => return Vec::new(),
     };
     let rows = match stmt.query_map([], |row| {

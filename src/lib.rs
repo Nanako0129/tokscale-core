@@ -2420,7 +2420,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         all_messages.extend(crush_messages);
     }
 
-    for_each_antigravity_family_message(&scan_result, pricing, |message| {
+    for_each_antigravity_family_message(&scan_result, pricing, |_, message| {
         all_messages.push(message)
     });
 
@@ -2794,9 +2794,11 @@ fn dedup_gate_passes(key: &str, seen: &mut HashSet<String>) -> bool {
 /// the materialized, streaming and count lanes.
 ///
 /// * Within a CLI/extension source a repeat is a message with the same
-///   `session_id:responseId` (a responseId is unique only inside one
-///   conversation; `session_id` is the db file stem). The IDE cache has no
-///   within-source gate.
+///   `session_id:responseId` (`session_id` is the db file stem), so two
+///   conversations of one source that reuse an id both count, as the fork did
+///   before. The IDE cache has no within-source gate.
+/// * Across sources the bare id is treated as one response. Measured on one
+///   Mac's 1157 CLI response ids: none appeared in two conversations.
 /// * Across sources, in the fixed order IDE -> CLI -> extension, a message
 ///   whose non-empty bare responseId an EARLIER source already recorded is
 ///   dropped; the earlier copy, and its `client`, survives. This deliberately
@@ -2806,6 +2808,9 @@ fn dedup_gate_passes(key: &str, seen: &mut HashSet<String>) -> bool {
 ///   filter and date/report filter, so a copy outside the requested window or
 ///   client set still suppresses the later copy. A source that was not
 ///   scanned (not in the requested clients, or mtime-pruned) records nothing.
+///   A source that was scanned but not requested (e.g. a request that also
+///   names `synthetic` scans every client) still suppresses the later copy,
+///   and the client filter then drops both: request the whole family.
 /// * A missing/empty id is never deduplicated.
 #[derive(Default)]
 struct AntigravityFamilyGate {
@@ -2844,12 +2849,12 @@ impl AntigravityFamilyGate {
 }
 
 /// Parse the three Antigravity sources in rule (b) order and hand every
-/// surviving message (priced when `pricing` is given) to `visit`, before any
-/// client or date filter.
+/// surviving message (priced when `pricing` is given), with the source it was
+/// scanned from, to `visit`, before any client or date filter.
 fn for_each_antigravity_family_message(
     scan_result: &scanner::ScanResult,
     pricing: Option<&pricing::PricingService>,
-    mut visit: impl FnMut(UnifiedMessage),
+    mut visit: impl FnMut(ClientId, UnifiedMessage),
 ) {
     type Parser = fn(&Path) -> Vec<UnifiedMessage>;
     let sources: [(ClientId, Parser, bool); 3] = [
@@ -2886,7 +2891,7 @@ fn for_each_antigravity_family_message(
             .collect();
         for message in parsed.into_iter().flatten() {
             if gate.admit(&message, within_source_gate) {
-                visit(message);
+                visit(client, message);
             }
         }
         gate.finish_source();
@@ -5032,7 +5037,7 @@ where
 
     // ---- Antigravity family: IDE cache -> CLI -> extension, rule (b) ----
     // IDE first: an earlier source's copy is the one that survives.
-    for_each_antigravity_family_message(&scan_result, pricing, |m| {
+    for_each_antigravity_family_message(&scan_result, pricing, |_, m| {
         if passes_client(&m) && filter(&m) {
             sink(&m);
         }
@@ -6974,26 +6979,22 @@ fn parse_local_clients_inner(
 
     let (mut antigravity_msgs, mut antigravity_cli_msgs, mut antigravity_extension_msgs) =
         (Vec::new(), Vec::new(), Vec::new());
-    for_each_antigravity_family_message(&scan_result, None, |message| {
-        let lane = match message.client.as_str() {
-            "antigravity-cli" => &mut antigravity_cli_msgs,
-            "antigravity-extension" => &mut antigravity_extension_msgs,
+    for_each_antigravity_family_message(&scan_result, None, |client, message| {
+        // `client` is the source the helper scanned, one of these three.
+        let source = match client {
+            ClientId::AntigravityCli => &mut antigravity_cli_msgs,
+            ClientId::AntigravityExtension => &mut antigravity_extension_msgs,
             _ => &mut antigravity_msgs,
         };
-        lane.push(unified_to_parsed(&message));
+        source.push(unified_to_parsed(&message));
     });
-    counts.set(
-        ClientId::Antigravity,
-        summed_parsed_message_count(&antigravity_msgs),
-    );
-    counts.set(
-        ClientId::AntigravityCli,
-        summed_parsed_message_count(&antigravity_cli_msgs),
-    );
-    counts.set(
-        ClientId::AntigravityExtension,
-        summed_parsed_message_count(&antigravity_extension_msgs),
-    );
+    for (client, source) in [
+        (ClientId::Antigravity, &antigravity_msgs),
+        (ClientId::AntigravityCli, &antigravity_cli_msgs),
+        (ClientId::AntigravityExtension, &antigravity_extension_msgs),
+    ] {
+        counts.set(client, summed_parsed_message_count(source));
+    }
     messages.extend(antigravity_msgs);
     messages.extend(antigravity_cli_msgs);
     messages.extend(antigravity_extension_msgs);
@@ -18255,9 +18256,10 @@ mod tests {
     }
 
     /// Per-client `(messages, input tokens)` of one request through all three
-    /// lanes, with an optional `since` date (`YYYY-MM-DD`, inclusive) applied by
-    /// each lane's own date filter. Asserts the lanes agree and returns the
-    /// totals. Fixture dbs carry 500 input tokens, IDE rows 100.
+    /// lanes, with an optional `since` date (`YYYY-MM-DD`, inclusive): the
+    /// streaming and count lanes apply it through their own date filter, the
+    /// materialized lane through `tally` here, after the gate. Asserts the
+    /// lanes agree and returns the totals. Fixture dbs carry 500 input tokens, IDE rows 100.
     fn antigravity_family_lane_totals(
         home: &std::path::Path,
         clients: &[&str],
@@ -18381,8 +18383,9 @@ mod tests {
         }
     }
 
-    // 2026-08-01 12:00 UTC and 2026-09-15 12:00 UTC (noon: the local date is the
-    // same in every timezone).
+    // 2026-08-01 12:00 UTC and 2026-09-15 12:00 UTC. Noon keeps the local date
+    // from UTC-11 to UTC+11; the test's windows are months apart, so the
+    // outcome holds in every timezone.
     const AGX_AUG: u64 = 1_785_585_600;
     const AGX_SEP: u64 = 1_789_473_600;
     const AGX_ALL: [&str; 3] = ["antigravity", "antigravity-cli", "antigravity-extension"];
