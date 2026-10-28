@@ -2811,7 +2811,8 @@ fn dedup_gate_passes(key: &str, seen: &mut HashSet<String>) -> bool {
 ///   scanned (not in the requested clients, or mtime-pruned) records nothing.
 ///   A source that was scanned but not requested (e.g. a request that also
 ///   names `synthetic` scans every client) still suppresses the later copy,
-///   and the client filter then drops both: request the whole family.
+///   and the client filter then drops the earlier one: no message row
+///   survives. Request the whole family.
 /// * A missing/empty id is never deduplicated.
 #[derive(Default)]
 struct AntigravityFamilyGate {
@@ -6979,15 +6980,11 @@ fn parse_local_clients_inner(
     messages.extend(crush_msgs);
 
     // The helper visits IDE, CLI, extension in order and passes the source it
-    // scanned; count per source the way `summed_parsed_message_count` does.
+    // scanned; each message adds to that source's count.
     for_each_antigravity_family_message(&scan_result, None, |client, message| {
         let parsed = unified_to_parsed(&message);
-        counts.set(
-            client,
-            counts
-                .get(client)
-                .saturating_add(parsed.message_count.max(0)),
-        );
+        let added = summed_parsed_message_count(std::slice::from_ref(&parsed));
+        counts.set(client, counts.get(client).saturating_add(added));
         messages.push(parsed);
     });
 
@@ -18520,8 +18517,10 @@ mod tests {
             agx_totals(&[])
         );
         // `synthetic` makes the scanner read every client, so the unrequested
-        // CLI db is scanned and gates the extension copy, which the client
-        // filter keeps alone; the CLI copy is filtered out: counted zero times.
+        // CLI db is scanned and gates the extension copy, and the client filter
+        // drops the CLI copy: no message row survives. (The count lane's
+        // per-client counters are taken before the client filter and still
+        // show the CLI copy; the helper checks requested clients only.)
         assert_eq!(
             antigravity_family_lane_totals(home, &["antigravity-extension", "synthetic"], None),
             agx_totals(&[])
