@@ -2797,8 +2797,9 @@ fn dedup_gate_passes(key: &str, seen: &mut HashSet<String>) -> bool {
 ///   `session_id:responseId` (`session_id` is the db file stem), so two
 ///   conversations of one source that reuse an id both count, as the fork did
 ///   before. The IDE cache has no within-source gate.
-/// * Across sources the bare id is treated as one response. Measured on one
-///   Mac's 1157 CLI response ids: none appeared in two conversations.
+/// * Across sources the bare id is treated as one response. Only the CLI side
+///   was measured (one Mac, 2026-10-28: none of 1157 CLI response ids appeared
+///   in two conversations); cross-source id collisions are not measured.
 /// * Across sources, in the fixed order IDE -> CLI -> extension, a message
 ///   whose non-empty bare responseId an EARLIER source already recorded is
 ///   dropped; the earlier copy, and its `client`, survives. This deliberately
@@ -6977,27 +6978,18 @@ fn parse_local_clients_inner(
     counts.set(ClientId::Crush, crush_count);
     messages.extend(crush_msgs);
 
-    let (mut antigravity_msgs, mut antigravity_cli_msgs, mut antigravity_extension_msgs) =
-        (Vec::new(), Vec::new(), Vec::new());
+    // The helper visits IDE, CLI, extension in order and passes the source it
+    // scanned; count per source the way `summed_parsed_message_count` does.
     for_each_antigravity_family_message(&scan_result, None, |client, message| {
-        // `client` is the source the helper scanned, one of these three.
-        let source = match client {
-            ClientId::AntigravityCli => &mut antigravity_cli_msgs,
-            ClientId::AntigravityExtension => &mut antigravity_extension_msgs,
-            _ => &mut antigravity_msgs,
-        };
-        source.push(unified_to_parsed(&message));
+        let parsed = unified_to_parsed(&message);
+        counts.set(
+            client,
+            counts
+                .get(client)
+                .saturating_add(parsed.message_count.max(0)),
+        );
+        messages.push(parsed);
     });
-    for (client, source) in [
-        (ClientId::Antigravity, &antigravity_msgs),
-        (ClientId::AntigravityCli, &antigravity_cli_msgs),
-        (ClientId::AntigravityExtension, &antigravity_extension_msgs),
-    ] {
-        counts.set(client, summed_parsed_message_count(source));
-    }
-    messages.extend(antigravity_msgs);
-    messages.extend(antigravity_cli_msgs);
-    messages.extend(antigravity_extension_msgs);
 
     let trae_msgs: Vec<ParsedMessage> = {
         let unique_trae_messages = dedupe_latest_trae_messages(
@@ -18256,9 +18248,9 @@ mod tests {
     }
 
     /// Per-client `(messages, input tokens)` of one request through all three
-    /// lanes, with an optional `since` date (`YYYY-MM-DD`, inclusive): the
-    /// streaming and count lanes apply it through their own date filter, the
-    /// materialized lane through `tally` here, after the gate. Asserts the
+    /// lanes, with an optional `since` date (`YYYY-MM-DD`, inclusive). `tally`
+    /// here applies `since` to every lane's rows after the gate, so this checks
+    /// the gate's window behavior, not each lane's own date filter. Asserts the
     /// lanes agree and returns the totals. Fixture dbs carry 500 input tokens, IDE rows 100.
     fn antigravity_family_lane_totals(
         home: &std::path::Path,
@@ -18384,7 +18376,7 @@ mod tests {
     }
 
     // 2026-08-01 12:00 UTC and 2026-09-15 12:00 UTC. Noon keeps the local date
-    // from UTC-11 to UTC+11; the test's windows are months apart, so the
+    // from UTC-12 to UTC+11; the test's windows are months apart, so the
     // outcome holds in every timezone.
     const AGX_AUG: u64 = 1_785_585_600;
     const AGX_SEP: u64 = 1_789_473_600;
@@ -18486,8 +18478,10 @@ mod tests {
     }
 
     // Case (vi): the cross-source set is filled before the client and date
-    // filters (rule (b) section 3), and an unrequested earlier source cannot
-    // gate (section 4). CLI copy dated August, extension copy dated September.
+    // filters (rule (b), third bullet); an earlier source that is not scanned
+    // cannot gate, one that is scanned but not requested still does
+    // (UPSTREAM.md dependence (a)). CLI copy dated August, extension copy dated
+    // September.
     #[test]
     #[serial_test::serial]
     fn test_antigravity_family_rule_b_request_set_and_date_window() {
@@ -18523,6 +18517,13 @@ mod tests {
         // CLI-only request in the September window: nothing in the window.
         assert_eq!(
             antigravity_family_lane_totals(home, &["antigravity-cli"], Some("2026-09-01")),
+            agx_totals(&[])
+        );
+        // `synthetic` makes the scanner read every client, so the unrequested
+        // CLI db is scanned and gates the extension copy, which the client
+        // filter keeps alone; the CLI copy is filtered out: counted zero times.
+        assert_eq!(
+            antigravity_family_lane_totals(home, &["antigravity-extension", "synthetic"], None),
             agx_totals(&[])
         );
     }
