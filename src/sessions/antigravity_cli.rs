@@ -1,8 +1,10 @@
-//! Antigravity CLI session parser
+//! Antigravity generation database parser
 //!
 //! The Antigravity CLI (the terminal agent, distinct from the Antigravity IDE)
 //! stores each conversation as a SQLite database under
-//! `~/.gemini/antigravity-cli/conversations/<uuid>.db`. Unlike the IDE-backed
+//! `~/.gemini/antigravity-cli/conversations/<uuid>.db`; IDE extensions write the
+//! same format under `~/.gemini/antigravity/conversations/<uuid>.db`, parsed
+//! here for the `antigravity-extension` client. Unlike the IDE-backed
 //! [`super::antigravity`] source — which depends on a *running* language server
 //! reachable over RPC and caches JSONL under the config dir — the CLI usage is
 //! already on disk and can be read directly. No RPC, no `antigravity sync`.
@@ -43,7 +45,19 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Parse an Antigravity CLI conversation database.
 pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
+    parse_antigravity_db_file(path, "antigravity-cli")
+}
+
+/// Parse an Antigravity IDE extension conversation database
+/// (`~/.gemini/antigravity/conversations/<uuid>.db`): the same `gen_metadata`
+/// format as the CLI, attributed to `antigravity-extension`.
+pub fn parse_antigravity_extension_file(path: &Path) -> Vec<UnifiedMessage> {
+    parse_antigravity_db_file(path, "antigravity-extension")
+}
+
+fn parse_antigravity_db_file(path: &Path, client: &'static str) -> Vec<UnifiedMessage> {
     let Some(conn) = open_readonly_sqlite(path) else {
         return Vec::new();
     };
@@ -58,7 +72,7 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let mut stmt = match conn.prepare("SELECT idx, data FROM gen_metadata ORDER BY idx") {
         Ok(stmt) => stmt,
-        // Not an Antigravity CLI database (table missing) — nothing to count.
+        // Not an Antigravity generation database (table missing) — nothing to count.
         Err(_) => return Vec::new(),
     };
     let rows = match stmt.query_map([], |row| {
@@ -77,6 +91,7 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
         // per-generation wall-clock stamp (see `parse_gen_metadata`).
         if let Some(mut message) = parse_gen_metadata(
             &blob,
+            client,
             &session_id,
             timestamp,
             &step_timestamps,
@@ -95,6 +110,7 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
 
 fn parse_gen_metadata(
     blob: &[u8],
+    client: &'static str,
     session_id: &str,
     session_timestamp: i64,
     step_timestamps: &StepTimestamps,
@@ -163,7 +179,7 @@ fn parse_gen_metadata(
         .to_string();
 
     Some(UnifiedMessage::new_with_dedup(
-        "antigravity-cli",
+        client,
         model_id,
         provider_id,
         session_id,
@@ -608,6 +624,7 @@ mod tests {
     ) -> Option<UnifiedMessage> {
         parse_gen_metadata(
             blob,
+            "antigravity-cli",
             session_id,
             session_timestamp,
             step_timestamps,
@@ -686,6 +703,30 @@ mod tests {
             Some("C:/Users/Frank/obsidian-vault")
         );
         assert_eq!(message.workspace_label.as_deref(), Some("obsidian-vault"));
+    }
+
+    #[test]
+    fn parses_antigravity_extension_database_with_shared_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension-conversation.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE gen_metadata (idx integer, data blob, size integer);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?1, 0)",
+                params![build_gen_metadata()],
+            )
+            .unwrap();
+        }
+
+        let messages = parse_antigravity_extension_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].client, "antigravity-extension");
+        assert_eq!(messages[0].session_id, "extension-conversation");
+        assert_eq!(messages[0].dedup_key.as_deref(), Some("resp-1"));
+        assert_eq!(messages[0].tokens.input, 1632);
     }
 
     #[test]

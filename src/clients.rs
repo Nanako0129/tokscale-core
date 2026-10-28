@@ -730,6 +730,23 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Antigravity IDE extensions (VS Code, JetBrains, Zed and others) persist
+    // the same generation databases as the CLI under
+    // `~/.gemini/antigravity/conversations/`; syrtis#507's reporter says the
+    // Antigravity 2.0 desktop app writes there too (not measured here). Same parser as
+    // `AntigravityCli`, separate client id for attribution. Cross-source
+    // response-id dedup against `Antigravity` and `AntigravityCli` lives in
+    // `AntigravityFamilyGate` (lib.rs). Unlike the CLI root, this one does not
+    // honor `GEMINI_CLI_HOME` (matches upstream tokscale #1362).
+    AntigravityExtension = 42 => {
+        id: "antigravity-extension",
+        root: PathRoot::Home,
+        relative: ".gemini/antigravity/conversations",
+        pattern: "*.db",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -819,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 42);
+        assert_eq!(ClientId::COUNT, 43);
     }
 
     #[test]
@@ -1290,6 +1307,21 @@ mod tests {
     #[test]
     fn test_antigravity_parse_local_is_true() {
         assert!(ClientId::Antigravity.data().parse_local);
+    }
+
+    #[test]
+    fn test_antigravity_extension_database_path() {
+        let client = ClientId::AntigravityExtension;
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            "/tmp/home/.gemini/antigravity/conversations"
+        );
+        assert_eq!(client.data().pattern, "*.db");
+        assert!(client.data().parse_local);
+        assert!(client.submit_default());
+        assert_eq!(client.as_str(), "antigravity-extension");
     }
 
     #[test]

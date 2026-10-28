@@ -2780,15 +2780,21 @@ mod tests {
         // re-approval: the identity is the approved-scope fingerprint, and
         // `RESOLVER_CONTRACT_VERSION` covers rule changes, not client-list
         // growth.
+        //
+        // Adding `antigravity-extension` (`.gemini/antigravity/conversations`,
+        // `*.db`) moved it again. The macOS value was measured on Apple
+        // hardware; the Linux value in a `rust:1.96.1` aarch64 container, where
+        // the unchanged tree also reproduces the previous x86_64 value, so the
+        // identity does not depend on the CPU architecture.
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:ca821233bffd644504cee0d2e6beceefbfa20763bbdc42a446ca894c1adebd6e"
+            "sc1:245e76a49f85c15e9ac6444033a9c3f3e35ee439b336a212e205c4c58bdbfec2"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:5c0e4536eff8bd5b3d286cdb216bc54eba99e011e65b9a44465d95d8294a88d5"
+            "sc1:8428d64fdcc256214d5aff864e75c9c7c02b2df01d116f1b5a9b70f27a47a7ae"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely
