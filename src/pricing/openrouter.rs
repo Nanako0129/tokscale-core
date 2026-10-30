@@ -18,6 +18,10 @@ const MAX_CONCURRENT_REQUESTS: usize = 10;
 struct ModelListPricing {
     prompt: String,
     completion: String,
+    #[serde(default)]
+    input_cache_read: Option<String>,
+    #[serde(default)]
+    input_cache_write: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +110,22 @@ fn parse_price(s: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
+fn listed_model_pricing(pricing: ModelListPricing) -> Option<ModelPricing> {
+    Some(ModelPricing {
+        input_cost_per_token: Some(parse_price(&pricing.prompt)?),
+        output_cost_per_token: Some(parse_price(&pricing.completion)?),
+        cache_read_input_token_cost: pricing
+            .input_cache_read
+            .as_deref()
+            .and_then(parse_price),
+        cache_creation_input_token_cost: pricing
+            .input_cache_write
+            .as_deref()
+            .and_then(parse_price),
+        ..Default::default()
+    })
+}
+
 async fn fetch_author_pricing(
     client: Arc<reqwest::Client>,
     model_id: String,
@@ -144,14 +164,8 @@ async fn fetch_author_pricing(
         }
     };
 
-    match select_author_endpoint_pricing(
-        &data.data.endpoints,
-        author_name,
-        fallback_pricing.as_ref(),
-    ) {
-        Some(pricing) => Some((model_id, pricing)),
-        None => fallback_pricing.map(|p| (model_id, p)),
-    }
+    select_author_or_listed_pricing(&data.data.endpoints, author_name, fallback_pricing)
+        .map(|pricing| (model_id, pricing))
 }
 
 /// An endpoint's prices, or `None` when its input or output price does not parse.
@@ -235,6 +249,14 @@ fn select_author_endpoint_pricing(
         }
     }
     endpoint_pricing(first)
+}
+
+fn select_author_or_listed_pricing(
+    endpoints: &[Endpoint],
+    author_name: &str,
+    listed: Option<ModelPricing>,
+) -> Option<ModelPricing> {
+    select_author_endpoint_pricing(endpoints, author_name, listed.as_ref()).or(listed)
 }
 
 /// Reduce equally-priced candidates to the one that leaves the fewest token
@@ -333,17 +355,7 @@ pub async fn fetch_all_models() -> HashMap<String, ModelPricing> {
                 .data
                 .into_iter()
                 .map(|m| {
-                    let fallback = m.pricing.and_then(|p| {
-                        let input = parse_price(&p.prompt)?;
-                        let output = parse_price(&p.completion)?;
-                        Some(ModelPricing {
-                            input_cost_per_token: Some(input),
-                            output_cost_per_token: Some(output),
-                            cache_read_input_token_cost: None,
-                            cache_creation_input_token_cost: None,
-                            ..Default::default()
-                        })
-                    });
+                    let fallback = m.pricing.and_then(listed_model_pricing);
                     (m.id, fallback)
                 })
                 .collect();
@@ -438,6 +450,62 @@ mod tests {
             output_cost_per_token: Some(output),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn model_list_fallback_preserves_cache_rates() {
+        let item: ModelListItem = serde_json::from_value(serde_json::json!({
+            "id": "deepseek/deepseek-v4.1-flash",
+            "pricing": {
+                "prompt": "0.0000003",
+                "completion": "0.0000012",
+                "input_cache_read": "0.000000006",
+                "input_cache_write": "0.000000009"
+            }
+        }))
+        .unwrap();
+
+        let pricing = item.pricing.and_then(listed_model_pricing).unwrap();
+        assert_eq!(pricing.input_cost_per_token, Some(3e-7));
+        assert_eq!(pricing.output_cost_per_token, Some(1.2e-6));
+        assert_eq!(pricing.cache_read_input_token_cost, Some(6e-9));
+        assert_eq!(pricing.cache_creation_input_token_cost, Some(9e-9));
+    }
+
+    #[test]
+    fn listed_cache_rates_survive_when_no_author_endpoint_matches() {
+        let listed = listed_model_pricing(ModelListPricing {
+            prompt: "0.0000003".to_string(),
+            completion: "0.0000012".to_string(),
+            input_cache_read: Some("0.000000006".to_string()),
+            input_cache_write: None,
+        })
+        .unwrap();
+        let endpoints = vec![endpoint(
+            "DigitalOcean",
+            "0.000000165",
+            "0.00000066",
+            Some("0.000000006"),
+        )];
+
+        let pricing =
+            select_author_or_listed_pricing(&endpoints, "DeepSeek", Some(listed)).unwrap();
+        assert_eq!(pricing.input_cost_per_token, Some(3e-7));
+        assert_eq!(pricing.output_cost_per_token, Some(1.2e-6));
+        assert_eq!(pricing.cache_read_input_token_cost, Some(6e-9));
+    }
+
+    #[test]
+    fn model_list_fallback_allows_missing_cache_rates() {
+        let pricing: ModelListPricing = serde_json::from_value(serde_json::json!({
+            "prompt": "0.0000003",
+            "completion": "0.0000012"
+        }))
+        .unwrap();
+
+        let pricing = listed_model_pricing(pricing).unwrap();
+        assert_eq!(pricing.cache_read_input_token_cost, None);
+        assert_eq!(pricing.cache_creation_input_token_cost, None);
     }
 
     /// OpenRouter serves `openai/gpt-6-astra` from three `OpenAI` endpoints that
