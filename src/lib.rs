@@ -928,16 +928,28 @@ fn build_codex_cache_entry(
     state: sessions::codex::CodexParseState,
     fallback_timestamp_indices: Vec<usize>,
 ) -> Option<message_cache::CachedSourceEntry> {
-    if fingerprint.size != consumed_offset {
-        return None;
-    }
-
-    let codex_incremental = message_cache::build_codex_incremental_cache_with_prefix_hash(
-        path,
-        consumed_offset,
-        state,
-        fingerprint.content_hash,
-    )?;
+    let codex_incremental = if sessions::codex::is_zst_path(path) {
+        // `consumed_offset` counts decoded bytes, never the archive's size.
+        // A successful archive parse covers the whole immutable file, so it
+        // is stored as complete: the exact-hit check then matches on the
+        // archive's own size and content hash (upstream #1423).
+        message_cache::CodexIncrementalCache {
+            state,
+            consumed_offset: fingerprint.size,
+            ends_with_newline: true,
+            prefix_hash: fingerprint.content_hash,
+        }
+    } else {
+        if fingerprint.size != consumed_offset {
+            return None;
+        }
+        message_cache::build_codex_incremental_cache_with_prefix_hash(
+            path,
+            consumed_offset,
+            state,
+            fingerprint.content_hash,
+        )?
+    };
 
     Some(message_cache::CachedSourceEntry::new(
         message_cache::CacheIdentity::for_client(ClientId::Codex),
@@ -15341,6 +15353,130 @@ mod tests {
                 .map(|message| message.output)
                 .sum::<i64>(),
             15,
+        );
+    }
+
+    /// Codex replaces a week-old rollout with `<name>.jsonl.zst` and deletes
+    /// the plain file; while it resumes one, both can exist (upstream #1423).
+    /// The same fixture as plain files, as archives only, and as both gives
+    /// the same 3 messages / 150 input / 15 output on the materialized lane,
+    /// the shipping report cold and warm, and the count lane. The cold report
+    /// stores each archive as a complete cache entry that the next scan hits
+    /// exactly (its decoded length never equals the archive's size, which is
+    /// what a plain rollout's entry is checked against).
+    #[test]
+    #[serial_test::serial]
+    fn codex_compressed_rollouts_count_like_plain_ones_on_every_lane() {
+        let lanes = |keep_plain: Option<bool>| {
+            let source_home = tempfile::TempDir::new().unwrap();
+            let materialized_cache = tempfile::TempDir::new().unwrap();
+            let streaming_cache = tempfile::TempDir::new().unwrap();
+            let count_cache = tempfile::TempDir::new().unwrap();
+            write_codex_sessions_and_archived_sessions_fixture(source_home.path());
+            let mut archives = Vec::new();
+            if let Some(keep_plain) = keep_plain {
+                for dir in ["sessions", "archived_sessions"] {
+                    let dir = source_home.path().join(".codex").join(dir);
+                    // Listed before writing: entries added while a directory
+                    // is being read may or may not be returned.
+                    let plains: Vec<_> = std::fs::read_dir(&dir)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .collect();
+                    for plain in plains {
+                        let archive = dir.join(format!(
+                            "{}.zst",
+                            plain.file_name().unwrap().to_str().unwrap()
+                        ));
+                        let bytes = std::fs::read(&plain).unwrap();
+                        std::fs::write(&archive, zstd::encode_all(&bytes[..], 3).unwrap()).unwrap();
+                        if !keep_plain {
+                            std::fs::remove_file(&plain).unwrap();
+                        }
+                        archives.push(archive);
+                    }
+                }
+            }
+
+            let home = source_home.path().to_str().unwrap().to_string();
+            let clients = vec!["codex".to_string()];
+            let materialized = with_isolated_tokscale_cache(materialized_cache.path(), || {
+                parse_all_messages_with_pricing_with_env_strategy(
+                    &home,
+                    &clients,
+                    None,
+                    false,
+                    &scanner::ScannerSettings::default(),
+                    None,
+                )
+            });
+            let materialized = (
+                materialized.len() as i64,
+                materialized.iter().map(|m| m.tokens.input).sum::<i64>(),
+                materialized.iter().map(|m| m.tokens.output).sum::<i64>(),
+            );
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let report = || {
+                let report = with_isolated_tokscale_cache(streaming_cache.path(), || {
+                    runtime
+                        .block_on(get_model_report(ReportOptions {
+                            home_dir: Some(home.clone()),
+                            use_env_roots: false,
+                            clients: Some(clients.clone()),
+                            ..Default::default()
+                        }))
+                        .unwrap()
+                });
+                (
+                    report.total_messages as i64,
+                    report.total_input,
+                    report.total_output,
+                )
+            };
+            let cold = report();
+            with_isolated_tokscale_cache(streaming_cache.path(), || {
+                let cache = message_cache::SourceMessageCache::load();
+                let identity = message_cache::CacheIdentity::for_client(ClientId::Codex);
+                for archive in &archives {
+                    let entry = cache.get(identity, archive).expect("archive cached");
+                    let fingerprint = message_cache::SourceFingerprint::from_path(archive).unwrap();
+                    assert!(
+                        message_cache::codex_cache_entry_matches_fingerprint(entry, &fingerprint),
+                        "{} must be an exact hit on the next scan",
+                        archive.display()
+                    );
+                }
+            });
+            let warm = report();
+
+            let counted = with_isolated_tokscale_cache(count_cache.path(), || {
+                parse_local_clients(LocalParseOptions {
+                    home_dir: Some(home.clone()),
+                    use_env_roots: false,
+                    clients: Some(clients.clone()),
+                    ..Default::default()
+                })
+                .unwrap()
+            });
+            let counted = (
+                counted.messages.len() as i64,
+                counted.messages.iter().map(|m| m.input).sum::<i64>(),
+                counted.messages.iter().map(|m| m.output).sum::<i64>(),
+            );
+            [materialized, cold, warm, counted]
+        };
+
+        let expected = [(3, 150, 15); 4];
+        assert_eq!(lanes(None), expected, "plain rollouts");
+        assert_eq!(lanes(Some(false)), expected, "archives only");
+        assert_eq!(
+            lanes(Some(true)),
+            expected,
+            "plain and archive side by side"
         );
     }
 
