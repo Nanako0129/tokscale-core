@@ -994,10 +994,15 @@ fn retain_unexcluded_scan_tasks<P: AsRef<Path>>(
     tasks: &mut Vec<(ClientId, P, &'static str)>,
     scanner_settings: &ScannerSettings,
 ) {
-    if scanner_settings.excluded_scan_paths.is_empty() {
+    let excluded = excluded_prefixes(scanner_settings);
+    if excluded.is_empty() {
         return;
     }
-    let excluded: Vec<(ClientId, PathBuf)> = scanner_settings
+    tasks.retain(|(client_id, path, _)| !is_excluded(&excluded, *client_id, path.as_ref()));
+}
+
+fn excluded_prefixes(scanner_settings: &ScannerSettings) -> Vec<(ClientId, PathBuf)> {
+    scanner_settings
         .excluded_scan_paths
         .iter()
         .filter_map(|(client_str, paths)| ClientId::from_str(client_str).map(|id| (id, paths)))
@@ -1012,17 +1017,56 @@ fn retain_unexcluded_scan_tasks<P: AsRef<Path>>(
                     )
                 })
         })
-        .collect();
+        .collect()
+}
+
+fn is_excluded(excluded: &[(ClientId, PathBuf)], client_id: ClientId, path: &Path) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    excluded
+        .iter()
+        .any(|(excluded_id, prefix)| *excluded_id == client_id && resolved.starts_with(prefix))
+}
+
+/// Drop every discovered file, database and directory at or under a
+/// caller-excluded prefix for its client, from the assembled [`ScanResult`].
+///
+/// [`retain_unexcluded_scan_tasks`] only stops an excluded root being walked.
+/// It cannot see an exclusion *below* a retained root (the walk starts above
+/// it), nor a source that never became a task: Grok's `logs/unified.jsonl`,
+/// the Copilot exporter file and desktop database, and every SQLite source.
+/// Both scan entries call this on their finished result, so one rule decides
+/// what an exclusion means whatever route found the path (issue #16).
+fn prune_excluded_scan_result(result: &mut ScanResult, scanner_settings: &ScannerSettings) {
+    let excluded = excluded_prefixes(scanner_settings);
     if excluded.is_empty() {
         return;
     }
-    tasks.retain(|(client_id, path, _)| {
-        let path = path.as_ref();
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        !excluded
-            .iter()
-            .any(|(excluded_id, prefix)| excluded_id == client_id && resolved.starts_with(prefix))
-    });
+    for client_id in ClientId::iter() {
+        result
+            .get_mut(client_id)
+            .retain(|path| !is_excluded(&excluded, client_id, path));
+    }
+    let drop_db = |client_id: ClientId, db: &mut Option<PathBuf>| {
+        if db
+            .as_deref()
+            .is_some_and(|p| is_excluded(&excluded, client_id, p))
+        {
+            *db = None;
+        }
+    };
+    drop_db(ClientId::Copilot, &mut result.copilot_desktop_db);
+    drop_db(ClientId::Kilo, &mut result.kilo_db);
+    drop_db(ClientId::Hermes, &mut result.hermes_db);
+    drop_db(ClientId::Goose, &mut result.goose_db);
+    drop_db(ClientId::Zed, &mut result.zed_db);
+    drop_db(ClientId::Kiro, &mut result.kiro_db);
+    drop_db(ClientId::Zcode, &mut result.zcode_db);
+    result
+        .opencode_dbs
+        .retain(|path| !is_excluded(&excluded, ClientId::OpenCode, path));
+    result
+        .crush_dbs
+        .retain(|db| !is_excluded(&excluded, ClientId::Crush, &db.db_path));
 }
 
 fn push_unique_scan_task(
@@ -1590,6 +1634,7 @@ fn scan_all_clients_resolved_inner(
     }
 
     prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+    prune_excluded_scan_result(&mut result, scanner_settings);
 
     Ok(result)
 }
@@ -2138,6 +2183,7 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+    prune_excluded_scan_result(&mut result, scanner_settings);
 
     result
 }
@@ -3633,6 +3679,258 @@ mod tests {
             scan(BTreeMap::from([("claude".to_string(), Vec::new())])),
             default
         );
+    }
+
+    /// Scan `client` through both entries: the context-free one and a
+    /// captured source context. Issue #16 was one rule answered differently
+    /// by the two, so every exclusion test below asserts on both.
+    fn scan_both_entries(
+        home: &Path,
+        client: &str,
+        use_env_roots: bool,
+        settings: &ScannerSettings,
+    ) -> [ScanResult; 2] {
+        let clients = [client.to_string()];
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.to_path_buf()),
+            use_env_roots,
+            settings.clone(),
+        )
+        .unwrap();
+        [
+            scan_all_clients_with_scanner_settings(
+                home.to_str().unwrap(),
+                &clients,
+                use_env_roots,
+                settings,
+            ),
+            scan_all_clients_with_source_context(&context, &clients).unwrap(),
+        ]
+    }
+
+    fn exclude(client: &str, dirs: &[&Path]) -> BTreeMap<String, Vec<PathBuf>> {
+        BTreeMap::from([(
+            client.to_string(),
+            dirs.iter().map(|dir| dir.to_path_buf()).collect(),
+        )])
+    }
+
+    fn touch(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        File::create(path).unwrap();
+    }
+
+    /// Issue #16 claim 2: an exclusion *below* a retained root. The root is
+    /// walked from above, so a prefix test on the task path never sees it.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_prune_a_directory_nested_in_a_retained_root() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let kept = home.join(".claude/projects/proj-a/session.jsonl");
+        let nested = home.join(".claude/projects/proj-b/session.jsonl");
+        touch(&kept);
+        touch(&nested);
+
+        for result in scan_both_entries(home, "claude", false, &ScannerSettings::default()) {
+            let files = result.get(ClientId::Claude);
+            assert!(
+                files.contains(&kept) && files.contains(&nested),
+                "inert: {files:?}"
+            );
+        }
+        let settings = ScannerSettings {
+            excluded_scan_paths: exclude("claude", &[nested.parent().unwrap()]),
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "claude", false, &settings) {
+            let files = result.get(ClientId::Claude);
+            assert!(files.contains(&kept), "the sibling was dropped: {files:?}");
+            assert!(
+                !files.contains(&nested),
+                "nested exclusion walked: {files:?}"
+            );
+        }
+    }
+
+    /// Issue #16 claim 3 (Grok): `logs/unified.jsonl` is pushed straight into
+    /// the result, not through a scan task.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_drop_a_grok_unified_log() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let grok_x = home.join("grok-x");
+        let kept = home.join(".grok/logs/unified.jsonl");
+        let leaked = grok_x.join("logs/unified.jsonl");
+        touch(&kept);
+        touch(&leaked);
+        let extra = exclude("grok", &[&grok_x.join("sessions")]);
+
+        for result in scan_both_entries(
+            home,
+            "grok",
+            false,
+            &ScannerSettings {
+                extra_scan_paths: extra.clone(),
+                ..Default::default()
+            },
+        ) {
+            let files = result.get(ClientId::Grok);
+            assert!(
+                files.contains(&kept) && files.contains(&leaked),
+                "inert: {files:?}"
+            );
+        }
+        let settings = ScannerSettings {
+            extra_scan_paths: extra,
+            excluded_scan_paths: exclude("grok", &[&grok_x]),
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "grok", false, &settings) {
+            let files = result.get(ClientId::Grok);
+            assert!(
+                files.contains(&kept),
+                "the primary log was dropped: {files:?}"
+            );
+            assert!(
+                !files.contains(&leaked),
+                "excluded unified log kept: {files:?}"
+            );
+        }
+    }
+
+    /// Issue #16 claim 3 (Copilot): the OTEL exporter file comes from an
+    /// environment variable and the desktop database from the home directory;
+    /// neither is a scan task.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_drop_copilot_single_file_sources() {
+        let mut env = EnvGuard::capture(&["COPILOT_OTEL_FILE_EXPORTER_PATH"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let otel_dir = home.join("otel-x");
+        let exporter = otel_dir.join("export.jsonl");
+        let desktop_db = home.join(".copilot/data.db");
+        touch(&exporter);
+        touch(&desktop_db);
+        env.set(
+            "COPILOT_OTEL_FILE_EXPORTER_PATH",
+            exporter.display().to_string(),
+        );
+
+        for result in scan_both_entries(home, "copilot", true, &ScannerSettings::default()) {
+            assert!(
+                result.get(ClientId::Copilot).contains(&exporter),
+                "inert exporter"
+            );
+            assert_eq!(
+                result.copilot_desktop_db.as_ref(),
+                Some(&desktop_db),
+                "inert db"
+            );
+        }
+        let settings = ScannerSettings {
+            excluded_scan_paths: exclude("copilot", &[&otel_dir, &home.join(".copilot")]),
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "copilot", true, &settings) {
+            assert!(
+                !result.get(ClientId::Copilot).contains(&exporter),
+                "excluded exporter kept"
+            );
+            assert_eq!(result.copilot_desktop_db, None, "excluded desktop db kept");
+        }
+    }
+
+    /// Issue #16 claim 3 (databases): each SQLite source has its own
+    /// `ScanResult` field. Excluding its directory must clear that field and
+    /// only that field.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_drop_database_sources() {
+        type Field = fn(&ScanResult) -> bool;
+        let cases: [(&str, &str, Field); 6] = [
+            ("kilo", ".local/share/kilo/kilo.db", |r| r.kilo_db.is_some()),
+            ("goose", ".local/share/goose/sessions/sessions.db", |r| {
+                r.goose_db.is_some()
+            }),
+            ("zed", ".local/share/zed/threads/threads.db", |r| {
+                r.zed_db.is_some()
+            }),
+            ("kiro", ".local/share/kiro-cli/data.sqlite3", |r| {
+                r.kiro_db.is_some()
+            }),
+            ("zcode", ".zcode/cli/db/db.sqlite", |r| r.zcode_db.is_some()),
+            ("hermes", ".hermes/state.db", |r| r.hermes_db.is_some()),
+        ];
+        for (client, rel, present) in cases {
+            let dir = TempDir::new().unwrap();
+            let home = dir.path();
+            let db = home.join(rel);
+            touch(&db);
+            for result in scan_both_entries(home, client, false, &ScannerSettings::default()) {
+                assert!(present(&result), "{client}: inert, db not discovered");
+            }
+            let settings = ScannerSettings {
+                excluded_scan_paths: exclude(client, &[db.parent().unwrap()]),
+                ..Default::default()
+            };
+            for result in scan_both_entries(home, client, false, &settings) {
+                assert!(!present(&result), "{client}: excluded database kept");
+            }
+        }
+
+        // Crush: databases come from a registry whose entries name any directory.
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let data = home.join("crush-x");
+        touch(&data.join("crush.db"));
+        let registry = home.join(".local/share/crush/projects.json");
+        touch(&registry);
+        fs::write(
+            &registry,
+            serde_json::json!({ "projects": [{ "path": home.join("proj"), "data_dir": data }] })
+                .to_string(),
+        )
+        .unwrap();
+        for result in scan_both_entries(home, "crush", false, &ScannerSettings::default()) {
+            assert_eq!(result.crush_dbs.len(), 1, "crush: inert");
+        }
+        let settings = ScannerSettings {
+            excluded_scan_paths: exclude("crush", &[&data]),
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "crush", false, &settings) {
+            assert!(result.crush_dbs.is_empty(), "crush: excluded database kept");
+        }
+
+        // OpenCode: a user-configured database outside the data dir, and the
+        // auto-discovered one beside it.
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let auto = home.join(".local/share/opencode/opencode-stable.db");
+        let outside = home.join("elsewhere/opencode.db");
+        touch(&auto);
+        touch(&outside);
+        let base = ScannerSettings {
+            opencode_db_paths: vec![outside.clone()],
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "opencode", false, &base) {
+            assert!(
+                result.opencode_dbs.contains(&auto) && result.opencode_dbs.contains(&outside),
+                "inert: {:?}",
+                result.opencode_dbs
+            );
+        }
+        let settings = ScannerSettings {
+            excluded_scan_paths: exclude("opencode", &[outside.parent().unwrap()]),
+            ..base
+        };
+        for result in scan_both_entries(home, "opencode", false, &settings) {
+            assert_eq!(result.opencode_dbs, vec![auto.clone()]);
+        }
     }
 
     #[test]
