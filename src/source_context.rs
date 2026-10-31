@@ -2786,15 +2786,19 @@ mod tests {
         // hardware; the Linux value in a `rust:1.96.1` aarch64 container, where
         // the unchanged tree also reproduces the previous x86_64 value, so the
         // identity does not depend on the CPU architecture.
+        //
+        // Codex's pattern `*.jsonl` -> `*.jsonl*` (its `.jsonl.zst` archives,
+        // upstream #1423) moved it again: macOS measured on Apple hardware,
+        // Linux in a `rust:1.96.1` aarch64 container.
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:245e76a49f85c15e9ac6444033a9c3f3e35ee439b336a212e205c4c58bdbfec2"
+            "sc1:20cbed559a4e5993dcf90e11feb44f430fbc421fe8c00a7bef8b4fc58c3c989a"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:8428d64fdcc256214d5aff864e75c9c7c02b2df01d116f1b5a9b70f27a47a7ae"
+            "sc1:b624585ff7382f112ada7ed8330400e7ceabb782e27cf25e9ad7c2793283718c"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely

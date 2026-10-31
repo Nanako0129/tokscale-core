@@ -420,7 +420,9 @@ fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
                 "*.jsonl" => file_name.ends_with(".jsonl"),
                 // OpenClaw: also match archived transcripts
                 // (<uuid>.jsonl.deleted.<ts>, <uuid>.jsonl.reset.<ts>) and
-                // zstd archives (<uuid>.jsonl.zst, upstream #1285). Compaction
+                // zstd archives (<uuid>.jsonl.zst, upstream #1285). Codex
+                // shares this arm for its own `rollout-*.jsonl.zst` archives
+                // (upstream #1423); it writes none of the other forms. Compaction
                 // checkpoint snapshots are OpenClaw's own bookkeeping, not
                 // usage, and are excluded first so an archived checkpoint
                 // cannot slip in as a copy (upstream #1293).
@@ -5046,6 +5048,67 @@ mod tests {
 
         let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codex".to_string()]);
         assert_eq!(result.get(ClientId::Codex).len(), 2);
+    }
+
+    /// Codex replaces a week-old rollout with `<name>.jsonl.zst` (upstream
+    /// #1423). Both scanners find archives under every Codex root — sessions,
+    /// archived sessions and the headless root — and nothing else ending in
+    /// `.zst`.
+    #[test]
+    #[serial]
+    fn codex_compressed_rollouts_are_found_under_every_codex_root() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let headless = dir.path().join("headless");
+        let mut env =
+            EnvGuard::capture(&["CODEX_HOME", "TOKSCALE_HEADLESS_DIR", "TOKSCALE_EXTRA_DIRS"]);
+        env.set("CODEX_HOME", home.join(".codex"));
+        env.set("TOKSCALE_HEADLESS_DIR", &headless);
+        env.remove("TOKSCALE_EXTRA_DIRS");
+
+        let mut expected = Vec::new();
+        for path in [
+            home.join(".codex/sessions/2026/10/01/rollout-a.jsonl.zst"),
+            home.join(".codex/sessions/2026/10/01/rollout-b.jsonl"),
+            home.join(".codex/archived_sessions/rollout-c.jsonl.zst"),
+            headless.join("codex/rollout-d.jsonl.zst"),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"x").unwrap();
+            expected.push(fs::canonicalize(&path).unwrap());
+        }
+        for decoy in [
+            home.join(".codex/sessions/2026/10/01/notes.zst"),
+            home.join(".codex/sessions/2026/10/01/rollout-e.json.zst"),
+        ] {
+            fs::write(decoy, b"x").unwrap();
+        }
+        expected.sort();
+
+        let found = |scan: &ScanResult| {
+            let mut files: Vec<PathBuf> = scan
+                .get(ClientId::Codex)
+                .iter()
+                .map(|path| fs::canonicalize(path).unwrap())
+                .collect();
+            files.sort();
+            files
+        };
+        let legacy = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["codex".to_string()],
+            true,
+        );
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        let resolved =
+            scan_all_clients_with_source_context(&context, &["codex".to_string()]).unwrap();
+        assert_eq!(found(&legacy), expected);
+        assert_eq!(found(&resolved), expected);
     }
 
     /// Ported from upstream `d409ee07`: nested subagent transcripts are found,
