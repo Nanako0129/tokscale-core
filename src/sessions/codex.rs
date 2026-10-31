@@ -18,8 +18,19 @@ use crate::provider_identity::inferred_provider_from_model;
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+
+/// Decoded-size ceiling for one `.jsonl.zst` rollout (upstream #1423, raised
+/// to 1 GiB by #1453); see `parse_codex_archive` for what counts past it.
+/// Codex writes these archives itself for rollouts whose mtime is at least
+/// 7 days old.
+const MAX_CODEX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+pub(crate) fn is_zst_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zst"))
+}
 
 /// Codex entry structure (from JSONL files)
 #[derive(Debug, Deserialize)]
@@ -280,9 +291,14 @@ pub(crate) struct ParsedCodexFile {
     pub state: CodexParseState,
 }
 
+/// File stem, with an outer `.zst` stripped first so an archive and its plain
+/// rollout share one session id.
 fn session_id_from_path(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
+    let mut stem = path.file_stem();
+    if is_zst_path(path) {
+        stem = stem.and_then(|stem| Path::new(stem).file_stem());
+    }
+    stem.and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
 }
@@ -1052,24 +1068,9 @@ fn flush_pending_model_messages_as_unknown(
     );
 }
 
-/// Parse a Codex JSONL file with stateful tracking
+/// Parse a Codex `.jsonl` or `.jsonl.zst` file with stateful tracking
 pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-
-    let session_id = session_id_from_path(path);
-    let fallback_timestamp = file_modified_timestamp_ms(path);
-    let reader = BufReader::new(file);
-    let parsed = parse_codex_reader(
-        reader,
-        &session_id,
-        fallback_timestamp,
-        0,
-        CodexParseState::default(),
-    );
-    parsed.messages
+    parse_codex_file_incremental(path, 0, CodexParseState::default()).messages
 }
 
 fn reported_total_tokens(usage: &CodexTokenUsage) -> Option<i64> {
@@ -1112,6 +1113,10 @@ pub(crate) fn parse_codex_file_incremental(
     start_offset: u64,
     state: CodexParseState,
 ) -> ParsedCodexFile {
+    if is_zst_path(path) {
+        return parse_codex_archive(path, start_offset, state, MAX_CODEX_ARCHIVE_BYTES);
+    }
+
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(_) => {
@@ -1141,6 +1146,92 @@ pub(crate) fn parse_codex_file_incremental(
     let fallback_timestamp = file_modified_timestamp_ms(path);
     let reader = BufReader::new(file);
     parse_codex_reader(reader, &session_id, fallback_timestamp, start_offset, state)
+}
+
+/// A `.jsonl.zst` rollout, streamed through a bounded decoder. Archives are
+/// immutable, so only a whole-file parse exists: a resume offset (a decoded
+/// position cannot be mapped back into the compressed file) fails, and both
+/// cached lanes then re-parse from the start. An intact archive within
+/// `max_bytes` parses exactly like its plain rollout, bad lines included (a
+/// malformed JSON line is skipped, a non-UTF-8 line ends the read). Once the
+/// read pulls more than `max_bytes` (intact or not) or hits a zstd stream
+/// fault (corrupt or truncated), the archive yields no messages and
+/// `parse_succeeded = false`. If a non-UTF-8 line ends the read before
+/// either, the lines before it count, as in the plain rollout; since the
+/// line buffer reads ahead (up to 8 KiB), a fault or the bound just past
+/// that line can still be reached first. Nothing beyond what decodes is
+/// ever counted.
+fn parse_codex_archive(
+    path: &Path,
+    start_offset: u64,
+    state: CodexParseState,
+    max_bytes: u64,
+) -> ParsedCodexFile {
+    let failed = |state| ParsedCodexFile {
+        messages: Vec::new(),
+        fallback_timestamp_indices: Vec::new(),
+        consumed_offset: start_offset,
+        parse_succeeded: false,
+        unresolved_model_events: false,
+        state,
+    };
+    if start_offset != 0 {
+        return failed(state);
+    }
+    let decoder = std::fs::File::open(path).and_then(|file| {
+        let mut decoder = zstd::stream::read::Decoder::new(file)?;
+        decoder.window_log_max(26)?;
+        Ok(decoder)
+    });
+    let decoder = match decoder {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "Skipping Codex archive");
+            return failed(state);
+        }
+    };
+
+    let session_id = session_id_from_path(path);
+    let fallback_timestamp = file_modified_timestamp_ms(path);
+    let mut reader = BufReader::new(DecodeErrorFlag {
+        inner: decoder.take(max_bytes.saturating_add(1)),
+        failed: false,
+    });
+    let mut parsed = parse_codex_reader(&mut reader, &session_id, fallback_timestamp, 0, state);
+    // An exhausted `take` means more than `max_bytes` were decoded. Checked
+    // on the reader, not on `consumed_offset`: a cut inside a multi-byte
+    // character fails `read_line` without counting the partial line.
+    let past_bound = reader.get_ref().inner.limit() == 0;
+    if past_bound || reader.get_ref().failed {
+        tracing::warn!(
+            path = %path.display(),
+            max_bytes,
+            "Skipping Codex archive that failed to decode or exceeds the decoded-size limit"
+        );
+        parsed.messages.clear();
+        parsed.fallback_timestamp_indices.clear();
+        parsed.parse_succeeded = false;
+    }
+    parsed
+}
+
+/// Records whether the zstd stream itself failed, as opposed to a line it
+/// decoded cleanly failing UTF-8 or JSON parsing further up. `Interrupted`
+/// is not a failure: `read_line` retries it, and the zstd reader passes it
+/// through from the file.
+struct DecodeErrorFlag<R> {
+    inner: R,
+    failed: bool,
+}
+
+impl<R: Read> Read for DecodeErrorFlag<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).inspect_err(|error| {
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                self.failed = true;
+            }
+        })
+    }
 }
 
 fn extract_model(payload: &CodexPayload) -> Option<String> {
@@ -3321,5 +3412,197 @@ mod tests {
             messages[1].is_turn_start,
             "the deferred turn-start marker must still apply"
         );
+    }
+
+    const ARCHIVE_ROLLOUT: &str = concat!(
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"session_meta","payload":{"id":"thread-1","model_provider":"openai","cwd":"/repo"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":100,"output_tokens":45,"reasoning_output_tokens":15,"total_tokens":345},"last_token_usage":{"input_tokens":160,"cached_input_tokens":70,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":185}}}}"#,
+        "\n"
+    );
+
+    /// Ported from upstream #1423: an archive parses to exactly its plain
+    /// rollout's messages — session id included — through both entry points.
+    #[test]
+    fn compressed_rollout_parses_like_its_plain_copy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = "rollout-2026-10-01T00-00-00-thread-1.jsonl";
+        let plain = dir.path().join(name);
+        std::fs::write(&plain, ARCHIVE_ROLLOUT).unwrap();
+        let expected = parse_codex_file(&plain);
+        assert_eq!(expected.len(), 2);
+        assert_eq!(
+            expected[0].session_id,
+            "rollout-2026-10-01T00-00-00-thread-1"
+        );
+
+        let archive = dir.path().join(format!("{name}.zst"));
+        std::fs::write(
+            &archive,
+            zstd::encode_all(ARCHIVE_ROLLOUT.as_bytes(), 3).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parse_codex_file(&archive), expected);
+        let incremental = parse_codex_file_incremental(&archive, 0, CodexParseState::default());
+        assert!(incremental.parse_succeeded);
+        assert_eq!(incremental.messages, expected);
+        assert_eq!(incremental.consumed_offset, ARCHIVE_ROLLOUT.len() as u64);
+    }
+
+    /// Bad content inside a cleanly decoded archive is not a decode failure:
+    /// a malformed JSON line (skipped) and a line that is not UTF-8 (which
+    /// ends the read) give the archive exactly its plain copy's result.
+    #[test]
+    fn archive_with_bad_lines_parses_like_its_plain_copy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (first, rest) = ARCHIVE_ROLLOUT.split_at(
+            ARCHIVE_ROLLOUT
+                .rfind(r#"{"timestamp":"2026-10-01T00:00:05Z""#)
+                .unwrap(),
+        );
+        for (name, bad_line, expected_len) in [
+            ("malformed", &b"{\"timestamp\": not json\n"[..], 2),
+            ("not-utf8", &b"{\"x\":\"\xff\"}\n"[..], 1),
+        ] {
+            let content = [first.as_bytes(), bad_line, rest.as_bytes()].concat();
+            let plain = dir.path().join(format!("{name}.jsonl"));
+            std::fs::write(&plain, &content).unwrap();
+            let archive = dir.path().join(format!("{name}.jsonl.zst"));
+            std::fs::write(&archive, zstd::encode_all(&content[..], 3).unwrap()).unwrap();
+
+            let expected = parse_codex_file_incremental(&plain, 0, CodexParseState::default());
+            let parsed = parse_codex_file_incremental(&archive, 0, CodexParseState::default());
+            assert_eq!(expected.messages.len(), expected_len, "{name}");
+            assert!(!expected.parse_succeeded, "{name}");
+            assert_eq!(parsed.messages, expected.messages, "{name}");
+            assert_eq!(parsed.parse_succeeded, expected.parse_succeeded, "{name}");
+        }
+    }
+
+    /// An `Interrupted` read is retried by `read_line` and is not a decode
+    /// failure; any other error from the stream is.
+    #[test]
+    fn decode_flag_ignores_interrupted_reads() {
+        struct Faulty<R> {
+            inner: R,
+            fault: Option<ErrorKind>,
+        }
+        impl<R: std::io::Read> std::io::Read for Faulty<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.fault.take() {
+                    Some(kind) => Err(Error::new(kind, "injected")),
+                    None => self.inner.read(buf),
+                }
+            }
+        }
+        for (kind, failed, messages) in [
+            (ErrorKind::Interrupted, false, 2),
+            (ErrorKind::Other, true, 0),
+        ] {
+            let mut reader = BufReader::new(DecodeErrorFlag {
+                inner: Faulty {
+                    inner: Cursor::new(ARCHIVE_ROLLOUT),
+                    fault: Some(kind),
+                },
+                failed: false,
+            });
+            let parsed = parse_codex_reader(&mut reader, "s", 0, 0, CodexParseState::default());
+            assert_eq!(reader.get_ref().failed, failed, "{kind:?}");
+            assert_eq!(parsed.messages.len(), messages, "{kind:?}");
+        }
+    }
+
+    /// The bound cutting a multi-byte character: `read_line` fails on the cut
+    /// line without counting it, so `consumed_offset` stays under the bound,
+    /// and the archive must still count nothing. Control: the same archive
+    /// with its full decoded length as the bound parses.
+    #[test]
+    fn archive_cut_inside_a_character_at_the_bound_yields_no_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollout.jsonl.zst");
+        let content = format!("{ARCHIVE_ROLLOUT}{{\"text\":\"한국어\"}}\n");
+        std::fs::write(&path, zstd::encode_all(content.as_bytes(), 3).unwrap()).unwrap();
+        // `take(max + 1)` stops right after the first byte of `한`.
+        let first_byte = content.find('한').unwrap() as u64;
+
+        let cut = parse_codex_archive(&path, 0, CodexParseState::default(), first_byte);
+        assert!(!cut.parse_succeeded);
+        assert!(cut.messages.is_empty());
+
+        let whole = parse_codex_archive(&path, 0, CodexParseState::default(), content.len() as u64);
+        assert!(whole.parse_succeeded);
+        assert_eq!(whole.messages.len(), 2);
+    }
+
+    /// A truncated stream, a file that is not zstd, an archive past the
+    /// decoded-size limit and a resume offset each yield nothing and report
+    /// failure, so no partial usage is counted or cached. The limit case is
+    /// paired with a control whose limit is exactly the decoded size.
+    #[test]
+    fn unreadable_or_oversized_archive_yields_no_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollout.jsonl.zst");
+        let encoded = zstd::encode_all(ARCHIVE_ROLLOUT.as_bytes(), 3).unwrap();
+        let decoded_len = ARCHIVE_ROLLOUT.len() as u64;
+        let assert_failed = |parsed: ParsedCodexFile| {
+            assert!(!parsed.parse_succeeded);
+            assert!(parsed.messages.is_empty());
+            assert!(parsed.fallback_timestamp_indices.is_empty());
+        };
+
+        std::fs::write(&path, &encoded[..encoded.len() - 1]).unwrap();
+        assert!(parse_codex_file(&path).is_empty());
+        assert_failed(parse_codex_file_incremental(
+            &path,
+            0,
+            CodexParseState::default(),
+        ));
+
+        // Several zstd blocks, cut mid-stream: the usage lines decode before
+        // the stream fails, and must still not be counted.
+        let padding: String = (0..20_000u64)
+            .map(|i| {
+                format!(
+                    "{{\"type\":\"response_item\",\"n\":{}}}\n",
+                    i.wrapping_mul(2_654_435_761)
+                )
+            })
+            .collect();
+        let long = zstd::encode_all(format!("{ARCHIVE_ROLLOUT}{padding}").as_bytes(), 3).unwrap();
+        std::fs::write(&path, &long[..long.len() / 2]).unwrap();
+        let mut prefix = zstd::stream::read::Decoder::new(&long[..long.len() / 2]).unwrap();
+        let mut decoded = Vec::new();
+        assert!(prefix.read_to_end(&mut decoded).is_err());
+        assert!(
+            decoded.len() > ARCHIVE_ROLLOUT.len(),
+            "usage decodes before the cut"
+        );
+        assert_failed(parse_codex_file_incremental(
+            &path,
+            0,
+            CodexParseState::default(),
+        ));
+
+        std::fs::write(&path, ARCHIVE_ROLLOUT).unwrap();
+        assert_failed(parse_codex_file_incremental(
+            &path,
+            0,
+            CodexParseState::default(),
+        ));
+
+        std::fs::write(&path, &encoded).unwrap();
+        let state = CodexParseState::default;
+        assert_failed(parse_codex_archive(&path, 0, state(), decoded_len - 1));
+        assert_eq!(
+            parse_codex_archive(&path, 0, state(), decoded_len)
+                .messages
+                .len(),
+            2
+        );
+        assert_failed(parse_codex_file_incremental(&path, 1, state()));
     }
 }
