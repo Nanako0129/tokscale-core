@@ -7904,6 +7904,68 @@ mod tests {
         );
     }
 
+    /// #17: a generated client id (`cc-mirror/<variant>`) is not a scanner lane
+    /// (`ClientId::from_str` is None); the window must scan the producing claude
+    /// lane via `split_report_client_filter` and keep exactly the requested id.
+    /// Asserts on rows returned: the bug's signature is a plausible empty window.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_window_usage_slices_cc_mirror_variant_issue17() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", std::ffi::OsStr::new("1")),
+        ]);
+        let home = source_home.path();
+        write_claude_message(
+            &home.join(".claude/projects/p"),
+            "plain.jsonl",
+            "m-plain",
+            100,
+        );
+        let variant_dir = home.join(".cc-mirror/zai-worker");
+        let config_dir = variant_dir.join("config");
+        std::fs::create_dir_all(&variant_dir).unwrap();
+        std::fs::write(
+            variant_dir.join("variant.json"),
+            serde_json::json!({"name": "zai-worker", "provider": "zai", "configDir": config_dir})
+                .to_string(),
+        )
+        .unwrap();
+        write_claude_message(&config_dir.join("projects/p"), "v.jsonl", "m-variant", 7);
+
+        let window = |clients: Option<Vec<String>>| {
+            let options = ReportOptions {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                clients,
+                ..Default::default()
+            };
+            async move {
+                let usage = get_window_usage(options, 1767225600000 - 1, 1767225600000 + 1)
+                    .await
+                    .unwrap();
+                (
+                    usage.messages.len(),
+                    usage.messages.iter().map(|m| m.output).sum::<i64>(),
+                )
+            }
+        };
+        assert_eq!(window(None).await, (2, 107), "all clients");
+        assert_eq!(
+            window(Some(vec!["cc-mirror/zai-worker".into()])).await,
+            (1, 7),
+            "variant slice must not be empty"
+        );
+        assert_eq!(
+            window(Some(vec!["claude".into()])).await,
+            (1, 100),
+            "claude slice excludes the variant"
+        );
+    }
+
     async fn claude_window_output(context: &crate::ResolvedLocalSourceContext) -> i64 {
         let options = ReportOptions {
             clients: Some(vec!["claude".to_string()]),
