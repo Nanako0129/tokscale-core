@@ -15376,7 +15376,8 @@ mod tests {
             let mut archives = Vec::new();
             if let Some(keep_plain) = keep_plain {
                 for dir in ["sessions", "archived_sessions"] {
-                    let dir = source_home.path().join(".codex").join(dir);
+                    // The scanner's spelling, so these paths are the cache keys.
+                    let dir = scanner_fixture_path(source_home.path(), &format!(".codex/{dir}"));
                     // Listed before writing: entries added while a directory
                     // is being read may or may not be returned.
                     let plains: Vec<_> = std::fs::read_dir(&dir)
@@ -15441,23 +15442,7 @@ mod tests {
             with_isolated_tokscale_cache(streaming_cache.path(), || {
                 let cache = message_cache::SourceMessageCache::load();
                 let identity = message_cache::CacheIdentity::for_client(ClientId::Codex);
-                // Cache keys are the scanner's path strings, which on Windows
-                // mix separators (`format!("{}/archived_sessions", ..)`), so
-                // look them up exactly as the report's scan produced them.
-                let scanned = scanner::scan_all_clients_with_scanner_settings(
-                    &home,
-                    &clients,
-                    false,
-                    &scanner::ScannerSettings::default(),
-                );
-                let scanned: Vec<_> = scanned
-                    .get(ClientId::Codex)
-                    .iter()
-                    .filter(|path| sessions::codex::is_zst_path(path))
-                    .cloned()
-                    .collect();
-                assert_eq!(scanned.len(), archives.len());
-                for archive in &scanned {
+                for archive in &archives {
                     let entry = cache.get(identity, archive).expect("archive cached");
                     let fingerprint = message_cache::SourceFingerprint::from_path(archive).unwrap();
                     assert!(
