@@ -9441,6 +9441,171 @@ mod tests {
         );
     }
 
+    /// Claude S1a fixture lines: a bare prompt snapshot beside a real cache
+    /// split (#1392), a 1h split that arrives before its total (#1376), an
+    /// advisor iteration (#1398), and one turn compaction will drop.
+    const S1A_LIVE_LINES: &str = concat!(
+        r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_snap","message":{"id":"msg_snap","model":"claude-3-5-sonnet","usage":{"input_tokens":42494,"output_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.100Z","requestId":"req_snap","message":{"id":"msg_snap","model":"claude-3-5-sonnet","usage":{"input_tokens":265,"output_tokens":120,"cache_read_input_tokens":42000,"cache_creation_input_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2024-12-01T09:10:00.000Z","requestId":"req_1h","message":{"id":"msg_1h","model":"claude-3-5-sonnet","usage":{"cache_creation":{"ephemeral_1h_input_tokens":100000}}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2024-12-01T09:10:01.000Z","requestId":"req_1h","message":{"id":"msg_1h","model":"claude-3-5-sonnet","usage":{"cache_creation_input_tokens":100000}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2024-12-01T09:20:00.000Z","requestId":"req_adv","message":{"id":"msg_adv","model":"claude-opus-5-5","usage":{"input_tokens":4,"output_tokens":779,"cache_read_input_tokens":224791,"cache_creation_input_tokens":1763,"iterations":[{"type":"message","input_tokens":2,"output_tokens":351},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":114995,"output_tokens":2343,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]}}}"#,
+        "\n",
+    );
+    const S1A_DROPPED_LINE: &str = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_dropped","message":{"id":"msg_dropped","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+
+    /// `(rows, message_count, input, output, cache_read, cache_write)`
+    type S1aTotals = (usize, i64, i64, i64, i64, i64);
+
+    fn s1a_lane_totals(source_home: &Path) -> (S1aTotals, S1aTotals, S1aTotals, i64) {
+        let fold = |rows: &[UnifiedMessage]| -> S1aTotals {
+            rows.iter().fold((0, 0, 0, 0, 0, 0), |a, m| {
+                (
+                    a.0 + 1,
+                    a.1 + i64::from(m.message_count),
+                    a.2 + m.tokens.input,
+                    a.3 + m.tokens.output,
+                    a.4 + m.tokens.cache_read,
+                    a.5 + m.tokens.cache_write,
+                )
+            })
+        };
+        let materialized_rows = parse_claude_fixture(source_home);
+        let one_hour: i64 = materialized_rows
+            .iter()
+            .map(|m| m.tokens.cache_write_1h)
+            .sum();
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.to_str().unwrap(),
+            &["claude".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+        );
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            ..Default::default()
+        })
+        .unwrap();
+        let count_lane = counted.messages.iter().fold((0, 0, 0, 0, 0, 0), |a, m| {
+            (
+                a.0 + 1,
+                a.1 + i64::from(m.message_count),
+                a.2 + m.input,
+                a.3 + m.output,
+                a.4 + m.cache_read,
+                a.5 + m.cache_write,
+            )
+        });
+        (
+            fold(&materialized_rows),
+            fold(&streamed),
+            count_lane,
+            one_hour,
+        )
+    }
+
+    /// The three S1a fixes read the same on the materialized, streaming and
+    /// count lanes, each from a cold cache.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_s1a_fixes_agree_on_materialized_streaming_and_count_lanes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("session.jsonl"), S1A_LIVE_LINES).unwrap();
+
+        // Hand-derived from the literals above: snapshot 265/120/42000, the
+        // 1h turn writes 100000, the advisor adds its own row (4+114995).
+        let expected: S1aTotals = (
+            4,
+            3,
+            265 + 4 + 114995,
+            120 + 779 + 2343,
+            42000 + 224791,
+            100000 + 1763,
+        );
+        let (materialized, streaming, count, one_hour) = s1a_lane_totals(source_home.path());
+        assert_eq!(materialized, expected, "materialized lane");
+        assert_eq!(one_hour, 100000, "the 1h split must survive assembly");
+        // Each lane starts from a cold cache so none replays another's rows.
+        for entry in std::fs::read_dir(cache_home.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+        assert_eq!(streaming, expected, "streaming lane");
+        assert_eq!(count, expected, "count lane");
+    }
+
+    /// A shard a v4 build left behind for an unchanged transcript is re-parsed
+    /// by this build, and the turn only the cache holds survives the upgrade.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_pv4_same_fingerprint_shard_reparses_and_keeps_retained_turns() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+        let claude_dir = source_home.path().join(".claude/projects/myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let transcript = claude_dir.join("session.jsonl");
+        let input_sum = || {
+            parse_claude_fixture(source_home.path())
+                .iter()
+                .map(|m| m.tokens.input)
+                .sum::<i64>()
+        };
+
+        std::fs::write(&transcript, format!("{S1A_LIVE_LINES}{S1A_DROPPED_LINE}\n")).unwrap();
+        assert_eq!(input_sum(), 265 + 4 + 114995 + 100);
+        // Compaction: only the cache holds the dropped turn from here on.
+        std::fs::write(&transcript, S1A_LIVE_LINES).unwrap();
+        assert_eq!(input_sum(), 265 + 4 + 114995 + 100, "retained");
+
+        // What a v4 build computed: the snapshot's whole-prompt input won the
+        // max (42494), and no advisor row existed. Stamp it pv 4.
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        let mut cache = message_cache::SourceMessageCache::load();
+        let mut entry = cache.entries.values().next().unwrap().clone();
+        entry.messages.retain(|m| {
+            !m.dedup_key
+                .as_deref()
+                .is_some_and(|k| k.contains(":advisor:"))
+        });
+        for message in entry.messages.iter_mut() {
+            if message.dedup_key.as_deref() == Some("msg_snap:req_snap") {
+                message.tokens.input = 42494;
+            }
+        }
+        cache.insert(entry);
+        cache.save_if_dirty();
+        message_cache::set_shard_parser_version_for_test(identity, 4);
+
+        assert_eq!(
+            input_sum(),
+            265 + 4 + 114995 + 100,
+            "live turns re-parse under pv 5 (snapshot 265, advisor row back) and the retained turn survives"
+        );
+    }
+
     /// The migrated entry has to outlive a scan that never reaches its source:
     /// the load queues the shard for rewrite either way, and the history is
     /// gone if the rewrite does not carry it. `modified_after` prunes the file

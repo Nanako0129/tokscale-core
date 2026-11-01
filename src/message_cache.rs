@@ -936,7 +936,13 @@ fn parser_version(client: ClientId) -> u32 {
         // `cache_write_1h` stays zero and its cost stays at the old value.
         // Cold-cache verification passes either way, which is exactly why
         // the acceptance for this change is a warm-cache measurement.
-        ClientId::Claude => 4,
+        // 5: the 1h split is clamped after duplicate assembly (a split that
+        // arrived before its total is kept), a bare prompt snapshot no longer
+        // maxes `input` against a real cache split, and advisor
+        // `usage.iterations` become their own rows. A v4 shard keeps its
+        // retained-only turns across this bump (non-lossy upgrade); the
+        // converse does not hold: a pv-4 engine reads a pv-5 shard as Stale.
+        ClientId::Claude => 5,
         // 2: Droid's cumulative session tokenUsage is now anchored on the
         // settings file's mtime (floored at providerLockTimestamp, via
         // parse_lock_timestamp/resolve_usage_timestamp) instead of the lock
@@ -4704,6 +4710,50 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    /// Pins the downgrade loss documented in the upgrade plan: a shard written
+    /// at Claude pv 5 is Stale to an engine that only knows pv 4, so that
+    /// engine rewrites it from an empty map and drops the retained-only turns.
+    /// Restoring the pre-upgrade `claude/` backup is the only lossless rollback.
+    #[test]
+    #[serial_test::serial]
+    fn test_a_claude_pv5_shard_read_with_a_pv4_identity_is_stale() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"claude transcript\n");
+        let claude = CacheIdentity::for_client(ClientId::Claude);
+        assert_eq!(claude.parser_version, 5);
+
+        let entry = CachedSourceEntry::new(
+            claude,
+            source.path(),
+            SourceFingerprint::from_path(source.path()).unwrap(),
+            vec![keyed_message(
+                claude.namespace,
+                "session",
+                "msg_kept:req_kept",
+            )],
+            Vec::new(),
+            None,
+        )
+        .with_retained_keys(HashSet::from(["msg_kept:req_kept".to_string()]));
+        let path = seed_shard(claude, source.path(), vec![entry]);
+
+        assert!(matches!(
+            read_shard(&path, claude),
+            ShardReadStatus::Loaded(_)
+        ));
+        let pv4 = CacheIdentity {
+            namespace: claude.namespace,
+            parser_version: 4,
+        };
+        assert!(
+            matches!(read_shard(&path, pv4), ShardReadStatus::Stale),
+            "a downgrade cannot read what a newer build wrote"
+        );
+
+        restore_cache_env(prev_env);
+    }
+
     /// Shared body for the Grok same-fingerprint parser-invalidation tests:
     /// a shard written under an older parser version, with an unchanged
     /// source file, must be treated as stale and cold-rebuilt rather than
@@ -6109,8 +6159,10 @@ mod tests {
         // the 1h/5m cache-write split. Each of those changed what a parse
         // produces from an unchanged transcript, which is the whole reason
         // this number exists -- without the bump `get` treats a stale entry
-        // as a hit and the new parse never runs.
-        assert_eq!(parser_version(ClientId::Claude), 4);
+        // as a hit and the new parse never runs. 5 is the S1a parser
+        // correctness set (1h clamp after assembly, bare-snapshot input,
+        // advisor iterations).
+        assert_eq!(parser_version(ClientId::Claude), 5);
         // 2 is the transcript-weighted per-reply attribution split (vendor-local
         // numbering; never upstream's 7 — see UPSTREAM.md).
         assert_eq!(parser_version(ClientId::Droid), 2);
