@@ -672,16 +672,18 @@ impl RelatedFileFingerprint {
 /// resolved, so the parent must be probed again when anything changes. Probing
 /// reads up to `PARENT_PROBE_MAX_BYTES`, so a warm check does not do it up
 /// front: it assumes the empty list (second return value `true`) and the caller
-/// probes only if that fingerprint turns out `Changed`. With the transcript and
-/// every related file unchanged the answer cannot differ, which is why the
-/// cached empty list is good enough for a hit.
+/// probes only if that fingerprint turns out `Changed`. The probe's answer
+/// depends only on the transcript, so with the transcript and every related
+/// file unchanged a correctly cached empty list stays correct; the gaps below
+/// are the cases where the cached list was wrong to begin with.
 ///
 /// Known gaps. A meta rewritten to a non-resolving one, or deleted, between the
 /// tier-1 read and the snapshot of it taken for the fingerprint can leave a
 /// parent-less entry whose recorded meta matches the file, so no later check
 /// repairs it; it lasts until the meta or the transcript changes. An unreadable
-/// meta gives no fingerprint at all, so the file is not cached and the parent
-/// is probed on every scan, with that scan's full parse.
+/// meta gives no fingerprint, so every scan does a full parse; an entry cached
+/// before the meta became unreadable is neither replaced nor removed, and the
+/// parent is not probed for it.
 fn claude_code_related_paths(
     path: &Path,
     home_dir: Option<&Path>,
@@ -4179,8 +4181,8 @@ mod tests {
     }
 
     /// A subagent-layout transcript with no meta and no parent to find is
-    /// probed when first fingerprinted and not again on warm checks: only a
-    /// present meta can have resolved and dropped the parents.
+    /// probed when first fingerprinted and not again on warm checks: the
+    /// probe runs only after a `Changed` fingerprint, and nothing changed.
     #[test]
     fn test_claude_subagent_without_meta_or_parent_is_probed_once() {
         use crate::sessions::claudecode::PARENT_PROBES;
