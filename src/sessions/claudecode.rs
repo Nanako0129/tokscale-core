@@ -550,6 +550,9 @@ pub fn parse_claude_file_with_cache_and_home(
 pub(crate) struct ClaudeParse {
     pub messages: Vec<UnifiedMessage>,
     pub checkpoint: Option<ClaudeCheckpoint>,
+    /// A read error ended the parse early: `messages` are what was read
+    /// before it. The caller must not cache them as the file's whole truth.
+    pub read_failed: bool,
 }
 
 /// Where a parse stopped, and enough to prove a later parse may continue from
@@ -654,7 +657,13 @@ impl ClaudeCheckpoint {
             .is_some_and(|digest| digest == self.integrity_digest)
     }
 
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "macos")
+        )
+    ))]
     pub(crate) fn corrupt_state_for_test(&mut self) {
         self.state.pending_turn_start = !self.state.pending_turn_start;
     }
@@ -711,14 +720,95 @@ struct ClaudeParseStart {
 const CLAUDE_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Checkpoints (and so resume) exist only where hashing the whole transcript
-/// prefix is cheap: x86_64 (sha2 detects SHA-NI at run time) and macOS arm64
-/// (sha2's `asm` feature, see Cargo.toml). Elsewhere sha2 is the portable
-/// backend, hashing costs about as much as parsing, and a checkpoint would
-/// only slow every cold parse; those targets parse exactly as before.
-pub(crate) const CLAUDE_CHECKPOINTS: bool = cfg!(any(
+/// prefix is cheap, because every cold parse pays for the hash and every
+/// resume re-hashes the prefix. Measured: macOS arm64 with sha2's `asm`
+/// feature (see Cargo.toml), 361 MB in 131 ms against 672 ms for the portable
+/// backend, which is slower than parsing the same bytes. x86_64 is decided at
+/// run time by the same CPU features sha2 itself requires for its SHA-NI
+/// backend (not measured here); a CPU without them gets the portable backend.
+/// Other targets parse exactly as before.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub(crate) fn claude_checkpoints_enabled() -> bool {
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn claude_checkpoints_enabled() -> bool {
+    // Unit tests exercise the checkpoint logic on any x86_64 CPU.
+    cfg!(test)
+        || (std::arch::is_x86_feature_detected!("sha")
+            && std::arch::is_x86_feature_detected!("sse2")
+            && std::arch::is_x86_feature_detected!("ssse3")
+            && std::arch::is_x86_feature_detected!("sse4.1"))
+}
+
+#[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "aarch64", target_os = "macos")
-));
+)))]
+pub(crate) fn claude_checkpoints_enabled() -> bool {
+    false
+}
+
+/// Test seam: make the parse of `path` fail every read after `after_bytes`.
+#[cfg(test)]
+static READ_FAULTS: std::sync::Mutex<Option<HashMap<PathBuf, u64>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_read_fault_for_test(path: &Path, after_bytes: Option<u64>) {
+    let mut faults = READ_FAULTS.lock().unwrap();
+    let faults = faults.get_or_insert_with(HashMap::new);
+    match after_bytes {
+        Some(n) => faults.insert(path.to_path_buf(), n),
+        None => faults.remove(path),
+    };
+}
+
+#[cfg(test)]
+fn read_fault_for_test(path: &Path) -> Option<u64> {
+    READ_FAULTS.lock().unwrap().as_ref()?.get(path).copied()
+}
+
+/// Yields at most `remaining` bytes of `inner`, then fails reads. The failures
+/// are finite (then EOF) so a parser that keeps retrying ends with a wrong
+/// result instead of hanging the suite; the always-failing case is covered by
+/// a bounded test of its own.
+#[cfg(test)]
+struct FailAfter<R> {
+    inner: R,
+    remaining: u64,
+    failures_left: u32,
+}
+
+#[cfg(test)]
+impl<R> FailAfter<R> {
+    fn new(inner: R, remaining: u64) -> Self {
+        Self {
+            inner,
+            remaining,
+            failures_left: 1000,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<R: std::io::Read> std::io::Read for FailAfter<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            if self.failures_left == 0 {
+                return Ok(0);
+            }
+            self.failures_left -= 1;
+            return Err(std::io::Error::other("injected read error"));
+        }
+        let limit = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut buf[..limit])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
 
 /// Parse a transcript from its first byte, ending in a checkpoint when one is
 /// safe to take.
@@ -745,7 +835,25 @@ pub(crate) fn resume_claude_file(
     checkpoint: &ClaudeCheckpoint,
     cached_messages: &[UnifiedMessage],
 ) -> Option<ClaudeParse> {
-    if !CLAUDE_CHECKPOINTS || is_workflow_journal(path) {
+    resume_claude_file_with(
+        path,
+        home_dir,
+        checkpoint,
+        cached_messages,
+        &UnifiedMessage::refresh_derived_fields,
+    )
+}
+
+/// `refresh_date` re-derives a cached message's local-time `date`; a test
+/// passes explicit zones instead of mutating the process time zone.
+fn resume_claude_file_with(
+    path: &Path,
+    home_dir: Option<&Path>,
+    checkpoint: &ClaudeCheckpoint,
+    cached_messages: &[UnifiedMessage],
+    refresh_date: &dyn Fn(&mut UnifiedMessage),
+) -> Option<ClaudeParse> {
+    if !claude_checkpoints_enabled() || is_workflow_journal(path) {
         return None;
     }
     let context = ClaudeFileContext::new(path, home_dir);
@@ -770,12 +878,6 @@ pub(crate) fn resume_claude_file(
     for &(index, cache_write_1h) in &checkpoint.unclamped_cache_write_1h {
         messages.get_mut(index)?.tokens.cache_write_1h = cache_write_1h;
     }
-    // `date` is local-time and was derived when the prefix was first parsed,
-    // possibly under another time zone. Re-derive it, as a cold parse and the
-    // cache-hit path do (the digest above covers the cached form).
-    for message in &mut messages {
-        message.refresh_derived_fields();
-    }
 
     let mut reader = BufReader::with_capacity(CLAUDE_READ_BUFFER_BYTES, file);
     let mut prefix_hasher = Sha256::new();
@@ -795,12 +897,19 @@ pub(crate) fn resume_claude_file(
     if prefix_hasher.clone().finalize()[..] != checkpoint.prefix_sha256[..] {
         return None;
     }
+    // `date` is local-time and was derived when the prefix was first parsed,
+    // possibly under another time zone. Re-derive it, as a cold parse and the
+    // cache-hit path do (the digest covers the cached form). Only a resume
+    // that will go ahead pays for the walk.
+    for message in &mut messages {
+        refresh_date(message);
+    }
 
     let mut parent_cache = ParentSubagentTypeCache::new();
     Some(parse_claude_lines(
         path,
         &context,
-        reader,
+        Box::new(reader),
         ClaudeParseStart {
             prefix_hasher: Some(prefix_hasher),
             consumed_offset: checkpoint.consumed_offset,
@@ -820,6 +929,7 @@ fn parse_claude_file_internal(
     let no_messages = || ClaudeParse {
         messages: Vec::new(),
         checkpoint: None,
+        read_failed: false,
     };
     // Workflow orchestration journals are metadata, not transcripts — never ingest.
     if is_workflow_journal(path) {
@@ -844,6 +954,7 @@ fn parse_claude_file_internal(
             return ClaudeParse {
                 messages: json_messages,
                 checkpoint: None,
+                read_failed: false,
             };
         }
     }
@@ -852,12 +963,20 @@ fn parse_claude_file_internal(
         return no_messages();
     };
 
+    let reader = BufReader::with_capacity(CLAUDE_READ_BUFFER_BYTES, file);
+    #[cfg(test)]
+    let reader: Box<dyn BufRead> = match read_fault_for_test(path) {
+        Some(after_bytes) => Box::new(BufReader::new(FailAfter::new(reader, after_bytes))),
+        None => Box::new(reader),
+    };
+    #[cfg(not(test))]
+    let reader: Box<dyn BufRead> = Box::new(reader);
     parse_claude_lines(
         path,
         &context,
-        BufReader::with_capacity(CLAUDE_READ_BUFFER_BYTES, file),
+        reader,
         ClaudeParseStart {
-            prefix_hasher: (capture_checkpoint && CLAUDE_CHECKPOINTS).then(Sha256::new),
+            prefix_hasher: (capture_checkpoint && claude_checkpoints_enabled()).then(Sha256::new),
             consumed_offset: 0,
             messages: Vec::with_capacity(64),
             state: ClaudeParseState {
@@ -897,7 +1016,7 @@ fn claude_message_digest(messages: &[UnifiedMessage]) -> Option<[u8; 32]> {
 fn parse_claude_lines(
     path: &Path,
     context: &ClaudeFileContext,
-    mut reader: BufReader<std::fs::File>,
+    mut reader: Box<dyn BufRead + '_>,
     start: ClaudeParseStart,
     parent_cache: &mut ParentSubagentTypeCache,
 ) -> ClaudeParse {
@@ -949,6 +1068,7 @@ fn parse_claude_lines(
     // current offset: a message stamped with the file's mtime (which moves as
     // the file grows), a headless message, or a read error.
     let mut checkpoint_blocked = context.is_json;
+    let mut read_failed = false;
 
     loop {
         raw_line.clear();
@@ -963,8 +1083,9 @@ fn parse_claude_lines(
             }
             Err(_) => {
                 // A persistent error (EIO) would never reach `Ok(0)`: keep what
-                // was parsed so far and stop.
+                // was parsed so far and stop. The caller must not cache it.
                 checkpoint_blocked = true;
+                read_failed = true;
                 break;
             }
         }
@@ -1324,6 +1445,7 @@ fn parse_claude_lines(
     ClaudeParse {
         messages,
         checkpoint,
+        read_failed,
     }
 }
 
@@ -4827,41 +4949,14 @@ mod resume_tests {
         assert_eq!(messages[0].tokens.cache_write_1h, 100000);
     }
 
-    #[cfg(unix)]
-    extern "C" {
-        fn tzset();
-    }
-
     /// `date` is local-time and was derived when the prefix was first parsed.
-    /// A resume under another time zone must re-derive it, as a cold parse does.
-    #[cfg(unix)]
+    /// A resume must re-derive it for the cached prefix (explicit zones are
+    /// injected; the process time zone is never touched).
     #[test]
-    #[serial_test::serial]
-    fn test_resume_rederives_date_under_the_current_time_zone() {
-        // chrono::Local on macOS calls localtime_r, which only re-reads TZ
-        // after tzset; this is the seam to switch zones in-process.
-        fn set_tz(zone: &str) {
-            unsafe {
-                std::env::set_var("TZ", zone);
-                tzset();
-            }
-        }
-        struct RestoreTz(Option<std::ffi::OsString>);
-        impl Drop for RestoreTz {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.0.take() {
-                        Some(value) => std::env::set_var("TZ", value),
-                        None => std::env::remove_var("TZ"),
-                    }
-                    tzset();
-                }
-            }
-        }
-        let _restore = RestoreTz(std::env::var_os("TZ"));
+    fn test_resume_rederives_the_prefix_date() {
         let line = |n: u32| {
             format!(
-                r#"{{"type":"assistant","timestamp":"2026-10-01T20:{n:02}:00.000Z","requestId":"r{n}","message":{{"id":"m{n}","model":"claude-sonnet-4-5","usage":{{"input_tokens":3,"output_tokens":1}}}}}}"#
+                r#"{{"type":"assistant","timestamp":"2026-10-01T12:{n:02}:00.000Z","requestId":"r{n}","message":{{"id":"m{n}","model":"claude-sonnet-4-5","usage":{{"input_tokens":3,"output_tokens":1}}}}}}"#
             )
             .into_bytes()
             .into_iter()
@@ -4870,37 +4965,28 @@ mod resume_tests {
         };
         let dir = TempDir::new().unwrap();
         let path = transcript_path(&dir);
-        // chrono caches the zone per thread (and re-checks it at most once a
-        // second), so each phase runs on a fresh thread.
-        let on_thread = |zone: &str, f: &(dyn Fn() + Sync)| {
-            set_tz(zone);
-            std::thread::scope(|scope| {
-                scope.spawn(f).join().unwrap();
-            });
-        };
-        let first = std::sync::Mutex::new(None);
         append(&path, &[line(0), line(1)]);
-        on_thread("UTC", &|| {
-            let first_parse = parse_claude_file_with_checkpoint(&path, None);
-            assert_eq!(
-                first_parse.messages[0].date, "2026-10-01",
-                "built under UTC"
-            );
-            *first.lock().unwrap() = Some(first_parse);
-        });
-        let first = first.into_inner().unwrap().unwrap();
+        let first = parse_claude_file_with_checkpoint(&path, None);
         let checkpoint = first.checkpoint.clone().unwrap();
         append(&path, &[line(2)]);
-        on_thread("Asia/Taipei", &|| {
-            let resumed = resume_claude_file(&path, None, &checkpoint, &first.messages).unwrap();
-            let full = parse_claude_file_with_checkpoint(&path, None);
-            assert_eq!(
-                full.messages[0].date, "2026-10-02",
-                "cold parse under Taipei"
-            );
-            assert_eq!(resumed.messages, full.messages);
-            assert_eq!(resumed.checkpoint, full.checkpoint);
-        });
+
+        // 12:00Z is 2026-10-02 at +14:00 and 2026-10-01 at -12:00, so the
+        // process zone (whatever it is) disagrees with at least one of them.
+        let mut stale_somewhere = false;
+        for (offset_hours, expected) in [(14, "2026-10-02"), (-12, "2026-10-01")] {
+            let zone = chrono::FixedOffset::east_opt(offset_hours * 3600).unwrap();
+            let resumed =
+                resume_claude_file_with(&path, None, &checkpoint, &first.messages, &|m| {
+                    m.date = super::super::timestamp_to_date_with_timezone(m.timestamp, &zone)
+                })
+                .unwrap();
+            assert_eq!(resumed.messages.len(), 3);
+            for message in &resumed.messages[..2] {
+                assert_eq!(message.date, expected, "prefix date in {zone}");
+                stale_somewhere |= first.messages[0].date != expected;
+            }
+        }
+        assert!(stale_somewhere, "one zone must differ from the cached date");
     }
 
     #[test]
@@ -4949,18 +5035,79 @@ mod checkpoint_gate_tests {
         .unwrap();
         let parsed = parse_claude_file_with_checkpoint(&path, None);
         assert_eq!(parsed.messages.len(), 1);
-        assert_eq!(parsed.checkpoint.is_some(), CLAUDE_CHECKPOINTS);
+        assert_eq!(parsed.checkpoint.is_some(), claude_checkpoints_enabled());
     }
 
-    /// A reader that fails on every read (a directory opens, then EISDIR on
-    /// each read, like a persistent EIO) must end the parse, not spin.
+    struct AlwaysErr;
+    impl std::io::Read for AlwaysErr {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("EIO"))
+        }
+    }
+
+    fn empty_start(context: &ClaudeFileContext) -> ClaudeParseStart {
+        ClaudeParseStart {
+            prefix_hasher: Some(Sha256::new()),
+            consumed_offset: 0,
+            messages: Vec::new(),
+            state: ClaudeParseState {
+                session_id: context.file_session_id.clone(),
+                ..ClaudeParseState::default()
+            },
+        }
+    }
+
+    /// A reader that fails on every read must end the parse (it once spun),
+    /// report the failure and take no checkpoint. Bounded, so a regression
+    /// fails in seconds instead of hanging the suite.
     #[test]
     fn test_a_persistent_read_error_ends_the_parse() {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let path = Path::new("/nonexistent/.claude/projects/-tmp-demo/session.jsonl");
+            let context = ClaudeFileContext::new(path, None);
+            let reader = Box::new(BufReader::new(AlwaysErr));
+            let mut parent_cache = ParentSubagentTypeCache::new();
+            let parsed = parse_claude_lines(
+                path,
+                &context,
+                reader,
+                empty_start(&context),
+                &mut parent_cache,
+            );
+            let _ = done.send((
+                parsed.messages.len(),
+                parsed.checkpoint.is_none(),
+                parsed.read_failed,
+            ));
+        });
+        let outcome = result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the parse must terminate on a persistent read error");
+        assert_eq!(outcome, (0, true, true));
+    }
+
+    /// An error in the middle keeps what was read before it, flags the parse
+    /// incomplete and takes no checkpoint.
+    #[test]
+    fn test_a_read_error_mid_file_keeps_earlier_messages_and_flags_the_parse() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("broken.jsonl");
-        std::fs::create_dir(&path).unwrap();
+        let path = transcript(&dir);
+        let line = |n: u32| {
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"2026-10-01T10:00:0{n}.000Z\",\"requestId\":\"r{n}\",\"message\":{{\"id\":\"m{n}\",\"model\":\"claude-sonnet-4-5\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":1}}}}}}\n"
+            )
+        };
+        let first = line(1);
+        std::fs::write(&path, format!("{first}{}", line(2))).unwrap();
+        set_read_fault_for_test(&path, Some(first.len() as u64));
         let parsed = parse_claude_file_with_checkpoint(&path, None);
-        assert!(parsed.messages.is_empty());
+        set_read_fault_for_test(&path, None);
+        assert_eq!(parsed.messages.len(), 1);
+        assert!(parsed.read_failed);
         assert!(parsed.checkpoint.is_none());
+        let healthy = parse_claude_file_with_checkpoint(&path, None);
+        assert_eq!(healthy.messages.len(), 2);
+        assert!(!healthy.read_failed);
     }
 }

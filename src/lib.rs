@@ -1157,7 +1157,8 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         fn from(parsed: sessions::claudecode::ClaudeParse) -> Self {
             Self {
                 messages: parsed.messages,
-                cacheable: true,
+                // A read error left a truncated parse: never cache it.
+                cacheable: !parsed.read_failed,
                 claude_checkpoint: parsed.checkpoint,
             }
         }
@@ -4041,6 +4042,8 @@ enum ClaudeStageA {
         fingerprint: Option<message_cache::SourceFingerprint>,
         /// Where a later scan of this transcript resumes; stage B stores it.
         checkpoint: Option<Box<sessions::claudecode::ClaudeCheckpoint>>,
+        /// False when a read error truncated the parse: not cached.
+        cacheable: bool,
     },
 }
 
@@ -4101,6 +4104,7 @@ fn claude_stage_a(
         messages: parsed.messages,
         fingerprint,
         checkpoint: parsed.checkpoint.map(Box::new),
+        cacheable: !parsed.read_failed,
     }
 }
 
@@ -4444,9 +4448,12 @@ where
                     messages: mut msgs,
                     fingerprint,
                     checkpoint,
+                    cacheable,
                 } => {
                     let mut retained_keys: HashSet<String> = HashSet::new();
-                    if let Some(fingerprint) = fingerprint {
+                    // A truncated parse is neither retained against nor cached
+                    // (the materialized lane does the same).
+                    if let Some(fingerprint) = fingerprint.filter(|_| cacheable) {
                         retained_keys = retain_observed_messages(
                             &mut msgs,
                             source_cache.retainable_history(claude_identity, path),
@@ -9992,6 +9999,59 @@ mod tests {
                 s1b_cold_scan(lane, source_home.path(), cold_home.path()),
                 "{lane:?}: never a wrong result"
             );
+        }
+    }
+
+    /// A read error that truncates a parse must not be cached as the file's
+    /// whole truth: no entry is inserted by either lane (a later healthy scan
+    /// then caches the full file).
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_read_error_mid_file_is_not_cached_by_either_lane() {
+        for lane in [S1bLane::Materialized, S1bLane::Streaming] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(&[
+                ("HOME", cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ]);
+            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let path = claude_dir.join("session.jsonl");
+            let first = s1b_turn(1, 5);
+            std::fs::write(&path, format!("{first}{}", s1b_turn(2, 1))).unwrap();
+            let cached_entries = || {
+                let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+                let mut cache = message_cache::SourceMessageCache::load();
+                cache.ensure_namespace_loaded(identity);
+                cache.entries.len()
+            };
+
+            sessions::claudecode::set_read_fault_for_test(&path, Some(first.len() as u64));
+            let rows = s1b_scan(lane, source_home.path());
+            sessions::claudecode::set_read_fault_for_test(&path, None);
+            assert_eq!(
+                rows.len(),
+                1,
+                "{lane:?}: only what was read before the error"
+            );
+            assert_eq!(
+                cached_entries(),
+                0,
+                "{lane:?}: a truncated parse is not cached"
+            );
+
+            let rows = s1b_scan(lane, source_home.path());
+            assert_eq!(
+                rows.len(),
+                2,
+                "{lane:?}: the healthy rescan sees the whole file"
+            );
+            assert_eq!(cached_entries(), 1, "{lane:?}: and caches it");
         }
     }
 
