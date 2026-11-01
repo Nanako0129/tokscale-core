@@ -1094,7 +1094,8 @@ fn merge_claude_duplicate(
     // When only one side reports the split, that side wins outright; when both
     // or neither do, the units agree and the max stands.
     match (usage.reports_cache_split(), existing_input_is_split) {
-        // A missing input is a no-op whatever `reports_cache_split` decides.
+        // Unreachable today (`reports_cache_split` requires a stated input);
+        // kept so a future loosening of that rule can't zero a snapshot's input.
         (true, false) => {
             if let Some(input) = usage.input_tokens {
                 t.input = input.max(0);
@@ -1138,9 +1139,9 @@ fn merge_claude_duplicate(
 ///
 /// Known limitation: the cached `TokenBreakdown` stores "stated input 0" and
 /// "input missing" both as 0, so a fully cached turn that stated input 0
-/// (cache_read > 0) merged with an earlier cached bare snapshot keeps the
-/// snapshot's input here, while a cold parse of the same lines gives 0. Rare,
-/// and recorded in UPSTREAM.md.
+/// (cache_read > 0) merged with a cached bare snapshot keeps the snapshot's
+/// input here in either order, while a cold parse of the same lines gives 0.
+/// How often this occurs is not measured; recorded in UPSTREAM.md.
 pub(crate) fn merge_cached_input(existing: &TokenBreakdown, stored: &TokenBreakdown) -> i64 {
     let has_cache = |t: &TokenBreakdown| t.cache_read > 0 || t.cache_write > 0;
     match (has_cache(existing), has_cache(stored)) {
