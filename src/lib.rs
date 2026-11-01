@@ -4007,8 +4007,10 @@ const PARSE_BATCH_SIZE: usize = 32;
 /// `related_files` takes the full parse. The parent session is a related file
 /// only for a subagent whose `.meta.json` does not resolve a name (see
 /// `claude_code_related_paths` in `message_cache.rs`); for one that does, a
-/// parent change leaves the entry alone and the subagent resumes on its own
-/// growth. Retained history after the live
+/// parent change leaves the entry alone. Where checkpoints exist
+/// (`CLAUDE_CHECKPOINTS`, macOS arm64) such a subagent then resumes on its
+/// own growth; elsewhere a changed transcript is always a full parse. Retained
+/// history after the live
 /// prefix is not the checkpoint's concern: `resume_claude_file` verifies only
 /// the first `message_count` messages.
 fn resume_claude_source(

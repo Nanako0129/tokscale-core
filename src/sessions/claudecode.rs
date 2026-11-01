@@ -165,8 +165,6 @@ fn clamp_cache_write_1h(cache_write: i64, cache_write_1h: i64) -> i64 {
 /// other: tiers 2 and 3 need a parent session id and a parent-subagent cache
 /// that the refresh has no access to.
 pub(crate) fn subagent_name_from_meta_sidecar(path: &Path) -> Option<String> {
-    #[cfg(test)]
-    META_SIDECAR_READS.with(|reads| reads.set(reads.get() + 1));
     let stem = path.file_stem().and_then(|s| s.to_str())?;
     let meta_path = path.with_file_name(format!("{}.meta.json", stem));
     let text = std::fs::read_to_string(&meta_path).ok()?;
@@ -286,11 +284,10 @@ fn find_parent_session_path(sidechain_path: &Path, parent_session_id: &str) -> O
 /// from triggering a whole-file read on every warm cache validation.
 const PARENT_PROBE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-// Per-thread call counters for the fingerprint tests: they assert that a warm
-// check does not read an unchanged `.meta.json` or probe a parent again.
+// Per-thread call counter for the fingerprint tests: they assert that a warm
+// check does not probe a parent again.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static META_SIDECAR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static PARENT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
