@@ -266,24 +266,7 @@ impl SourceFingerprint {
         path: &Path,
         home_dir: Option<&Path>,
     ) -> Option<Self> {
-        let mut related = Vec::new();
-
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            let meta_filename = format!("{}.meta.json", stem);
-            related.push((".meta.json".to_string(), path.with_file_name(meta_filename)));
-        }
-
-        if let Some(variant_path) = crate::cc_mirror::variant_file_for_session_path(path, home_dir)
-        {
-            related.push(("cc-mirror/variant.json".to_string(), variant_path));
-        }
-        for (index, parent_path) in
-            crate::sessions::claudecode::parent_session_paths_for_cache(path)
-                .into_iter()
-                .enumerate()
-        {
-            related.push((format!("parent-session-{index}.jsonl"), parent_path));
-        }
+        let related = claude_code_related_paths(path, home_dir, None);
 
         Self::from_path_with_related_mode(path, related, ContentHashMode::SamplesOnly)
     }
@@ -424,33 +407,13 @@ impl SourceFingerprint {
         home_dir: Option<&Path>,
         mode: ContentHashMode,
     ) -> Option<FingerprintStatus> {
-        let mut related = Vec::new();
-
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            let meta_filename = format!("{}.meta.json", stem);
-            related.push((".meta.json".to_string(), path.with_file_name(meta_filename)));
-        }
-
-        if let Some(variant_path) = crate::cc_mirror::variant_file_for_session_path(path, home_dir)
-        {
-            related.push(("cc-mirror/variant.json".to_string(), variant_path));
-        }
-
         let primary_matches =
             cached.and_then(|fingerprint| primary_fingerprint_matches(path, fingerprint));
-        let parent_paths = cached
-            .filter(|_| primary_matches == Some(true))
-            .map(cached_claude_parent_paths)
-            .unwrap_or_else(|| {
-                crate::sessions::claudecode::parent_session_paths_for_cache(path)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, parent_path)| {
-                        (format!("parent-session-{index}.jsonl"), parent_path)
-                    })
-                    .collect()
-            });
-        related.extend(parent_paths);
+        let related = claude_code_related_paths(
+            path,
+            home_dir,
+            cached.filter(|_| primary_matches == Some(true)),
+        );
 
         Self::check_path_with_related_mode_and_primary(path, related, cached, mode, primary_matches)
     }
@@ -676,6 +639,47 @@ impl RelatedFileFingerprint {
             Err(_) => None,
         }
     }
+}
+
+/// Related files of a Claude Code transcript. `warm` is the cached fingerprint
+/// when the transcript itself is unchanged, so its probed parent paths can be
+/// reused instead of re-reading the file head.
+///
+/// The parent session only names a subagent when tier 1 (the `.meta.json`
+/// `agentType`) cannot, so a resolving tier 1 leaves it out and a parent append
+/// stops invalidating every subagent of that session. `.meta.json` stays
+/// related: rewriting it re-evaluates this rule. A cached fingerprint with no
+/// parent entry may have dropped them while tier 1 resolved, so once tier 1
+/// fails the parent is probed afresh rather than trusting the empty list.
+fn claude_code_related_paths(
+    path: &Path,
+    home_dir: Option<&Path>,
+    warm: Option<&SourceFingerprint>,
+) -> Vec<(String, PathBuf)> {
+    let mut related = Vec::new();
+
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        let meta_filename = format!("{}.meta.json", stem);
+        related.push((".meta.json".to_string(), path.with_file_name(meta_filename)));
+    }
+
+    if let Some(variant_path) = crate::cc_mirror::variant_file_for_session_path(path, home_dir) {
+        related.push(("cc-mirror/variant.json".to_string(), variant_path));
+    }
+
+    if crate::sessions::claudecode::subagent_name_from_meta_sidecar(path).is_none() {
+        let cached_parents = warm
+            .map(cached_claude_parent_paths)
+            .filter(|parents| !parents.is_empty());
+        related.extend(cached_parents.unwrap_or_else(|| {
+            crate::sessions::claudecode::parent_session_paths_for_cache(path)
+                .into_iter()
+                .enumerate()
+                .map(|(index, parent_path)| (format!("parent-session-{index}.jsonl"), parent_path))
+                .collect()
+        }));
+    }
+    related
 }
 
 fn cached_claude_parent_paths(cached: &SourceFingerprint) -> Vec<(String, PathBuf)> {
@@ -3979,6 +3983,183 @@ mod tests {
             ),
             Some(FingerprintStatus::Changed(_))
         ));
+    }
+
+    /// A nested subagent transcript with its parent session and a `.meta.json`
+    /// path (not yet written): `(sidechain, parent, meta)`.
+    fn s1c_subagent_fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let project_dir = dir.join("projects/project-one");
+        let subagents = project_dir.join("parent-session/subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let sidechain = subagents.join("agent-child.jsonl");
+        std::fs::write(
+            &sidechain,
+            concat!(
+                r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-session","agentId":"child","timestamp":"2026-01-01T00:00:00Z","requestId":"req-1","message":{"id":"msg-1","model":"claude-sonnet-4","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let parent = project_dir.join("parent-session.jsonl");
+        std::fs::write(&parent, b"parent line 1\n").unwrap();
+        (sidechain, parent, subagents.join("agent-child.meta.json"))
+    }
+
+    fn s1c_append(path: &Path, text: &str) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    fn s1c_check(path: &Path, cached: Option<&SourceFingerprint>) -> FingerprintStatus {
+        SourceFingerprint::check_claude_code_path_with_home_samples_only(path, cached, None)
+            .expect("fingerprintable")
+    }
+
+    fn s1c_has_parent(fingerprint: &SourceFingerprint) -> bool {
+        fingerprint
+            .related_files
+            .iter()
+            .any(|related| related.suffix.starts_with("parent-session-"))
+    }
+
+    /// The parent session only names a subagent when `.meta.json` cannot, so a
+    /// resolving `agentType` leaves it out and a parent append is a cache hit.
+    #[test]
+    fn test_claude_subagent_with_resolving_meta_survives_a_parent_append() {
+        let dir = TempDir::new().unwrap();
+        let (sidechain, parent, meta) = s1c_subagent_fixture(dir.path());
+        std::fs::write(&meta, br#"{"agentType":"explore"}"#).unwrap();
+
+        let FingerprintStatus::Changed(cached) = s1c_check(&sidechain, None) else {
+            panic!("a cold check fingerprints");
+        };
+        assert!(!s1c_has_parent(&cached));
+        assert!(cached
+            .related_files
+            .iter()
+            .any(|r| r.suffix == ".meta.json" && r.exists));
+
+        s1c_append(&parent, "parent line 2\n");
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&cached)),
+            FingerprintStatus::Unchanged
+        ));
+
+        // The meta itself stays related: rewriting it is still a change.
+        std::fs::write(&meta, br#"{"agentType":"plan"}"#).unwrap();
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&cached)),
+            FingerprintStatus::Changed(_)
+        ));
+    }
+
+    #[test]
+    fn test_claude_subagent_without_meta_reparses_on_a_parent_append() {
+        let dir = TempDir::new().unwrap();
+        let (sidechain, parent, _meta) = s1c_subagent_fixture(dir.path());
+
+        let FingerprintStatus::Changed(cached) = s1c_check(&sidechain, None) else {
+            panic!("a cold check fingerprints");
+        };
+        assert!(s1c_has_parent(&cached));
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&cached)),
+            FingerprintStatus::Unchanged
+        ));
+        s1c_append(&parent, "parent line 2\n");
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&cached)),
+            FingerprintStatus::Changed(_)
+        ));
+    }
+
+    /// Fixture (a): a `.meta.json` that exists but does not resolve a name
+    /// (no `agentType`, an empty or blank one, invalid JSON) still depends on
+    /// the parent.
+    #[test]
+    fn test_claude_subagent_with_unresolving_meta_reparses_on_a_parent_append() {
+        for body in [
+            r#"{}"#,
+            r#"{"other":1}"#,
+            r#"{"agentType":""}"#,
+            r#"{"agentType":"  "}"#,
+            r#"not json"#,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let (sidechain, parent, meta) = s1c_subagent_fixture(dir.path());
+            std::fs::write(&meta, body).unwrap();
+
+            let FingerprintStatus::Changed(cached) = s1c_check(&sidechain, None) else {
+                panic!("a cold check fingerprints");
+            };
+            assert!(s1c_has_parent(&cached), "{body}");
+            s1c_append(&parent, "parent line 2\n");
+            assert!(
+                matches!(
+                    s1c_check(&sidechain, Some(&cached)),
+                    FingerprintStatus::Changed(_)
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    /// Fixture (b): the cached fingerprint was taken while the meta resolved
+    /// (no parent entry). Rewriting the meta without an `agentType` while the
+    /// transcript is unchanged must probe the parent again, or a later parent
+    /// append would never be seen.
+    #[test]
+    fn test_claude_subagent_regains_its_parent_when_the_meta_stops_resolving() {
+        let dir = TempDir::new().unwrap();
+        let (sidechain, parent, meta) = s1c_subagent_fixture(dir.path());
+        std::fs::write(&meta, br#"{"agentType":"explore"}"#).unwrap();
+        let FingerprintStatus::Changed(resolving) = s1c_check(&sidechain, None) else {
+            panic!("a cold check fingerprints");
+        };
+        assert!(!s1c_has_parent(&resolving));
+
+        std::fs::write(&meta, br#"{}"#).unwrap();
+        let FingerprintStatus::Changed(rescanned) = s1c_check(&sidechain, Some(&resolving)) else {
+            panic!("the meta rewrite changes the fingerprint");
+        };
+        assert!(s1c_has_parent(&rescanned));
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&rescanned)),
+            FingerprintStatus::Unchanged
+        ));
+
+        s1c_append(&parent, "parent line 2\n");
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&rescanned)),
+            FingerprintStatus::Changed(_)
+        ));
+    }
+
+    /// An unreadable `.meta.json` fails open: no fingerprint, so the caller
+    /// parses cold.
+    #[cfg(unix)]
+    #[test]
+    fn test_claude_subagent_with_unreadable_meta_has_no_fingerprint() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let (sidechain, _parent, meta) = s1c_subagent_fixture(dir.path());
+        std::fs::write(&meta, br#"{"agentType":"explore"}"#).unwrap();
+        std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&meta).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        assert!(SourceFingerprint::from_claude_code_path_with_home(&sidechain, None).is_none());
+        assert!(
+            SourceFingerprint::check_claude_code_path_with_home_samples_only(
+                &sidechain, None, None
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -164,7 +164,7 @@ fn clamp_cache_write_1h(cache_write: i64, cache_write_1h: i64) -> i64 {
 /// Split out because the retained-message refresh can reach this tier and no
 /// other: tiers 2 and 3 need a parent session id and a parent-subagent cache
 /// that the refresh has no access to.
-fn subagent_name_from_meta_sidecar(path: &Path) -> Option<String> {
+pub(crate) fn subagent_name_from_meta_sidecar(path: &Path) -> Option<String> {
     let stem = path.file_stem().and_then(|s| s.to_str())?;
     let meta_path = path.with_file_name(format!("{}.meta.json", stem));
     let text = std::fs::read_to_string(&meta_path).ok()?;
