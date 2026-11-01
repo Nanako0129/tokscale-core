@@ -936,7 +936,13 @@ fn parser_version(client: ClientId) -> u32 {
         // `cache_write_1h` stays zero and its cost stays at the old value.
         // Cold-cache verification passes either way, which is exactly why
         // the acceptance for this change is a warm-cache measurement.
-        ClientId::Claude => 4,
+        // 5: the 1h split is clamped after duplicate assembly (a split that
+        // arrived before its total is kept), a bare prompt snapshot no longer
+        // maxes `input` against a real cache split, and advisor
+        // `usage.iterations` become their own rows. A v4 shard keeps its
+        // retained-only turns across this bump (non-lossy upgrade); the
+        // converse does not hold: a pv-4 engine reads a pv-5 shard as Stale.
+        ClientId::Claude => 5,
         // 2: Droid's cumulative session tokenUsage is now anchored on the
         // settings file's mtime (floored at providerLockTimestamp, via
         // parse_lock_timestamp/resolve_usage_timestamp) instead of the lock
@@ -1369,7 +1375,13 @@ impl CachedSourceEntry {
                     // on the case, below.
                     let existing = &mut self.messages[index];
                     let stored_tokens = &message.tokens;
-                    existing.tokens.input = existing.tokens.input.max(stored_tokens.input);
+                    // `input` is the one field that is not a plain max: a bare
+                    // prompt snapshot's whole-prompt figure must not beat the
+                    // cache-bearing copy's uncached remainder (upstream #1396).
+                    existing.tokens.input = crate::sessions::claudecode::merge_cached_input(
+                        &existing.tokens,
+                        stored_tokens,
+                    );
                     existing.tokens.output = existing.tokens.output.max(stored_tokens.output);
                     existing.tokens.cache_read =
                         existing.tokens.cache_read.max(stored_tokens.cache_read);
@@ -4704,6 +4716,50 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    /// Pins the downgrade loss documented in the upgrade plan: a shard written
+    /// at Claude pv 5 is Stale to an engine that only knows pv 4, so that
+    /// engine rewrites it from an empty map and drops the retained-only turns.
+    /// Restoring the pre-upgrade `claude/` backup is the only lossless rollback.
+    #[test]
+    #[serial_test::serial]
+    fn test_a_claude_pv5_shard_read_with_a_pv4_identity_is_stale() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"claude transcript\n");
+        let claude = CacheIdentity::for_client(ClientId::Claude);
+        assert_eq!(claude.parser_version, 5);
+
+        let entry = CachedSourceEntry::new(
+            claude,
+            source.path(),
+            SourceFingerprint::from_path(source.path()).unwrap(),
+            vec![keyed_message(
+                claude.namespace,
+                "session",
+                "msg_kept:req_kept",
+            )],
+            Vec::new(),
+            None,
+        )
+        .with_retained_keys(HashSet::from(["msg_kept:req_kept".to_string()]));
+        let path = seed_shard(claude, source.path(), vec![entry]);
+
+        assert!(matches!(
+            read_shard(&path, claude),
+            ShardReadStatus::Loaded(_)
+        ));
+        let pv4 = CacheIdentity {
+            namespace: claude.namespace,
+            parser_version: 4,
+        };
+        assert!(
+            matches!(read_shard(&path, pv4), ShardReadStatus::Stale),
+            "a downgrade cannot read what a newer build wrote"
+        );
+
+        restore_cache_env(prev_env);
+    }
+
     /// Shared body for the Grok same-fingerprint parser-invalidation tests:
     /// a shard written under an older parser version, with an unchanged
     /// source file, must be treated as stale and cold-rebuilt rather than
@@ -5702,6 +5758,10 @@ mod tests {
             // input. Neither field-set alone is the true maximum, so a fix
             // that just picks one whole message over the other would still
             // fail this.
+            // Fixture changed for the #1396 input rule: a cache-bearing copy with a
+            // positive input now wins `input` outright, so this completed copy is
+            // silent about input (0) and the max still decides, which is what
+            // this test is about.
             let completed = UnifiedMessage::new_with_dedup(
                 namespace,
                 "claude-3-5-sonnet",
@@ -5709,7 +5769,7 @@ mod tests {
                 "session",
                 1,
                 TokenBreakdown {
-                    input: 80,
+                    input: 0,
                     output: 999,
                     cache_read: 10,
                     cache_write: 5,
@@ -5812,6 +5872,42 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    /// #1396: a bare prompt snapshot (whole-prompt `input`, no cache) saved
+    /// last must not beat the cache-bearing completed copy's uncached remainder.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_merge_input_prefers_the_cache_bearing_copy_over_a_bare_snapshot() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("transcript.jsonl");
+            std::fs::write(&path, b"{\"id\":\"one-generation\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+
+            let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.input = 265;
+            completed.tokens.cache_read = 42_000;
+            let mut snapshot = keyed_message(namespace, "session", key);
+            snapshot.tokens.input = 42_494;
+
+            for message in [completed, snapshot] {
+                let mut writer = SourceMessageCache::load();
+                writer.insert(entry_with_messages(identity, &path, vec![message]));
+                writer.save_if_dirty();
+            }
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1);
+            assert_eq!(entry.messages[0].tokens.input, 265);
+            assert_eq!(entry.messages[0].tokens.cache_read, 42_000);
+        }
+        restore_cache_env(prev_env);
+    }
+
     /// Matching retained labels do not imply matching content. Writers
     /// spanning more than one rewrite can land a partial and a completed form
     /// of the same turn into a single fingerprint, both labeled retained. This
@@ -5835,7 +5931,12 @@ mod tests {
             let key = "msg_shared:req_shared";
             let retained: HashSet<String> = [key.to_string()].into_iter().collect();
 
+            // Fixture changed for the #1396 input rule: a cache-bearing copy with a
+            // positive input now wins `input` outright, so this completed copy is
+            // silent about input (0) and the max still decides, which is what
+            // this test is about.
             let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.input = 0;
             completed.tokens.output = 999;
             completed.tokens.cache_read = 10;
             completed.duration_ms = Some(4_200);
@@ -5911,7 +6012,12 @@ mod tests {
             partial.tokens.output = 50;
             partial.duration_ms = Some(900);
 
+            // Fixture changed for the #1396 input rule: a cache-bearing copy with a
+            // positive input now wins `input` outright, so this completed copy is
+            // silent about input (0) and the max still decides, which is what
+            // this test is about.
             let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.input = 0;
             completed.tokens.output = 999;
             completed.tokens.cache_read = 10;
             completed.duration_ms = Some(4_200);
@@ -6109,8 +6215,10 @@ mod tests {
         // the 1h/5m cache-write split. Each of those changed what a parse
         // produces from an unchanged transcript, which is the whole reason
         // this number exists -- without the bump `get` treats a stale entry
-        // as a hit and the new parse never runs.
-        assert_eq!(parser_version(ClientId::Claude), 4);
+        // as a hit and the new parse never runs. 5 is the S1a parser
+        // correctness set (1h clamp after assembly, bare-snapshot input,
+        // advisor iterations).
+        assert_eq!(parser_version(ClientId::Claude), 5);
         // 2 is the transcript-weighted per-reply attribution split (vendor-local
         // numbering; never upstream's 7 — see UPSTREAM.md).
         assert_eq!(parser_version(ClientId::Droid), 2);
