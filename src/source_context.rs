@@ -157,13 +157,22 @@ impl RemoteSourceContextV1 {
 const DOMAIN: &[u8] = b"tokenbar-source-context";
 const REMOTE_DOMAIN: &[u8] = b"tokenbar-remote-source-context-v1";
 /// Version of the rules that turn the descriptor's inputs into the set of
-/// directories a scan visits. Bump it for any change that alters what an
-/// existing descriptor actually scans — adding or removing a derived scan root,
-/// or changing a resolution rule — even when every input stays the same. The
-/// identity is the approved-scope fingerprint for remote pairing, and it must
-/// describe what gets scanned, not only the inputs (705817f6); otherwise a
-/// scope approved before the change silently widens after it. A new `ClientId`
-/// already changes the descriptor through the client list and needs no bump.
+/// directories a scan visits. Bump it for any change that can make an existing
+/// descriptor scan MORE — adding a derived scan root, or loosening a resolution
+/// rule — even when every input stays the same. The identity is the
+/// approved-scope fingerprint for remote pairing, and it exists so that a scope
+/// approved before a change cannot silently widen after it (705817f6); so it
+/// must describe what gets scanned, not only the inputs. A change that only
+/// narrows what an existing descriptor scans needs no bump: a scope approved
+/// earlier stays a superset of what it now scans, and nothing is exposed that
+/// was not already approved. Bumping anyway is allowed but re-approves every
+/// remote scope and changes every local identity. A new `ClientId` already
+/// changes the descriptor through the client list and needs no bump.
+///
+/// First narrowing without a bump: `excluded_scan_paths` now also drops
+/// nested subtrees and non-task sources (databases, Grok's unified log, the
+/// Copilot exporter), and only for descriptors that already carry exclusions
+/// (identity field 16), which a descriptor without them never reaches (#16).
 ///
 /// 2: Kimi Work scan roots under the desktop app-data tree (upstream #1170).
 /// 3: the `pi` client no longer derives `~/.omp/agent/sessions` as a scan
