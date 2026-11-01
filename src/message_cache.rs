@@ -266,7 +266,7 @@ impl SourceFingerprint {
         path: &Path,
         home_dir: Option<&Path>,
     ) -> Option<Self> {
-        let related = claude_code_related_paths(path, home_dir, None);
+        let (related, _) = claude_code_related_paths(path, home_dir, None);
 
         Self::from_path_with_related_mode(path, related, ContentHashMode::SamplesOnly)
     }
@@ -409,13 +409,29 @@ impl SourceFingerprint {
     ) -> Option<FingerprintStatus> {
         let primary_matches =
             cached.and_then(|fingerprint| primary_fingerprint_matches(path, fingerprint));
-        let related = claude_code_related_paths(
+        let (related, parents_assumed_empty) = claude_code_related_paths(
             path,
             home_dir,
             cached.filter(|_| primary_matches == Some(true)),
         );
 
-        Self::check_path_with_related_mode_and_primary(path, related, cached, mode, primary_matches)
+        let status = Self::check_path_with_related_mode_and_primary(
+            path,
+            related.clone(),
+            cached,
+            mode,
+            primary_matches,
+        );
+        if parents_assumed_empty && matches!(status, Some(FingerprintStatus::Changed(_))) {
+            // The empty parent list was only reused, never proved: something
+            // changed, so look for the parent again for the new fingerprint.
+            let (probed, _) = claude_code_related_paths(path, home_dir, None);
+            if probed != related {
+                return Self::from_path_with_related_mode(path, probed, mode)
+                    .map(FingerprintStatus::Changed);
+            }
+        }
+        status
     }
 
     pub(crate) fn check_grok_path_samples_only(
@@ -641,8 +657,9 @@ impl RelatedFileFingerprint {
     }
 }
 
-/// Related files of a Claude Code transcript. `warm` is the cached fingerprint
-/// when the transcript itself is unchanged, so its probed parent paths can be
+/// Related files of a Claude Code transcript, and whether the parent list was
+/// assumed empty rather than looked up. `warm` is the cached fingerprint when
+/// the transcript itself is unchanged, so its probed parent paths can be
 /// reused instead of re-reading the file head.
 ///
 /// The parent session only names a subagent when tier 1 (the `.meta.json`
@@ -652,29 +669,29 @@ impl RelatedFileFingerprint {
 /// every check.
 ///
 /// A cached fingerprint with no parent entry may have dropped them while tier 1
-/// resolved, so once tier 1 fails the parent is probed afresh rather than
-/// trusting the empty list, but only if the answer can have changed: when the
-/// fingerprint is cold, or when the `.meta.json` it recorded no longer matches
-/// the file (it appeared, changed or vanished). With the transcript and the
-/// meta both unchanged the probe would read up to `PARENT_PROBE_MAX_BYTES` to
-/// reach the same answer on every warm check, so the cached list is reused.
+/// resolved, so the parent must be probed again when anything changes. Probing
+/// reads up to `PARENT_PROBE_MAX_BYTES`, so a warm check does not do it up
+/// front: it assumes the empty list (second return value `true`) and the caller
+/// probes only if that fingerprint turns out `Changed`. With the transcript and
+/// every related file unchanged the answer cannot differ, which is why the
+/// cached empty list is good enough for a hit.
 ///
-/// Known gap: a meta rewritten or deleted between the tier-1 read and the
-/// snapshot of it taken for the fingerprint can leave a parent-less entry whose
-/// recorded meta then matches the file, so no later check repairs it; it lasts
-/// until the meta or the transcript changes.
+/// Known gaps. A meta rewritten to a non-resolving one, or deleted, between the
+/// tier-1 read and the snapshot of it taken for the fingerprint can leave a
+/// parent-less entry whose recorded meta matches the file, so no later check
+/// repairs it; it lasts until the meta or the transcript changes. An unreadable
+/// meta gives no fingerprint at all, so the file is not cached and the parent
+/// is probed on every scan, with that scan's full parse.
 fn claude_code_related_paths(
     path: &Path,
     home_dir: Option<&Path>,
     warm: Option<&SourceFingerprint>,
-) -> Vec<(String, PathBuf)> {
+) -> (Vec<(String, PathBuf)>, bool) {
     let mut related = Vec::new();
-    let mut meta_path = None;
 
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        let meta = path.with_file_name(format!("{}.meta.json", stem));
-        related.push((".meta.json".to_string(), meta.clone()));
-        meta_path = Some(meta);
+        let meta_filename = format!("{}.meta.json", stem);
+        related.push((".meta.json".to_string(), path.with_file_name(meta_filename)));
     }
 
     if let Some(variant_path) = crate::cc_mirror::variant_file_for_session_path(path, home_dir) {
@@ -682,30 +699,17 @@ fn claude_code_related_paths(
     }
 
     if crate::sessions::claudecode::subagent_name_from_meta_sidecar(path).is_some() {
-        return related;
+        return (related, false);
     }
 
     let cached_parents = warm.map(cached_claude_parent_paths).unwrap_or_default();
-    let meta_changed = |cached: &SourceFingerprint| {
-        let entry = cached
-            .related_files
-            .iter()
-            .find(|related| related.suffix == ".meta.json");
-        match (entry, meta_path.as_deref()) {
-            (Some(entry), Some(meta)) => related_entry_matches(entry, meta) != Some(true),
-            (None, Some(_)) => true,
-            (_, None) => false,
-        }
-    };
-    let parents = if !cached_parents.is_empty() {
-        cached_parents
-    } else if warm.is_none_or(meta_changed) {
-        probe_claude_parent_paths(path)
-    } else {
-        Vec::new()
+    let assumed_empty = warm.is_some() && cached_parents.is_empty();
+    let parents = match warm {
+        Some(_) => cached_parents,
+        None => probe_claude_parent_paths(path),
     };
     related.extend(parents);
-    related
+    (related, assumed_empty)
 }
 
 fn probe_claude_parent_paths(path: &Path) -> Vec<(String, PathBuf)> {
@@ -743,25 +747,6 @@ fn metadata_signature(path: &Path) -> std::io::Result<(u64, u64)> {
     Ok((metadata.len(), modified_ns))
 }
 
-/// Whether one cached related file still describes `related_path`: the same
-/// path, existence, size, mtime and sample hashes. `None` when the file cannot
-/// be read for a reason other than being absent.
-fn related_entry_matches(related: &RelatedFileFingerprint, related_path: &Path) -> Option<bool> {
-    if related.path != CachedPath::from_path(related_path) {
-        return Some(false);
-    }
-    match metadata_signature(related_path) {
-        Ok((size, modified_ns)) => {
-            if !related.exists || related.size != size || related.modified_ns != modified_ns {
-                return Some(false);
-            }
-            Some(compute_sample_hashes(related_path, size)? == related.sample_hashes)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(!related.exists),
-        Err(_) => None,
-    }
-}
-
 fn related_fingerprint_metadata_matches(
     related_paths: &[(String, PathBuf)],
     cached: &SourceFingerprint,
@@ -778,8 +763,24 @@ fn related_fingerprint_metadata_matches(
         else {
             return Some(false);
         };
-        if !related_entry_matches(related, related_path)? {
+        if related.path != CachedPath::from_path(related_path) {
             return Some(false);
+        }
+        match metadata_signature(related_path) {
+            Ok((size, modified_ns)) => {
+                if !related.exists || related.size != size || related.modified_ns != modified_ns {
+                    return Some(false);
+                }
+                if compute_sample_hashes(related_path, size)? != related.sample_hashes {
+                    return Some(false);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if related.exists {
+                    return Some(false);
+                }
+            }
+            Err(_) => return None,
         }
     }
 

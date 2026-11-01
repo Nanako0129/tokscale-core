@@ -10140,8 +10140,11 @@ mod tests {
     /// grew, and its name never differs from a cold scan. When the meta stops
     /// resolving, the parent becomes a dependency again (rewriting the meta
     /// with the transcript unchanged, then the parent), and a meta change is a
-    /// full parse, not a resume. Runs on every target: resumes exist only where
-    /// `CLAUDE_CHECKPOINTS` is on, so the resume count is asserted against that.
+    /// full parse, not a resume. Resumes exist only where `CLAUDE_CHECKPOINTS` is
+    /// on, so the resume count is asserted against that and the parent
+    /// dependency is asserted on the cached fingerprint. Checked on macOS arm64
+    /// and on an arm64 copy with `CLAUDE_CHECKPOINTS` forced off; x86_64
+    /// Linux and Windows run in CI.
     #[test]
     #[serial_test::serial]
     fn test_claude_subagent_name_follows_the_meta_then_the_parent() {
@@ -10170,6 +10173,23 @@ mod tests {
             let agents = |rows: &[S1bRow]| -> Vec<Option<String>> {
                 rows.iter().map(|row| row.7.clone()).collect()
             };
+            // Whether the child's cached fingerprint lists its parent session:
+            // target-independent, unlike the resume count.
+            let child_has_parent_entry = || {
+                let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+                let mut cache = message_cache::SourceMessageCache::load();
+                cache.ensure_namespace_loaded(identity);
+                let entry = cache
+                    .entries
+                    .values()
+                    .find(|entry| entry.path.to_path_buf().ends_with("agent-sidecar1.jsonl"))
+                    .expect("the scan cached the child");
+                entry
+                    .fingerprint
+                    .related_files
+                    .iter()
+                    .any(|related| related.suffix.starts_with("parent-session-"))
+            };
 
             std::fs::write(&parent, s1c_parent_session("explorer")).unwrap();
             std::fs::write(&meta, r#"{"agentType":"planner"}"#).unwrap();
@@ -10188,10 +10208,14 @@ mod tests {
             assert_eq!(
                 resumed,
                 usize::from(sessions::claudecode::CLAUDE_CHECKPOINTS),
-                "{lane:?}: the parent is not a dependency of a resolving subagent"
+                "{lane:?}: a grown transcript resumes exactly where checkpoints are on"
             );
             assert_eq!(warm, cold(lane), "{lane:?}");
             assert_eq!(agents(&warm), vec![planner[0].clone(); 2], "{lane:?}");
+            assert!(
+                !child_has_parent_entry(),
+                "{lane:?}: a resolving subagent does not list its parent"
+            );
 
             // The meta stops resolving while the child is unchanged: the name
             // now comes from the parent, and a meta change is not a resume.
@@ -10201,6 +10225,10 @@ mod tests {
             assert_eq!(warm, cold(lane), "{lane:?}");
             let explorer = agents(&warm);
             assert_ne!(explorer[0], planner[0], "{lane:?}: now the parent's");
+            assert!(
+                child_has_parent_entry(),
+                "{lane:?}: a non-resolving subagent lists its parent again"
+            );
 
             // The parent is a dependency again, though the cached fingerprint
             // was taken by a scan the child did not change in.
