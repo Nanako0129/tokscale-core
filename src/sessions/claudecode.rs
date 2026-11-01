@@ -164,7 +164,7 @@ fn clamp_cache_write_1h(cache_write: i64, cache_write_1h: i64) -> i64 {
 /// Split out because the retained-message refresh can reach this tier and no
 /// other: tiers 2 and 3 need a parent session id and a parent-subagent cache
 /// that the refresh has no access to.
-fn subagent_name_from_meta_sidecar(path: &Path) -> Option<String> {
+pub(crate) fn subagent_name_from_meta_sidecar(path: &Path) -> Option<String> {
     let stem = path.file_stem().and_then(|s| s.to_str())?;
     let meta_path = path.with_file_name(format!("{}.meta.json", stem));
     let text = std::fs::read_to_string(&meta_path).ok()?;
@@ -284,12 +284,22 @@ fn find_parent_session_path(sidechain_path: &Path, parent_session_id: &str) -> O
 /// from triggering a whole-file read on every warm cache validation.
 const PARENT_PROBE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
+// Per-thread call counter for the fingerprint tests: they assert that a warm
+// check does not probe a parent again.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARENT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Resolve the parent transcript that can influence a sidechain's cached agent
 /// attribution. The probe follows the parser until its first parseable
 /// sidechain row, then returns every candidate in parser precedence order.
 /// Missing candidates are retained so their later appearance invalidates the
-/// cache.
+/// cache. The fingerprint asks for them only when the `.meta.json` tier cannot
+/// name the subagent.
 pub(crate) fn parent_session_paths_for_cache(sidechain_path: &Path) -> Vec<PathBuf> {
+    #[cfg(test)]
+    PARENT_PROBES.with(|probes| probes.set(probes.get() + 1));
     parent_session_paths_for_cache_bounded(sidechain_path, PARENT_PROBE_MAX_BYTES)
 }
 

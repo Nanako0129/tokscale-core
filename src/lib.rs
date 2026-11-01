@@ -4004,7 +4004,13 @@ const PARSE_BATCH_SIZE: usize = 32;
 /// or `None` for a full parse. A changed sidecar (the subagent `.meta.json`,
 /// a parent session, a cc-mirror `variant.json`) can change messages before
 /// the checkpoint, and each of them is a related file, so any change in
-/// `related_files` takes the full parse. Retained history after the live
+/// `related_files` takes the full parse. The parent session is a related file
+/// only for a subagent whose `.meta.json` does not resolve a name (see
+/// `claude_code_related_paths` in `message_cache.rs`); for one that does, a
+/// parent change leaves the entry alone. Where checkpoints exist
+/// (`CLAUDE_CHECKPOINTS`, macOS arm64) such a subagent then resumes on its
+/// own growth; elsewhere a changed transcript is always a full parse. Retained
+/// history after the live
 /// prefix is not the checkpoint's concern: `resume_claude_file` verifies only
 /// the first `message_count` messages.
 fn resume_claude_source(
@@ -9601,7 +9607,6 @@ mod tests {
         )
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn s1b_append(path: &Path, text: &str) {
         use std::io::Write;
         std::fs::OpenOptions::new()
@@ -9612,7 +9617,6 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// How many transcripts under `source_home` a scan continued from a
     /// checkpoint so far (the recorder is process-wide; paths are per-test).
     fn s1b_resumes(source_home: &Path) -> usize {
@@ -9699,7 +9703,6 @@ mod tests {
         rows
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// A scan of `source_home` from an empty cache home, leaving the current
     /// (warm) cache home untouched.
     fn s1b_cold_scan(lane: S1bLane, source_home: &Path, cold_home: &Path) -> Vec<S1bRow> {
@@ -10111,15 +10114,129 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     const S1B_SIDECHAIN_LINE: &str = concat!(
         r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-1","agentId":"sidecar1","timestamp":"2026-10-01T10:00:05.000Z","requestId":"req_{n}","message":{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":5}}}"#,
         "\n"
     );
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn s1b_sidechain_line(n: u32) -> String {
         S1B_SIDECHAIN_LINE.replace("{n}", &n.to_string())
+    }
+
+    fn s1c_parent_session(subagent_type: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tu1","name":"Agent","input":{{"subagent_type":"{}"}}}}]}}}}"#,
+                "\n",
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"tu1","content":[{{"type":"text","text":"agentId: sidecar1"}}]}}]}}}}"#,
+                "\n"
+            ),
+            subagent_type
+        )
+    }
+
+    /// A subagent whose `.meta.json` resolves its name no longer depends on the
+    /// parent session: it still resumes on its own growth after the parent
+    /// grew, and its name never differs from a cold scan. When the meta stops
+    /// resolving, the parent becomes a dependency again (rewriting the meta
+    /// with the transcript unchanged, then the parent), and a meta change is a
+    /// full parse, not a resume. Resumes exist only where `CLAUDE_CHECKPOINTS` is
+    /// on, so the resume count is asserted against that and the parent
+    /// dependency is asserted on the cached fingerprint. Checked on macOS arm64
+    /// and on an arm64 copy with `CLAUDE_CHECKPOINTS` forced off; x86_64
+    /// Linux and Windows run in CI.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_subagent_name_follows_the_meta_then_the_parent() {
+        for lane in [S1bLane::Materialized, S1bLane::Streaming, S1bLane::Count] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let cold_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(&[
+                ("HOME", cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ]);
+            let dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&dir).unwrap();
+            let child = dir.join("agent-sidecar1.jsonl");
+            let meta = dir.join("agent-sidecar1.meta.json");
+            let parent = dir.join("parent-1.jsonl");
+            let mut colds = 0;
+            let mut cold = |lane| {
+                colds += 1;
+                s1b_cold_scan(
+                    lane,
+                    source_home.path(),
+                    &cold_home.path().join(colds.to_string()),
+                )
+            };
+            let agents = |rows: &[S1bRow]| -> Vec<Option<String>> {
+                rows.iter().map(|row| row.7.clone()).collect()
+            };
+            // Whether the child's cached fingerprint lists its parent session:
+            // target-independent, unlike the resume count.
+            let child_has_parent_entry = || {
+                let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+                let mut cache = message_cache::SourceMessageCache::load();
+                cache.ensure_namespace_loaded(identity);
+                let entry = cache
+                    .entries
+                    .values()
+                    .find(|entry| entry.path.to_path_buf().ends_with("agent-sidecar1.jsonl"))
+                    .expect("the scan cached the child");
+                entry
+                    .fingerprint
+                    .related_files
+                    .iter()
+                    .any(|related| related.suffix.starts_with("parent-session-"))
+            };
+
+            std::fs::write(&parent, s1c_parent_session("explorer")).unwrap();
+            std::fs::write(&meta, r#"{"agentType":"planner"}"#).unwrap();
+            std::fs::write(&child, s1b_sidechain_line(1)).unwrap();
+            let seed = s1b_scan(lane, source_home.path());
+            assert_eq!(seed, cold(lane), "{lane:?}");
+            let planner = agents(&seed);
+            assert!(planner[0].as_deref().is_some_and(|a| a.contains("lanner")));
+
+            // The parent grew and so did the child: the child resumes.
+            s1b_append(&parent, r#"{"type":"user","message":{"content":"more"}}"#);
+            s1b_append(&parent, "\n");
+            s1b_append(&child, &s1b_sidechain_line(2));
+            let warm = s1b_scan(lane, source_home.path());
+            let resumed = s1b_resumes(source_home.path());
+            assert_eq!(
+                resumed,
+                usize::from(sessions::claudecode::CLAUDE_CHECKPOINTS),
+                "{lane:?}: a grown transcript resumes exactly where checkpoints are on"
+            );
+            assert_eq!(warm, cold(lane), "{lane:?}");
+            assert_eq!(agents(&warm), vec![planner[0].clone(); 2], "{lane:?}");
+            assert!(
+                !child_has_parent_entry(),
+                "{lane:?}: a resolving subagent does not list its parent"
+            );
+
+            // The meta stops resolving while the child is unchanged: the name
+            // now comes from the parent, and a meta change is not a resume.
+            std::fs::write(&meta, "{}").unwrap();
+            let warm = s1b_scan(lane, source_home.path());
+            assert_eq!(s1b_resumes(source_home.path()), resumed, "{lane:?}");
+            assert_eq!(warm, cold(lane), "{lane:?}");
+            let explorer = agents(&warm);
+            assert_ne!(explorer[0], planner[0], "{lane:?}: now the parent's");
+            assert!(
+                child_has_parent_entry(),
+                "{lane:?}: a non-resolving subagent lists its parent again"
+            );
+
+            // The parent is a dependency again, though the cached fingerprint
+            // was taken by a scan the child did not change in.
+            std::fs::write(&parent, s1c_parent_session("reviewer")).unwrap();
+            let warm = s1b_scan(lane, source_home.path());
+            assert_eq!(warm, cold(lane), "{lane:?}");
+            assert_ne!(agents(&warm), explorer, "{lane:?}: the parent rename lands");
+        }
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
