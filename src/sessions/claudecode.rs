@@ -99,11 +99,24 @@ pub struct ClaudeUsage {
 
 impl ClaudeUsage {
     /// Whether this usage object describes the prompt/caching split rather than
-    /// being a bare snapshot of the whole prompt (upstream #1392). Key presence
-    /// is the signal, not the value: a prompt that never reached the cache
-    /// minimum is reported with explicit zeroes and is still a genuine split.
+    /// being a bare snapshot of the whole prompt (upstream #1392).
+    ///
+    /// Fork deviations from upstream, which counts any cache key as a split:
+    /// - the line must STATE `input_tokens`. A split line silent about input
+    ///   makes no claim about the remainder, so it must not mark the key as
+    ///   split-reporting (that made a later real split take the max against
+    ///   the snapshot, an order dependence);
+    /// - an all-zero line (zero cache keys AND zero input) carries no
+    ///   information and must not erase a snapshot's real input. A zero cache
+    ///   with a nonzero input is still a real final figure: a prompt that
+    ///   never reached the cache minimum reports exactly that.
     fn reports_cache_split(&self) -> bool {
-        self.cache_read_input_tokens.is_some() || self.cache_creation_input_tokens.is_some()
+        let has_cache_key =
+            self.cache_read_input_tokens.is_some() || self.cache_creation_input_tokens.is_some();
+        let has_signal = self.input_tokens.unwrap_or(0) != 0
+            || self.cache_read_input_tokens.unwrap_or(0) != 0
+            || self.cache_creation_input_tokens.unwrap_or(0) != 0;
+        has_cache_key && self.input_tokens.is_some() && has_signal
     }
 
     /// The reported 1h portion, floored at zero but NOT clamped to the total.
@@ -1053,12 +1066,8 @@ fn merge_claude_duplicate(
     // When only one side reports the split, that side wins outright; when both
     // or neither do, the units agree and the max stands.
     match (usage.reports_cache_split(), existing_input_is_split) {
-        // Silence is not a claim of zero: only overwrite when input is stated.
-        (true, false) => {
-            if let Some(input) = usage.input_tokens {
-                t.input = input.max(0);
-            }
-        }
+        // `reports_cache_split` implies the input is stated.
+        (true, false) => t.input = usage.input_tokens.unwrap_or(0).max(0),
         (false, true) => {}
         (true, true) | (false, false) => {
             t.input = t.input.max(usage.input_tokens.unwrap_or(0).max(0));
@@ -3752,6 +3761,80 @@ mod s1a_tests {
         assert_eq!(messages[0].tokens.input, 42494);
         assert_eq!(messages[0].tokens.cache_read, 42000);
         assert_eq!(messages[0].tokens.output, 120);
+    }
+
+    fn usage_line(usage: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_o","message":{{"id":"msg_o","model":"claude-3-5-sonnet","usage":{{{usage}}}}}}}"#
+        )
+    }
+
+    fn merged_input(usages: &[&str]) -> i64 {
+        let content = usages
+            .iter()
+            .map(|u| usage_line(u))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file = create_test_file(&content);
+        let messages = parse_claude_file(file.path());
+        assert_eq!(messages.len(), 1);
+        messages[0].tokens.input
+    }
+
+    #[test]
+    fn test_split_reporting_does_not_depend_on_a_silent_split_line() {
+        // Fork fix (not upstream): a cache-split line that omits input_tokens
+        // must not mark the key as split-reporting, or a later real split
+        // would take the max against the snapshot.
+        let snapshot = r#""input_tokens":42494,"output_tokens":0"#;
+        let silent = r#""output_tokens":120,"cache_read_input_tokens":42000,"cache_creation_input_tokens":0"#;
+        let real = r#""input_tokens":265,"output_tokens":120,"cache_read_input_tokens":42000,"cache_creation_input_tokens":0"#;
+        for order in [
+            [snapshot, silent, real],
+            [real, silent, snapshot],
+            [silent, snapshot, real],
+            [snapshot, real, silent],
+        ] {
+            assert_eq!(merged_input(&order), 265, "order {order:?}");
+        }
+    }
+
+    #[test]
+    fn test_an_all_zero_line_does_not_erase_a_snapshots_input() {
+        // Fork fix (not upstream): zero cache keys with input 0 say nothing,
+        // so they must not overwrite a bare snapshot's real input.
+        let snapshot = r#""input_tokens":500,"output_tokens":0"#;
+        let zeros = r#""input_tokens":0,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0"#;
+        assert_eq!(merged_input(&[snapshot, zeros]), 500);
+        assert_eq!(merged_input(&[zeros, snapshot]), 500);
+    }
+
+    #[test]
+    fn test_zero_cache_with_nonzero_input_is_a_real_final_figure() {
+        // Key-less snapshots (44,939) followed by split entries whose cache keys
+        // are explicit zeroes but whose input is 44,696 resolve to 44,696.
+        let snapshot = r#""input_tokens":44939,"output_tokens":0"#;
+        let split = r#""input_tokens":44696,"output_tokens":9,"cache_read_input_tokens":0,"cache_creation_input_tokens":0"#;
+        assert_eq!(merged_input(&[snapshot, snapshot, split]), 44696);
+        assert_eq!(merged_input(&[split, snapshot]), 44696);
+    }
+
+    #[test]
+    fn test_merge_cached_input_ignores_a_silent_or_zero_cache_bearing_copy() {
+        let t = |input, cache_read| TokenBreakdown {
+            input,
+            cache_read,
+            ..Default::default()
+        };
+        // Cache-bearing copy silent about input (0): the snapshot's input stays.
+        assert_eq!(merge_cached_input(&t(0, 42_000), &t(500, 0)), 500);
+        assert_eq!(merge_cached_input(&t(500, 0), &t(0, 42_000)), 500);
+        // Cache-bearing copy with a positive remainder wins over the snapshot.
+        assert_eq!(merge_cached_input(&t(265, 42_000), &t(42_494, 0)), 265);
+        assert_eq!(merge_cached_input(&t(42_494, 0), &t(265, 42_000)), 265);
+        // Neither (a zero-cache real figure vs a snapshot) cannot be told apart
+        // once cached, so max stands; the in-file merge already resolved it.
+        assert_eq!(merge_cached_input(&t(44_696, 0), &t(44_939, 0)), 44_939);
     }
 
     fn fixture() -> Value {
