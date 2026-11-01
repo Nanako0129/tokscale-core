@@ -648,38 +648,70 @@ impl RelatedFileFingerprint {
 /// The parent session only names a subagent when tier 1 (the `.meta.json`
 /// `agentType`) cannot, so a resolving tier 1 leaves it out and a parent append
 /// stops invalidating every subagent of that session. `.meta.json` stays
-/// related: rewriting it re-evaluates this rule. A cached fingerprint with no
-/// parent entry may have dropped them while tier 1 resolved, so once tier 1
-/// fails the parent is probed afresh rather than trusting the empty list.
+/// related: rewriting it re-evaluates this rule.
+///
+/// Two costs stay off the warm path. The meta is read only when it may have
+/// changed: a cached fingerprint with no parent entry and a `.meta.json` entry
+/// that still matches the file on disk means tier 1 gave the same answer as
+/// when it was cached (if it did not resolve, the probe found no parent and
+/// the transcript is unchanged, so the answer is the same empty list). A
+/// cached fingerprint with parent entries is read, because an older engine
+/// also wrote them for a resolving meta. And the parent is probed afresh, when
+/// tier 1 fails and the cached list is empty, only if a `.meta.json` existed
+/// when it was cached, since only a present meta can have resolved and dropped
+/// the parents; a file with no meta and no parent is not probed on every check.
 fn claude_code_related_paths(
     path: &Path,
     home_dir: Option<&Path>,
     warm: Option<&SourceFingerprint>,
 ) -> Vec<(String, PathBuf)> {
     let mut related = Vec::new();
+    let mut meta_path = None;
 
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        let meta_filename = format!("{}.meta.json", stem);
-        related.push((".meta.json".to_string(), path.with_file_name(meta_filename)));
+        let meta = path.with_file_name(format!("{}.meta.json", stem));
+        related.push((".meta.json".to_string(), meta.clone()));
+        meta_path = Some(meta);
     }
 
     if let Some(variant_path) = crate::cc_mirror::variant_file_for_session_path(path, home_dir) {
         related.push(("cc-mirror/variant.json".to_string(), variant_path));
     }
 
-    if crate::sessions::claudecode::subagent_name_from_meta_sidecar(path).is_none() {
-        let cached_parents = warm
-            .map(cached_claude_parent_paths)
-            .filter(|parents| !parents.is_empty());
-        related.extend(cached_parents.unwrap_or_else(|| {
-            crate::sessions::claudecode::parent_session_paths_for_cache(path)
-                .into_iter()
-                .enumerate()
-                .map(|(index, parent_path)| (format!("parent-session-{index}.jsonl"), parent_path))
-                .collect()
-        }));
+    let cached_parents = warm.map(cached_claude_parent_paths).unwrap_or_default();
+    let cached_meta = warm.and_then(|cached| {
+        cached
+            .related_files
+            .iter()
+            .find(|related| related.suffix == ".meta.json" && related.exists)
+    });
+    let meta_unchanged = cached_parents.is_empty()
+        && cached_meta
+            .zip(meta_path.as_deref())
+            .is_some_and(|(cached, meta)| related_entry_matches(cached, meta) == Some(true));
+    if meta_unchanged
+        || crate::sessions::claudecode::subagent_name_from_meta_sidecar(path).is_some()
+    {
+        return related;
     }
+
+    let parents = if !cached_parents.is_empty() {
+        cached_parents
+    } else if warm.is_none() || cached_meta.is_some() {
+        probe_claude_parent_paths(path)
+    } else {
+        Vec::new()
+    };
+    related.extend(parents);
     related
+}
+
+fn probe_claude_parent_paths(path: &Path) -> Vec<(String, PathBuf)> {
+    crate::sessions::claudecode::parent_session_paths_for_cache(path)
+        .into_iter()
+        .enumerate()
+        .map(|(index, parent_path)| (format!("parent-session-{index}.jsonl"), parent_path))
+        .collect()
 }
 
 fn cached_claude_parent_paths(cached: &SourceFingerprint) -> Vec<(String, PathBuf)> {
@@ -709,6 +741,25 @@ fn metadata_signature(path: &Path) -> std::io::Result<(u64, u64)> {
     Ok((metadata.len(), modified_ns))
 }
 
+/// Whether one cached related file still describes `related_path`: the same
+/// path, existence, size, mtime and sample hashes. `None` when the file cannot
+/// be read for a reason other than being absent.
+fn related_entry_matches(related: &RelatedFileFingerprint, related_path: &Path) -> Option<bool> {
+    if related.path != CachedPath::from_path(related_path) {
+        return Some(false);
+    }
+    match metadata_signature(related_path) {
+        Ok((size, modified_ns)) => {
+            if !related.exists || related.size != size || related.modified_ns != modified_ns {
+                return Some(false);
+            }
+            Some(compute_sample_hashes(related_path, size)? == related.sample_hashes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(!related.exists),
+        Err(_) => None,
+    }
+}
+
 fn related_fingerprint_metadata_matches(
     related_paths: &[(String, PathBuf)],
     cached: &SourceFingerprint,
@@ -725,24 +776,8 @@ fn related_fingerprint_metadata_matches(
         else {
             return Some(false);
         };
-        if related.path != CachedPath::from_path(related_path) {
+        if !related_entry_matches(related, related_path)? {
             return Some(false);
-        }
-        match metadata_signature(related_path) {
-            Ok((size, modified_ns)) => {
-                if !related.exists || related.size != size || related.modified_ns != modified_ns {
-                    return Some(false);
-                }
-                if compute_sample_hashes(related_path, size)? != related.sample_hashes {
-                    return Some(false);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if related.exists {
-                    return Some(false);
-                }
-            }
-            Err(_) => return None,
         }
     }
 
@@ -4137,6 +4172,126 @@ mod tests {
         assert!(matches!(
             s1c_check(&sidechain, Some(&rescanned)),
             FingerprintStatus::Changed(_)
+        ));
+    }
+
+    /// A subagent-layout transcript with no meta and no parent to find is
+    /// probed when first fingerprinted and not again on warm checks: only a
+    /// present meta can have resolved and dropped the parents.
+    #[test]
+    fn test_claude_subagent_without_meta_or_parent_is_probed_once() {
+        use crate::sessions::claudecode::PARENT_PROBES;
+        let dir = TempDir::new().unwrap();
+        let (sidechain, _parent, _meta) = s1c_subagent_fixture(dir.path());
+        std::fs::write(
+            &sidechain,
+            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+
+        let probes = || PARENT_PROBES.with(|probes| probes.get());
+        let FingerprintStatus::Changed(cached) = s1c_check(&sidechain, None) else {
+            panic!("a cold check fingerprints");
+        };
+        assert!(!s1c_has_parent(&cached));
+        let after_cold = probes();
+        assert!(after_cold >= 1);
+        for _ in 0..2 {
+            assert!(matches!(
+                s1c_check(&sidechain, Some(&cached)),
+                FingerprintStatus::Unchanged
+            ));
+        }
+        assert_eq!(probes(), after_cold, "warm checks must not probe again");
+    }
+
+    /// A warm check whose cached `.meta.json` entry still matches the file takes
+    /// the tier-1 outcome from the cache and does not read the meta.
+    #[test]
+    fn test_claude_subagent_unchanged_meta_is_not_read_on_a_warm_check() {
+        use crate::sessions::claudecode::META_SIDECAR_READS;
+        let dir = TempDir::new().unwrap();
+        let (sidechain, parent, meta) = s1c_subagent_fixture(dir.path());
+        std::fs::write(&meta, br#"{"agentType":"explore"}"#).unwrap();
+
+        let reads = || META_SIDECAR_READS.with(|reads| reads.get());
+        let FingerprintStatus::Changed(cached) = s1c_check(&sidechain, None) else {
+            panic!("a cold check fingerprints");
+        };
+        let after_cold = reads();
+        assert!(after_cold >= 1);
+        s1c_append(&parent, "parent line 2\n");
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&cached)),
+            FingerprintStatus::Unchanged
+        ));
+        assert_eq!(reads(), after_cold, "an unchanged meta is not read");
+
+        // A rewritten meta is read again.
+        std::fs::write(&meta, br#"{"agentType":"plan"}"#).unwrap();
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&cached)),
+            FingerprintStatus::Changed(_)
+        ));
+        assert!(reads() > after_cold);
+    }
+
+    /// A resolving `.meta.json` that appears after the transcript was cached
+    /// with its parent invalidates the entry; the new fingerprint has no
+    /// parent, so a later parent append is a hit.
+    #[test]
+    fn test_claude_subagent_meta_appearing_later_drops_the_parent() {
+        let dir = TempDir::new().unwrap();
+        let (sidechain, parent, meta) = s1c_subagent_fixture(dir.path());
+        let FingerprintStatus::Changed(with_parent) = s1c_check(&sidechain, None) else {
+            panic!("a cold check fingerprints");
+        };
+        assert!(s1c_has_parent(&with_parent));
+
+        std::fs::write(&meta, br#"{"agentType":"explore"}"#).unwrap();
+        let FingerprintStatus::Changed(resolved) = s1c_check(&sidechain, Some(&with_parent)) else {
+            panic!("the meta appearing changes the fingerprint");
+        };
+        assert!(!s1c_has_parent(&resolved));
+
+        s1c_append(&parent, "parent line 2\n");
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&resolved)),
+            FingerprintStatus::Unchanged
+        ));
+    }
+
+    /// A fingerprint written before this rule lists the parent for a resolving
+    /// meta. It misses once, and the fingerprint that replaces it has no parent.
+    #[test]
+    fn test_claude_subagent_old_fingerprint_with_resolving_meta_converges() {
+        let dir = TempDir::new().unwrap();
+        let (sidechain, _parent, meta) = s1c_subagent_fixture(dir.path());
+        let FingerprintStatus::Changed(no_meta) = s1c_check(&sidechain, None) else {
+            panic!("a cold check fingerprints");
+        };
+        std::fs::write(&meta, br#"{"agentType":"explore"}"#).unwrap();
+        let FingerprintStatus::Changed(mut old) = s1c_check(&sidechain, None) else {
+            panic!("a cold check fingerprints");
+        };
+        old.related_files.extend(
+            no_meta
+                .related_files
+                .iter()
+                .filter(|related| related.suffix.starts_with("parent-session-"))
+                .cloned(),
+        );
+        old.related_files
+            .sort_by(|left, right| left.suffix.cmp(&right.suffix));
+        assert!(s1c_has_parent(&old));
+
+        let FingerprintStatus::Changed(new) = s1c_check(&sidechain, Some(&old)) else {
+            panic!("the old fingerprint misses once");
+        };
+        assert!(!s1c_has_parent(&new));
+        assert!(matches!(
+            s1c_check(&sidechain, Some(&new)),
+            FingerprintStatus::Unchanged
         ));
     }
 

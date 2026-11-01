@@ -4004,7 +4004,11 @@ const PARSE_BATCH_SIZE: usize = 32;
 /// or `None` for a full parse. A changed sidecar (the subagent `.meta.json`,
 /// a parent session, a cc-mirror `variant.json`) can change messages before
 /// the checkpoint, and each of them is a related file, so any change in
-/// `related_files` takes the full parse. Retained history after the live
+/// `related_files` takes the full parse. The parent session is a related file
+/// only for a subagent whose `.meta.json` does not resolve a name (see
+/// `claude_code_related_paths` in `message_cache.rs`); for one that does, a
+/// parent change leaves the entry alone and the subagent resumes on its own
+/// growth. Retained history after the live
 /// prefix is not the checkpoint's concern: `resume_claude_file` verifies only
 /// the first `message_count` messages.
 fn resume_claude_source(
@@ -10145,7 +10149,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_claude_subagent_name_follows_the_meta_then_the_parent() {
-        for lane in [S1bLane::Materialized, S1bLane::Streaming] {
+        for lane in [S1bLane::Materialized, S1bLane::Streaming, S1bLane::Count] {
             let cache_home = tempfile::TempDir::new().unwrap();
             let cold_home = tempfile::TempDir::new().unwrap();
             let source_home = tempfile::TempDir::new().unwrap();
