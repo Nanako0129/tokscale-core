@@ -354,12 +354,16 @@ const SCAN_WORKER_CEILING: usize = 4;
 fn run_scan_tasks<P: Send>(
     tasks: Vec<(ClientId, P, &str)>,
     root: impl Fn(&P) -> &Path + Sync,
+    exclusions: &ScanExclusions,
 ) -> Vec<(ClientId, Vec<PathBuf>)> {
     let scan = |tasks: Vec<(ClientId, P, &str)>| -> Vec<(ClientId, Vec<PathBuf>)> {
         tasks
             .into_par_iter()
             .map(|(client_id, path, pattern)| {
-                (client_id, scan_directory_path(root(&path), pattern))
+                (
+                    client_id,
+                    scan_directory_path(root(&path), pattern, &exclusions.for_client(client_id)),
+                )
             })
             .collect()
     };
@@ -377,10 +381,10 @@ fn run_scan_tasks<P: Send>(
 
 /// Scan a single directory for session files
 pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
-    scan_directory_path(Path::new(root), pattern)
+    scan_directory_path(Path::new(root), pattern, &[])
 }
 
-fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
+fn scan_directory_path(root_path: &Path, pattern: &str, excluded: &[PathBuf]) -> Vec<PathBuf> {
     if !root_path.exists() {
         return Vec::new();
     }
@@ -391,8 +395,32 @@ fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
     // convoy-stall on large trees; upstream measured the sequential walk
     // faster (~130 ms vs ~250 ms on 31.5k files). Upstream's maintainer notes
     // it is a stall, not a deadlock, and does not explain the #1153 hang.
+    //
+    // `excluded` prunes whole subtrees during the walk. An entry is compared
+    // as found and as resolved: the resolved form is the canonical root plus
+    // the relative path (no syscall per entry), except for a symlink, which is
+    // resolved on its own. The walk root itself is an entry, so an excluded
+    // root yields nothing.
+    let canonical_root = (!excluded.is_empty())
+        .then(|| std::fs::canonicalize(root_path).ok())
+        .flatten();
     let mut paths: Vec<PathBuf> = WalkDir::new(root_path)
         .into_iter()
+        .filter_entry(|e| {
+            if excluded.is_empty() {
+                return true;
+            }
+            let found = e.path();
+            let resolved = if e.path_is_symlink() {
+                std::fs::canonicalize(found).ok()
+            } else {
+                canonical_root
+                    .as_ref()
+                    .zip(found.strip_prefix(root_path).ok())
+                    .map(|(root, relative)| root.join(relative))
+            };
+            !prefixes_cover(excluded, found, resolved.as_deref())
+        })
         .filter_map(|e| e.ok())
         .filter(|e| {
             let path = e.path();
@@ -974,99 +1002,83 @@ fn grok_unified_log_path_from_updates(updates_path: &Path) -> Option<PathBuf> {
         .map(|grok_home| grok_home.join("logs/unified.jsonl"))
 }
 
-/// Drop every scan task at or under a caller-excluded prefix for its client.
+/// Caller-excluded prefixes, per client, built once per scan.
 ///
-/// Applied to the assembled task list rather than inside
-/// [`push_unique_scan_task_with_pattern`], because that is the only place every
-/// discovery route has finished contributing: the declared root, the settings
-/// file's extra paths, the built-in extras, the `.cc-mirror` variants and the
-/// cowork trees all push through the helper at different points, and a guard
-/// placed at any one of them would let the others past.
+/// Every prefix is held as given and, when it resolves, canonicalized. A path
+/// is excluded when either form of the path (as found, or resolved) starts
+/// with either form of a prefix. The "as found" half makes a symlink inside an
+/// excluded directory count as excluded even when it points elsewhere; the
+/// canonical half catches a path reached through a symlinked parent. Comparing
+/// raw with raw and canonical with canonical also keeps Windows `\\?\` verbatim
+/// paths (what `canonicalize` returns there) from silently never matching.
 ///
-/// Both sides are canonicalized, for the same reason the helper canonicalizes
-/// its dedup key at the call below: a symlinked directory would otherwise walk
-/// straight past a string comparison.
+/// The exclusion is applied where each source is *selected*, before the
+/// cross-client `seen` dedup and before a database candidate is chosen: the
+/// directory walk skips an excluded subtree (so nesting is covered and the
+/// subtree is never enumerated), and single-file and database sources ask
+/// [`Self::usable`], so an excluded candidate yields to the next one. A client
+/// with no prefix does no extra work.
 ///
-/// Both scan paths call it: the context-free one on its `String` tasks and
-/// the source-context one on its `PathBuf` tasks, each just before
-/// `run_scan_tasks`.
-fn retain_unexcluded_scan_tasks<P: AsRef<Path>>(
-    tasks: &mut Vec<(ClientId, P, &'static str)>,
-    scanner_settings: &ScannerSettings,
-) {
-    let excluded = excluded_prefixes(scanner_settings);
-    if excluded.is_empty() {
-        return;
-    }
-    tasks.retain(|(client_id, path, _)| !is_excluded(&excluded, *client_id, path.as_ref()));
+/// Not covered: the `synthetic` pseudo-client (the octofriend database) has no
+/// `ClientId`, so `excluded_scan_paths` cannot name it; and
+/// `ScanResult::opencode_json_dir` is a migration stat pointer, not a source
+/// read for usage, so it is still reported when its directory is excluded
+/// (the walk of that directory is skipped).
+#[derive(Default)]
+struct ScanExclusions {
+    prefixes: Vec<(ClientId, PathBuf)>,
 }
 
-fn excluded_prefixes(scanner_settings: &ScannerSettings) -> Vec<(ClientId, PathBuf)> {
-    scanner_settings
-        .excluded_scan_paths
-        .iter()
-        .filter_map(|(client_str, paths)| ClientId::from_str(client_str).map(|id| (id, paths)))
-        .flat_map(|(client_id, paths)| {
-            paths
-                .iter()
-                .filter(|path| !path.as_os_str().is_empty())
-                .map(move |path| {
-                    (
-                        client_id,
-                        std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()),
-                    )
-                })
-        })
-        .collect()
-}
-
-fn is_excluded(excluded: &[(ClientId, PathBuf)], client_id: ClientId, path: &Path) -> bool {
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    excluded
-        .iter()
-        .any(|(excluded_id, prefix)| *excluded_id == client_id && resolved.starts_with(prefix))
-}
-
-/// Drop every discovered file, database and directory at or under a
-/// caller-excluded prefix for its client, from the assembled [`ScanResult`].
-///
-/// [`retain_unexcluded_scan_tasks`] only stops an excluded root being walked.
-/// It cannot see an exclusion *below* a retained root (the walk starts above
-/// it), nor a source that never became a task: Grok's `logs/unified.jsonl`,
-/// the Copilot exporter file and desktop database, and every SQLite source.
-/// Both scan entries call this on their finished result, so one rule decides
-/// what an exclusion means whatever route found the path (issue #16).
-fn prune_excluded_scan_result(result: &mut ScanResult, scanner_settings: &ScannerSettings) {
-    let excluded = excluded_prefixes(scanner_settings);
-    if excluded.is_empty() {
-        return;
-    }
-    for client_id in ClientId::iter() {
-        result
-            .get_mut(client_id)
-            .retain(|path| !is_excluded(&excluded, client_id, path));
-    }
-    let drop_db = |client_id: ClientId, db: &mut Option<PathBuf>| {
-        if db
-            .as_deref()
-            .is_some_and(|p| is_excluded(&excluded, client_id, p))
-        {
-            *db = None;
+impl ScanExclusions {
+    fn new(scanner_settings: &ScannerSettings) -> Self {
+        let mut prefixes = Vec::new();
+        for (client_str, paths) in &scanner_settings.excluded_scan_paths {
+            let Some(client_id) = ClientId::from_str(client_str) else {
+                continue;
+            };
+            for path in paths.iter().filter(|path| !path.as_os_str().is_empty()) {
+                prefixes.push((client_id, path.clone()));
+                if let Ok(canonical) = std::fs::canonicalize(path) {
+                    if &canonical != path {
+                        prefixes.push((client_id, canonical));
+                    }
+                }
+            }
         }
-    };
-    drop_db(ClientId::Copilot, &mut result.copilot_desktop_db);
-    drop_db(ClientId::Kilo, &mut result.kilo_db);
-    drop_db(ClientId::Hermes, &mut result.hermes_db);
-    drop_db(ClientId::Goose, &mut result.goose_db);
-    drop_db(ClientId::Zed, &mut result.zed_db);
-    drop_db(ClientId::Kiro, &mut result.kiro_db);
-    drop_db(ClientId::Zcode, &mut result.zcode_db);
-    result
-        .opencode_dbs
-        .retain(|path| !is_excluded(&excluded, ClientId::OpenCode, path));
-    result
-        .crush_dbs
-        .retain(|db| !is_excluded(&excluded, ClientId::Crush, &db.db_path));
+        Self { prefixes }
+    }
+
+    fn for_client(&self, client_id: ClientId) -> Vec<PathBuf> {
+        self.prefixes
+            .iter()
+            .filter(|(id, _)| *id == client_id)
+            .map(|(_, prefix)| prefix.clone())
+            .collect()
+    }
+
+    /// One path (a database, a log, an exporter file): one `canonicalize`, and
+    /// only for a client that has a prefix.
+    fn excludes(&self, client_id: ClientId, path: &Path) -> bool {
+        let prefixes = self.for_client(client_id);
+        if prefixes.is_empty() {
+            return false;
+        }
+        let canonical = std::fs::canonicalize(path).ok();
+        prefixes_cover(&prefixes, path, canonical.as_deref())
+    }
+
+    /// An existing file that is not excluded: what a database candidate must
+    /// be to be chosen.
+    fn usable(&self, client_id: ClientId, path: &Path) -> bool {
+        path.is_file() && !self.excludes(client_id, path)
+    }
+}
+
+fn prefixes_cover(prefixes: &[PathBuf], found: &Path, canonical: Option<&Path>) -> bool {
+    prefixes.iter().any(|prefix| {
+        found.starts_with(prefix)
+            || canonical.is_some_and(|canonical| canonical.starts_with(prefix))
+    })
 }
 
 fn push_unique_scan_task(
@@ -1243,6 +1255,7 @@ fn scan_all_clients_resolved_inner(
     let home_dir = context.home_dir();
     let use_env_roots = context.use_env_roots();
     let scanner_settings = context.scanner_settings();
+    let exclusions = ScanExclusions::new(scanner_settings);
 
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
@@ -1377,6 +1390,9 @@ fn scan_all_clients_resolved_inner(
             &mut result.opencode_dbs,
             &scanner_settings.opencode_db_paths,
         );
+        result
+            .opencode_dbs
+            .retain(|path| !exclusions.excludes(ClientId::OpenCode, path));
         result.opencode_dbs.sort_unstable();
         result.opencode_dbs.dedup();
         let path = context.resolve_client_path(ClientId::OpenCode)?;
@@ -1472,7 +1488,7 @@ fn scan_all_clients_resolved_inner(
 
     if enabled.contains(&ClientId::Kilo) {
         let path = context.resolve_client_path(ClientId::Kilo)?;
-        if path.exists() {
+        if path.exists() && !exclusions.excludes(ClientId::Kilo, &path) {
             result.kilo_db = Some(path);
         }
     }
@@ -1491,7 +1507,7 @@ fn scan_all_clients_resolved_inner(
         let mut extra_dbs = Vec::new();
         for hermes_home in homes {
             let default_db = hermes_home.join("state.db");
-            if default_db.is_file() {
+            if exclusions.usable(ClientId::Hermes, &default_db) {
                 if result.hermes_db.is_none() {
                     result.hermes_db = Some(default_db);
                 } else if result.hermes_db.as_ref() != Some(&default_db) {
@@ -1500,6 +1516,7 @@ fn scan_all_clients_resolved_inner(
             }
             extra_dbs.extend(discover_hermes_profile_state_dbs(&hermes_home));
         }
+        extra_dbs.retain(|path| !exclusions.excludes(ClientId::Hermes, path));
         extra_dbs.sort_unstable();
         extra_dbs.dedup();
         result.get_mut(ClientId::Hermes).extend(extra_dbs);
@@ -1518,7 +1535,9 @@ fn scan_all_clients_resolved_inner(
             home_dir.join("Library/Application Support/Block/goose/sessions/sessions.db"),
             home_dir.join(".local/share/Block/goose/sessions/sessions.db"),
         ]);
-        result.goose_db = candidates.into_iter().find(|path| path.is_file());
+        result.goose_db = candidates
+            .into_iter()
+            .find(|path| exclusions.usable(ClientId::Goose, path));
     }
 
     if enabled.contains(&ClientId::Zed) {
@@ -1534,7 +1553,9 @@ fn scan_all_clients_resolved_inner(
                 candidates.push(root.join("Zed/threads/threads.db"));
             }
         }
-        result.zed_db = candidates.into_iter().find(|path| path.is_file());
+        result.zed_db = candidates
+            .into_iter()
+            .find(|path| exclusions.usable(ClientId::Zed, path));
     }
 
     if enabled.contains(&ClientId::Crush) {
@@ -1543,6 +1564,7 @@ fn scan_all_clients_resolved_inner(
         // Crush databases bypass `push`, and a registry entry's `data_dir` is
         // file content that may be absolute, so it needs the same check.
         dbs.retain(|db| context.admits_scan_root(&db.db_path));
+        dbs.retain(|db| !exclusions.excludes(ClientId::Crush, &db.db_path));
         dbs.sort_by(|a, b| a.db_path.cmp(&b.db_path));
         dbs.dedup_by(|a, b| a.db_path == b.db_path);
         result.crush_dbs = dbs;
@@ -1553,11 +1575,11 @@ fn scan_all_clients_resolved_inner(
             home_dir.join("Library/Application Support/kiro-cli/data.sqlite3"),
         ]
         .into_iter()
-        .find(|path| path.is_file());
+        .find(|path| exclusions.usable(ClientId::Kiro, path));
     }
     if enabled.contains(&ClientId::Zcode) {
         let path = context.resolve_client_path(ClientId::Zcode)?;
-        result.zcode_db = path.is_file().then_some(path);
+        result.zcode_db = exclusions.usable(ClientId::Zcode, &path).then_some(path);
     }
     if enabled.contains(&ClientId::Codebuff) {
         if use_env_roots {
@@ -1590,9 +1612,7 @@ fn scan_all_clients_resolved_inner(
         }
     }
 
-    retain_unexcluded_scan_tasks(&mut tasks, scanner_settings);
-
-    let scan_results = run_scan_tasks(tasks, |path| path.as_path());
+    let scan_results = run_scan_tasks(tasks, |path| path.as_path(), &exclusions);
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for (client_id, files) in scan_results {
         for file in files {
@@ -1610,7 +1630,7 @@ fn scan_all_clients_resolved_inner(
     );
     for path in grok_unified_paths {
         let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if path.is_file() && seen.insert(key) {
+        if exclusions.usable(ClientId::Grok, &path) && seen.insert(key) {
             result.get_mut(ClientId::Grok).push(path);
         }
     }
@@ -1618,14 +1638,14 @@ fn scan_all_clients_resolved_inner(
 
     if enabled.contains(&ClientId::Copilot) {
         let desktop_db = home_dir.join(".copilot/data.db");
-        if desktop_db.is_file() {
+        if exclusions.usable(ClientId::Copilot, &desktop_db) {
             result.copilot_desktop_db = Some(desktop_db);
         }
         if use_env_roots && context.source_env_is_explicit("COPILOT_OTEL_FILE_EXPORTER_PATH") {
             if let Some(path) = context.source_env_path("COPILOT_OTEL_FILE_EXPORTER_PATH") {
                 let path = path.to_path_buf();
                 let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                if path.is_file() && seen.insert(key) {
+                if exclusions.usable(ClientId::Copilot, &path) && seen.insert(key) {
                     result.get_mut(ClientId::Copilot).push(path);
                     result.get_mut(ClientId::Copilot).sort_unstable();
                 }
@@ -1634,7 +1654,6 @@ fn scan_all_clients_resolved_inner(
     }
 
     prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
-    prune_excluded_scan_result(&mut result, scanner_settings);
 
     Ok(result)
 }
@@ -1646,6 +1665,7 @@ fn scan_all_clients_with_env_strategy_inner(
     scanner_settings: &ScannerSettings,
 ) -> ScanResult {
     let mut result = ScanResult::default();
+    let exclusions = ScanExclusions::new(scanner_settings);
 
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
@@ -1800,6 +1820,9 @@ fn scan_all_clients_with_env_strategy_inner(
             &mut result.opencode_dbs,
             &scanner_settings.opencode_db_paths,
         );
+        result
+            .opencode_dbs
+            .retain(|path| !exclusions.excludes(ClientId::OpenCode, path));
         result.opencode_dbs.sort_unstable();
         result.opencode_dbs.dedup();
 
@@ -1965,7 +1988,9 @@ fn scan_all_clients_with_env_strategy_inner(
         let kilo_db_path = ClientId::Kilo
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
-        if std::path::Path::new(&kilo_db_path).exists() {
+        if std::path::Path::new(&kilo_db_path).exists()
+            && !exclusions.excludes(ClientId::Kilo, std::path::Path::new(&kilo_db_path))
+        {
             result.kilo_db = Some(PathBuf::from(kilo_db_path));
         }
     }
@@ -1974,7 +1999,7 @@ fn scan_all_clients_with_env_strategy_inner(
         let mut extra_dbs = Vec::new();
         for hermes_home in hermes_home_candidates(home_dir, use_env_roots) {
             let default_db = hermes_home.join("state.db");
-            if default_db.is_file() {
+            if exclusions.usable(ClientId::Hermes, &default_db) {
                 if result.hermes_db.is_none() {
                     result.hermes_db = Some(default_db);
                 } else if result.hermes_db.as_ref() != Some(&default_db) {
@@ -1983,6 +2008,7 @@ fn scan_all_clients_with_env_strategy_inner(
             }
             extra_dbs.extend(discover_hermes_profile_state_dbs(&hermes_home));
         }
+        extra_dbs.retain(|path| !exclusions.excludes(ClientId::Hermes, path));
         extra_dbs.sort_unstable();
         extra_dbs.dedup();
         result.get_mut(ClientId::Hermes).extend(extra_dbs);
@@ -1994,7 +2020,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 let trimmed = custom_root.trim();
                 if !trimmed.is_empty() {
                     let custom_path = PathBuf::from(trimmed).join("data/sessions/sessions.db");
-                    if custom_path.is_file() {
+                    if exclusions.usable(ClientId::Goose, &custom_path) {
                         result.goose_db = Some(custom_path);
                     }
                 }
@@ -2005,7 +2031,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 .data()
                 .resolve_path_with_env_strategy(home_dir, use_env_roots);
             let xdg = PathBuf::from(xdg_path);
-            if xdg.is_file() {
+            if exclusions.usable(ClientId::Goose, &xdg) {
                 result.goose_db = Some(xdg);
             }
         }
@@ -2014,7 +2040,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 "{}/Library/Application Support/goose/sessions/sessions.db",
                 home_dir
             ));
-            if macos_path.is_file() {
+            if exclusions.usable(ClientId::Goose, &macos_path) {
                 result.goose_db = Some(macos_path);
             }
         }
@@ -2023,7 +2049,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 "{}/Library/Application Support/Block/goose/sessions/sessions.db",
                 home_dir
             ));
-            if legacy_macos_path.is_file() {
+            if exclusions.usable(ClientId::Goose, &legacy_macos_path) {
                 result.goose_db = Some(legacy_macos_path);
             }
         }
@@ -2032,7 +2058,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 "{}/.local/share/Block/goose/sessions/sessions.db",
                 home_dir
             ));
-            if legacy_xdg_path.is_file() {
+            if exclusions.usable(ClientId::Goose, &legacy_xdg_path) {
                 result.goose_db = Some(legacy_xdg_path);
             }
         }
@@ -2043,7 +2069,7 @@ fn scan_all_clients_with_env_strategy_inner(
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
         let xdg = PathBuf::from(zed_db_path);
-        if xdg.is_file() {
+        if exclusions.usable(ClientId::Zed, &xdg) {
             result.zed_db = Some(xdg);
         }
         #[cfg(target_os = "macos")]
@@ -2052,13 +2078,13 @@ fn scan_all_clients_with_env_strategy_inner(
                 "{}/Library/Application Support/Zed/threads/threads.db",
                 home_dir
             ));
-            if macos_path.is_file() {
+            if exclusions.usable(ClientId::Zed, &macos_path) {
                 result.zed_db = Some(macos_path);
             }
         }
         if !use_env_roots && result.zed_db.is_none() {
             let windows_path = PathBuf::from(home_dir).join("AppData/Local/Zed/threads/threads.db");
-            if windows_path.is_file() {
+            if exclusions.usable(ClientId::Zed, &windows_path) {
                 result.zed_db = Some(windows_path);
             }
         }
@@ -2066,7 +2092,7 @@ fn scan_all_clients_with_env_strategy_inner(
         if use_env_roots && result.zed_db.is_none() {
             if let Some(local_app_data) = dirs::data_local_dir() {
                 let windows_path = local_app_data.join("Zed/threads/threads.db");
-                if windows_path.is_file() {
+                if exclusions.usable(ClientId::Zed, &windows_path) {
                     result.zed_db = Some(windows_path);
                 }
             }
@@ -2075,11 +2101,14 @@ fn scan_all_clients_with_env_strategy_inner(
 
     if enabled.contains(&ClientId::Crush) {
         result.crush_dbs = discover_crush_dbs(home_dir, use_env_roots);
+        result
+            .crush_dbs
+            .retain(|db| !exclusions.excludes(ClientId::Crush, &db.db_path));
     }
 
     if enabled.contains(&ClientId::Kiro) {
         let xdg_path = PathBuf::from(format!("{}/.local/share/kiro-cli/data.sqlite3", home_dir));
-        if xdg_path.is_file() {
+        if exclusions.usable(ClientId::Kiro, &xdg_path) {
             result.kiro_db = Some(xdg_path);
         }
         if result.kiro_db.is_none() {
@@ -2087,7 +2116,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 "{}/Library/Application Support/kiro-cli/data.sqlite3",
                 home_dir
             ));
-            if macos_path.is_file() {
+            if exclusions.usable(ClientId::Kiro, &macos_path) {
                 result.kiro_db = Some(macos_path);
             }
         }
@@ -2099,7 +2128,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 .data()
                 .resolve_path_with_env_strategy(home_dir, use_env_roots),
         );
-        result.zcode_db = path.is_file().then_some(path);
+        result.zcode_db = exclusions.usable(ClientId::Zcode, &path).then_some(path);
     }
 
     if enabled.contains(&ClientId::Codebuff) {
@@ -2136,9 +2165,7 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
-    retain_unexcluded_scan_tasks(&mut tasks, scanner_settings);
-
-    let scan_results = run_scan_tasks(tasks, |path| Path::new(path.as_str()));
+    let scan_results = run_scan_tasks(tasks, |path| Path::new(path.as_str()), &exclusions);
 
     // Aggregate results, deduplicating physical files across overlapping roots.
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -2160,7 +2187,7 @@ fn scan_all_clients_with_env_strategy_inner(
 
     for path in grok_unified_paths {
         let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if path.is_file() && seen.insert(key) {
+        if exclusions.usable(ClientId::Grok, &path) && seen.insert(key) {
             result.get_mut(ClientId::Grok).push(path);
         }
     }
@@ -2168,13 +2195,13 @@ fn scan_all_clients_with_env_strategy_inner(
 
     if enabled.contains(&ClientId::Copilot) {
         let desktop_db = PathBuf::from(home_dir).join(".copilot/data.db");
-        if desktop_db.is_file() {
+        if exclusions.usable(ClientId::Copilot, &desktop_db) {
             result.copilot_desktop_db = Some(desktop_db);
         }
 
         if let Some(path) = copilot_exporter_path_with_env_strategy(use_env_roots) {
             let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if path.is_file() && seen.insert(key) {
+            if exclusions.usable(ClientId::Copilot, &path) && seen.insert(key) {
                 let copilot_files = result.get_mut(ClientId::Copilot);
                 copilot_files.push(path);
                 copilot_files.sort_unstable();
@@ -2183,7 +2210,6 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
-    prune_excluded_scan_result(&mut result, scanner_settings);
 
     result
 }
@@ -3930,6 +3956,137 @@ mod tests {
         };
         for result in scan_both_entries(home, "opencode", false, &settings) {
             assert_eq!(result.opencode_dbs, vec![auto.clone()]);
+        }
+    }
+
+    /// An excluded database candidate yields to the next one: the exclusion
+    /// is part of the choice, not applied to whatever was chosen.
+    #[test]
+    #[serial]
+    fn test_excluded_database_candidate_falls_back_to_the_next() {
+        for (client, first, second) in [
+            (
+                "goose",
+                ".local/share/goose/sessions/sessions.db",
+                "Library/Application Support/goose/sessions/sessions.db",
+            ),
+            (
+                "kiro",
+                ".local/share/kiro-cli/data.sqlite3",
+                "Library/Application Support/kiro-cli/data.sqlite3",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let home = dir.path();
+            touch(&home.join(first));
+            touch(&home.join(second));
+            let pick = |r: &ScanResult| match client {
+                "goose" => r.goose_db.clone(),
+                _ => r.kiro_db.clone(),
+            };
+            for result in scan_both_entries(home, client, false, &ScannerSettings::default()) {
+                assert_eq!(pick(&result), Some(home.join(first)), "{client}: inert");
+            }
+            let settings = ScannerSettings {
+                excluded_scan_paths: exclude(client, &[home.join(first).parent().unwrap()]),
+                ..Default::default()
+            };
+            for result in scan_both_entries(home, client, false, &settings) {
+                assert_eq!(
+                    pick(&result),
+                    Some(home.join(second)),
+                    "{client}: no fallback"
+                );
+            }
+        }
+    }
+
+    /// One physical file reachable from two clients, in a subtree excluded for
+    /// one: it stays with the other client on every run, whichever copy a
+    /// dedup would see first.
+    #[test]
+    #[serial]
+    fn test_exclusion_for_one_client_keeps_the_file_for_another_deterministically() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let shared = home.join("shared");
+        let file = shared.join("sub/a.jsonl");
+        touch(&file);
+        // Both directions, so the outcome cannot hinge on which client's
+        // copy the scan happens to meet first.
+        for (excluded, kept) in [("claude", ClientId::Codex), ("codex", ClientId::Claude)] {
+            let settings = ScannerSettings {
+                extra_scan_paths: BTreeMap::from([
+                    ("claude".to_string(), vec![shared.clone()]),
+                    ("codex".to_string(), vec![shared.clone()]),
+                ]),
+                excluded_scan_paths: exclude(excluded, &[&shared.join("sub")]),
+                ..Default::default()
+            };
+            let clients = ["claude".to_string(), "codex".to_string()];
+            let context = ResolvedLocalSourceContext::capture(
+                Some(home.to_path_buf()),
+                false,
+                settings.clone(),
+            )
+            .unwrap();
+            for _ in 0..10 {
+                let results = [
+                    scan_all_clients_with_scanner_settings(
+                        home.to_str().unwrap(),
+                        &clients,
+                        false,
+                        &settings,
+                    ),
+                    scan_all_clients_with_source_context(&context, &clients).unwrap(),
+                ];
+                for result in results {
+                    let dropped = if kept == ClientId::Codex {
+                        ClientId::Claude
+                    } else {
+                        ClientId::Codex
+                    };
+                    assert!(!result.get(dropped).contains(&file));
+                    assert!(result.get(kept).contains(&file));
+                }
+            }
+        }
+    }
+
+    /// "Under the excluded directory" means the path as found: an exporter
+    /// file that is a symlink inside the directory but points elsewhere is
+    /// excluded, though its target is not. (The directory walk never reaches
+    /// such a link, since it prunes the directory itself.)
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_cover_a_symlink_pointing_out_of_the_directory() {
+        let mut env = EnvGuard::capture(&["COPILOT_OTEL_FILE_EXPORTER_PATH"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let target = home.join("outside/real.jsonl");
+        touch(&target);
+        let excluded = home.join("otel-x");
+        fs::create_dir_all(&excluded).unwrap();
+        let link = excluded.join("linked.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        env.set(
+            "COPILOT_OTEL_FILE_EXPORTER_PATH",
+            link.display().to_string(),
+        );
+
+        for result in scan_both_entries(home, "copilot", true, &ScannerSettings::default()) {
+            assert!(result.get(ClientId::Copilot).contains(&link), "inert");
+        }
+        let settings = ScannerSettings {
+            excluded_scan_paths: exclude("copilot", &[&excluded]),
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "copilot", true, &settings) {
+            assert!(
+                !result.get(ClientId::Copilot).contains(&link),
+                "symlink out of an excluded dir kept"
+            );
         }
     }
 
