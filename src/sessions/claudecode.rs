@@ -1089,6 +1089,20 @@ fn merge_claude_duplicate(
     }
 }
 
+/// `input` for two cached copies of one message (upstream #1396, applied to the
+/// save-merge's per-field max). The per-message split flag of
+/// `merge_claude_duplicate` does not survive the cache, so presence of cached
+/// tokens stands in for it: the cache-bearing copy's input wins outright when
+/// it states a positive remainder; otherwise (both, neither, or silent) max.
+pub(crate) fn merge_cached_input(existing: &TokenBreakdown, stored: &TokenBreakdown) -> i64 {
+    let has_cache = |t: &TokenBreakdown| t.cache_read > 0 || t.cache_write > 0;
+    match (has_cache(existing), has_cache(stored)) {
+        (true, false) if existing.input > 0 => existing.input,
+        (false, true) if stored.input > 0 => stored.input,
+        _ => existing.input.max(stored.input),
+    }
+}
+
 fn merge_claude_tool_result_duplicate(
     existing: &mut UnifiedMessage,
     input_tokens: i64,

@@ -1375,7 +1375,13 @@ impl CachedSourceEntry {
                     // on the case, below.
                     let existing = &mut self.messages[index];
                     let stored_tokens = &message.tokens;
-                    existing.tokens.input = existing.tokens.input.max(stored_tokens.input);
+                    // `input` is the one field that is not a plain max: a bare
+                    // prompt snapshot's whole-prompt figure must not beat the
+                    // cache-bearing copy's uncached remainder (upstream #1396).
+                    existing.tokens.input = crate::sessions::claudecode::merge_cached_input(
+                        &existing.tokens,
+                        stored_tokens,
+                    );
                     existing.tokens.output = existing.tokens.output.max(stored_tokens.output);
                     existing.tokens.cache_read =
                         existing.tokens.cache_read.max(stored_tokens.cache_read);
@@ -5752,6 +5758,10 @@ mod tests {
             // input. Neither field-set alone is the true maximum, so a fix
             // that just picks one whole message over the other would still
             // fail this.
+            // Fixture changed for the #1396 input rule: a cache-bearing copy with a
+            // positive input now wins `input` outright, so this completed copy is
+            // silent about input (0) and the max still decides, which is what
+            // this test is about.
             let completed = UnifiedMessage::new_with_dedup(
                 namespace,
                 "claude-3-5-sonnet",
@@ -5759,7 +5769,7 @@ mod tests {
                 "session",
                 1,
                 TokenBreakdown {
-                    input: 80,
+                    input: 0,
                     output: 999,
                     cache_read: 10,
                     cache_write: 5,
@@ -5862,6 +5872,42 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    /// #1396: a bare prompt snapshot (whole-prompt `input`, no cache) saved
+    /// last must not beat the cache-bearing completed copy's uncached remainder.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_merge_input_prefers_the_cache_bearing_copy_over_a_bare_snapshot() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("transcript.jsonl");
+            std::fs::write(&path, b"{\"id\":\"one-generation\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+            let key = "msg_shared:req_shared";
+
+            let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.input = 265;
+            completed.tokens.cache_read = 42_000;
+            let mut snapshot = keyed_message(namespace, "session", key);
+            snapshot.tokens.input = 42_494;
+
+            for message in [completed, snapshot] {
+                let mut writer = SourceMessageCache::load();
+                writer.insert(entry_with_messages(identity, &path, vec![message]));
+                writer.save_if_dirty();
+            }
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1);
+            assert_eq!(entry.messages[0].tokens.input, 265);
+            assert_eq!(entry.messages[0].tokens.cache_read, 42_000);
+        }
+        restore_cache_env(prev_env);
+    }
+
     /// Matching retained labels do not imply matching content. Writers
     /// spanning more than one rewrite can land a partial and a completed form
     /// of the same turn into a single fingerprint, both labeled retained. This
@@ -5885,7 +5931,12 @@ mod tests {
             let key = "msg_shared:req_shared";
             let retained: HashSet<String> = [key.to_string()].into_iter().collect();
 
+            // Fixture changed for the #1396 input rule: a cache-bearing copy with a
+            // positive input now wins `input` outright, so this completed copy is
+            // silent about input (0) and the max still decides, which is what
+            // this test is about.
             let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.input = 0;
             completed.tokens.output = 999;
             completed.tokens.cache_read = 10;
             completed.duration_ms = Some(4_200);
@@ -5961,7 +6012,12 @@ mod tests {
             partial.tokens.output = 50;
             partial.duration_ms = Some(900);
 
+            // Fixture changed for the #1396 input rule: a cache-bearing copy with a
+            // positive input now wins `input` outright, so this completed copy is
+            // silent about input (0) and the max still decides, which is what
+            // this test is about.
             let mut completed = keyed_message(namespace, "session", key);
+            completed.tokens.input = 0;
             completed.tokens.output = 999;
             completed.tokens.cache_read = 10;
             completed.duration_ms = Some(4_200);
