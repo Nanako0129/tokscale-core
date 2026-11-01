@@ -683,7 +683,8 @@ impl RelatedFileFingerprint {
 /// repairs it; it lasts until the meta or the transcript changes. An unreadable
 /// meta gives no fingerprint, so every scan does a full parse; an entry cached
 /// before the meta became unreadable is neither replaced nor removed, and the
-/// parent is not probed for it.
+/// parent is not probed for it while the transcript is unchanged (once the
+/// transcript changes, the probe runs up front and its result is discarded).
 fn claude_code_related_paths(
     path: &Path,
     home_dir: Option<&Path>,
