@@ -9573,10 +9573,6 @@ mod tests {
 
     // ---- S1b: Claude resume from a cached checkpoint ----
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
     /// One human turn and the assistant response to it.
     fn s1b_turn(n: u32, output: u32) -> String {
         format!(
@@ -9591,10 +9587,7 @@ mod tests {
         )
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// The streamed completion of a response whose first line is already
     /// before the checkpoint.
     fn s1b_completion(n: u32, output: u32) -> String {
@@ -9608,10 +9601,7 @@ mod tests {
         )
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn s1b_append(path: &Path, text: &str) {
         use std::io::Write;
         std::fs::OpenOptions::new()
@@ -9622,10 +9612,7 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// How many transcripts under `source_home` a scan continued from a
     /// checkpoint so far (the recorder is process-wide; paths are per-test).
     fn s1b_resumes(source_home: &Path) -> usize {
@@ -9637,10 +9624,6 @@ mod tests {
             .count()
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
     #[derive(Clone, Copy, Debug)]
     enum S1bLane {
         Materialized,
@@ -9648,10 +9631,6 @@ mod tests {
         Count,
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
     type S1bRow = (
         i64,
         Option<i64>,
@@ -9665,10 +9644,6 @@ mod tests {
         String,
     );
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
     /// Every field the three lanes share, sorted, so lanes and cold/warm
     /// scans compare as plain values.
     fn s1b_scan(lane: S1bLane, source_home: &Path) -> Vec<S1bRow> {
@@ -9724,10 +9699,7 @@ mod tests {
         rows
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// A scan of `source_home` from an empty cache home, leaving the current
     /// (warm) cache home untouched.
     fn s1b_cold_scan(lane: S1bLane, source_home: &Path, cold_home: &Path) -> Vec<S1bRow> {
@@ -9738,10 +9710,6 @@ mod tests {
         s1b_scan(lane, source_home)
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
     /// The cached Claude entry of the only transcript a test scanned.
     fn s1b_only_entry() -> message_cache::CachedSourceEntry {
         let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
@@ -9759,10 +9727,7 @@ mod tests {
         entry
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// A Claude transcript that only grew since the last scan continues from
     /// its checkpoint on every lane, also after the checkpoint went through a
     /// shard on disk, and the result equals a cold scan of the same bytes. A
@@ -9852,10 +9817,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// A compacting rewrite (a full parse that keeps the turn the file lost)
     /// followed by growth (a resume) keeps the retained turn, after the live
     /// prefix, and counts the live turns once.
@@ -9927,10 +9889,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// A save-merge that changes a live message under a stored checkpoint
     /// leaves the checkpoint describing messages the entry no longer holds.
     /// The next scan must take the full parse instead of resuming from them.
@@ -10002,17 +9961,32 @@ mod tests {
         }
     }
 
-    /// A read error that truncates a parse must not be cached as the file's
-    /// whole truth: no entry is inserted by either lane (a later healthy scan
-    /// then caches the full file).
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    /// The cached entry of the only transcript, as comparable parts.
+    fn s1b_entry_parts() -> (
+        Vec<UnifiedMessage>,
+        message_cache::SourceFingerprint,
+        HashSet<String>,
+    ) {
+        let entry = s1b_only_entry();
+        (entry.messages, entry.fingerprint, entry.retained_keys)
+    }
+
+    fn s1b_entry_count() -> usize {
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        let mut cache = message_cache::SourceMessageCache::load();
+        cache.ensure_namespace_loaded(identity);
+        cache.entries.len()
+    }
+
+    /// A read or open error that truncates a parse must not be cached as the
+    /// file's whole truth, and must neither overwrite nor evict an entry that
+    /// is already cached (that scan may show fewer rows; the next one
+    /// recovers). Needs no checkpoint, so it runs on every target.
     #[test]
     #[serial_test::serial]
-    fn test_claude_read_error_mid_file_is_not_cached_by_either_lane() {
-        for lane in [S1bLane::Materialized, S1bLane::Streaming] {
+    fn test_claude_read_failures_are_not_cached_and_keep_an_existing_entry() {
+        use sessions::claudecode::{set_read_fault_for_test, ReadFault};
+        for lane in [S1bLane::Materialized, S1bLane::Streaming, S1bLane::Count] {
             let cache_home = tempfile::TempDir::new().unwrap();
             let source_home = tempfile::TempDir::new().unwrap();
             let _env = EnvGuard::set(&[
@@ -10024,58 +9998,116 @@ mod tests {
             let path = claude_dir.join("session.jsonl");
             let first = s1b_turn(1, 5);
             std::fs::write(&path, format!("{first}{}", s1b_turn(2, 1))).unwrap();
-            let cached_entries = || {
-                let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
-                let mut cache = message_cache::SourceMessageCache::load();
-                cache.ensure_namespace_loaded(identity);
-                cache.entries.len()
-            };
 
-            sessions::claudecode::set_read_fault_for_test(&path, Some(first.len() as u64));
+            // No entry yet: a read error mid-file, then an open error.
+            set_read_fault_for_test(&path, Some(ReadFault::ReadsAfter(first.len() as u64)));
             let rows = s1b_scan(lane, source_home.path());
-            sessions::claudecode::set_read_fault_for_test(&path, None);
             assert_eq!(
                 rows.len(),
                 1,
                 "{lane:?}: only what was read before the error"
             );
             assert_eq!(
-                cached_entries(),
+                s1b_entry_count(),
                 0,
                 "{lane:?}: a truncated parse is not cached"
             );
-
-            let rows = s1b_scan(lane, source_home.path());
+            set_read_fault_for_test(&path, Some(ReadFault::Open));
+            assert!(s1b_scan(lane, source_home.path()).is_empty(), "{lane:?}");
             assert_eq!(
-                rows.len(),
-                2,
-                "{lane:?}: the healthy rescan sees the whole file"
+                s1b_entry_count(),
+                0,
+                "{lane:?}: an open error is not an empty file"
             );
-            assert_eq!(cached_entries(), 1, "{lane:?}: and caches it");
+
+            set_read_fault_for_test(&path, None);
+            assert_eq!(s1b_scan(lane, source_home.path()).len(), 2, "{lane:?}");
+            assert_eq!(s1b_entry_count(), 1, "{lane:?}: a healthy scan caches it");
+            let seeded = s1b_entry_parts();
+
+            // An entry exists and the file changed (a rewrite, so a full
+            // parse): an error during it leaves the entry as it was.
+            let third = s1b_turn(3, 7);
+            std::fs::write(&path, format!("{third}{}", s1b_turn(4, 2))).unwrap();
+            for fault in [ReadFault::ReadsAfter(third.len() as u64), ReadFault::Open] {
+                let fault_name = match fault {
+                    ReadFault::Open => "open",
+                    ReadFault::ReadsAfter(_) => "read",
+                };
+                set_read_fault_for_test(&path, Some(fault));
+                s1b_scan(lane, source_home.path());
+                assert_eq!(
+                    s1b_entry_parts(),
+                    seeded,
+                    "{lane:?}: a {fault_name} error keeps the cached entry"
+                );
+            }
+
+            set_read_fault_for_test(&path, None);
+            let rows = s1b_scan(lane, source_home.path());
+            assert_eq!(rows.len(), 4, "{lane:?}: the next scan recovers");
+            assert_ne!(s1b_entry_parts(), seeded, "{lane:?}");
         }
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    /// The same for a read error during a resumed parse: the entry and its
+    /// checkpoint are kept, and the next scan resumes from them.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_read_error_during_a_resume_keeps_the_entry() {
+        use sessions::claudecode::{set_read_fault_for_test, ReadFault};
+        for lane in [S1bLane::Materialized, S1bLane::Streaming] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(&[
+                ("HOME", cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ]);
+            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let path = claude_dir.join("session.jsonl");
+            std::fs::write(&path, format!("{}{}", s1b_turn(1, 5), s1b_turn(2, 1))).unwrap();
+            s1b_scan(lane, source_home.path());
+            let seeded = s1b_only_entry();
+            assert!(seeded.claude_checkpoint.is_some());
+
+            s1b_append(&path, &s1b_turn(3, 7));
+            set_read_fault_for_test(&path, Some(ReadFault::ReadsAfter(0)));
+            s1b_scan(lane, source_home.path());
+            set_read_fault_for_test(&path, None);
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                1,
+                "{lane:?}: the resume ran"
+            );
+            let kept = s1b_only_entry();
+            assert_eq!(kept.messages, seeded.messages, "{lane:?}");
+            assert_eq!(kept.fingerprint, seeded.fingerprint, "{lane:?}");
+            assert_eq!(kept.claude_checkpoint, seeded.claude_checkpoint, "{lane:?}");
+
+            let rows = s1b_scan(lane, source_home.path());
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                2,
+                "{lane:?}: recovers by resuming"
+            );
+            assert_eq!(rows.len(), 3, "{lane:?}");
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     const S1B_SIDECHAIN_LINE: &str = concat!(
         r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-1","agentId":"sidecar1","timestamp":"2026-10-01T10:00:05.000Z","requestId":"req_{n}","message":{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":5}}}"#,
         "\n"
     );
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn s1b_sidechain_line(n: u32) -> String {
         S1B_SIDECHAIN_LINE.replace("{n}", &n.to_string())
     }
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// The agent name a subagent transcript takes from a sidecar, a parent
     /// session or a cc-mirror variant file can change messages before the
     /// checkpoint, so a change to any of them is a full parse.
