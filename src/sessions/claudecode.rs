@@ -658,7 +658,7 @@ impl ClaudeCheckpoint {
             .is_some_and(|digest| digest == self.integrity_digest)
     }
 
-    #[cfg(all(test, all(target_arch = "aarch64", target_os = "macos")))]
+    #[cfg(all(test, target_arch = "aarch64", target_os = "macos"))]
     pub(crate) fn corrupt_state_for_test(&mut self) {
         self.state.pending_turn_start = !self.state.pending_turn_start;
     }
@@ -718,8 +718,19 @@ const CLAUDE_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// measured: with sha2's `asm` feature (see Cargo.toml) the whole-prefix hash of
 /// a 361 MB transcript takes 131 ms against 672 ms for the portable backend,
 /// which is slower than parsing the same bytes. Every other target, x86_64
-/// included, hashes nothing and parses exactly as before.
+/// included, hashes nothing, takes no checkpoint and never resumes. What
+/// changes on every target is read-error handling: a read or open error ends
+/// the parse, which is then neither cached nor retained (`read_failed`).
 pub(crate) const CLAUDE_CHECKPOINTS: bool = cfg!(all(target_arch = "aarch64", target_os = "macos"));
+
+/// Opens a transcript; the test seam can make it fail (`ReadFault::Open`).
+fn open_transcript(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(test)]
+    if let Some(ReadFault::Open) = read_fault_for_test(path) {
+        return Err(std::io::Error::other("injected open error"));
+    }
+    std::fs::File::open(path)
+}
 
 /// Test seam: make the parse of `path` fail to open, or fail every read after
 /// some bytes (of the whole file for a full parse, of the part after the
@@ -829,7 +840,7 @@ pub(crate) fn resume_claude_file(
         return None;
     }
 
-    let file = std::fs::File::open(path).ok()?;
+    let file = open_transcript(path).ok()?;
     if file.metadata().ok()?.len() <= checkpoint.consumed_offset {
         return None;
     }
@@ -936,15 +947,8 @@ fn parse_claude_file_internal(
 
     #[cfg(test)]
     let injected = read_fault_for_test(path);
-    #[cfg(test)]
-    let opened = match injected {
-        Some(ReadFault::Open) => Err(std::io::Error::other("injected open error")),
-        _ => std::fs::File::open(path),
-    };
-    #[cfg(not(test))]
-    let opened = std::fs::File::open(path);
     // An open that fails is not an empty file: do not let it cache as one.
-    let Ok(file) = opened else {
+    let Ok(file) = open_transcript(path) else {
         return ClaudeParse {
             read_failed: true,
             ..no_messages()
@@ -4558,7 +4562,7 @@ mod s1a_tests {
     }
 }
 
-#[cfg(all(test, all(target_arch = "aarch64", target_os = "macos")))]
+#[cfg(all(test, target_arch = "aarch64", target_os = "macos"))]
 mod resume_tests {
     use super::*;
     use std::io::Write;
@@ -4993,8 +4997,8 @@ mod checkpoint_gate_tests {
         path
     }
 
-    /// Targets without fast SHA-256 parse exactly as before: no hashing, no
-    /// checkpoint. Elsewhere the same file checkpoints.
+    /// Targets other than macOS arm64 hash nothing and take no checkpoint;
+    /// there the same file checkpoints.
     #[test]
     fn test_checkpoints_exist_only_where_sha256_is_fast() {
         let dir = TempDir::new().unwrap();

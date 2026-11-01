@@ -2799,7 +2799,6 @@ mod tests {
         )
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn claude_checkpointed_entry(dir: &TempDir) -> CachedSourceEntry {
         let source = dir.path().join("session.jsonl");
         std::fs::write(
@@ -2809,7 +2808,12 @@ mod tests {
         )
         .unwrap();
         let parsed = crate::sessions::claudecode::parse_claude_file_with_checkpoint(&source, None);
-        assert!(parsed.checkpoint.is_some());
+        // Checkpoints exist only on macOS arm64; elsewhere the entry is the
+        // same, without one.
+        assert_eq!(
+            parsed.checkpoint.is_some(),
+            crate::sessions::claudecode::CLAUDE_CHECKPOINTS
+        );
         CachedSourceEntry::new(
             CacheIdentity::for_client(ClientId::Claude),
             &source,
@@ -2821,7 +2825,6 @@ mod tests {
         .with_claude_checkpoint(parsed.checkpoint)
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn read_envelope(shard: &Path) -> CachedShardEnvelope {
         bincode::options()
             .deserialize_from(BufReader::new(File::open(shard).unwrap()))
@@ -2914,7 +2917,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn test_claude_shard_at_the_shared_format_loads_without_a_checkpoint() {
         let dir = TempDir::new().unwrap();
@@ -2939,7 +2941,6 @@ mod tests {
         assert!(entries[0].claude_checkpoint.is_none());
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn test_claude_envelope_read_by_another_namespace_is_stale() {
         let dir = TempDir::new().unwrap();

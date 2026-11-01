@@ -10050,14 +10050,15 @@ mod tests {
         }
     }
 
-    /// The same for a read error during a resumed parse: the entry and its
-    /// checkpoint are kept, and the next scan resumes from them.
+    /// The same for an open error and for a read error during a resumed parse:
+    /// the entry and its checkpoint are kept, and the next scan resumes from
+    /// them.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     #[serial_test::serial]
     fn test_claude_read_error_during_a_resume_keeps_the_entry() {
         use sessions::claudecode::{set_read_fault_for_test, ReadFault};
-        for lane in [S1bLane::Materialized, S1bLane::Streaming] {
+        for lane in [S1bLane::Materialized, S1bLane::Streaming, S1bLane::Count] {
             let cache_home = tempfile::TempDir::new().unwrap();
             let source_home = tempfile::TempDir::new().unwrap();
             let _env = EnvGuard::set(&[
@@ -10073,6 +10074,20 @@ mod tests {
             assert!(seeded.claude_checkpoint.is_some());
 
             s1b_append(&path, &s1b_turn(3, 7));
+            // An append whose open fails: no resume, and the full parse that
+            // follows fails to open too. The entry is kept.
+            set_read_fault_for_test(&path, Some(ReadFault::Open));
+            s1b_scan(lane, source_home.path());
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                0,
+                "{lane:?}: an open error is no resume"
+            );
+            let kept = s1b_only_entry();
+            assert_eq!(kept.messages, seeded.messages, "{lane:?}");
+            assert_eq!(kept.claude_checkpoint, seeded.claude_checkpoint, "{lane:?}");
+
+            // The open works, the read of the appended tail fails.
             set_read_fault_for_test(&path, Some(ReadFault::ReadsAfter(0)));
             s1b_scan(lane, source_home.path());
             set_read_fault_for_test(&path, None);
