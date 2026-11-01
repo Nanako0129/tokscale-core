@@ -45,6 +45,16 @@ jiff = { version = "=0.2.32", default-features = false, features = ["std"] }
 jiff-tzdb = "=0.1.8"
 unicode-normalization = { version = "=0.1.25", default-features = false, features = ["std"] }
 
+# sha2 0.10 hashes with the portable backend on aarch64 (about 0.5 GB/s on an
+# M-series Mac, measured) unless `asm` is on, which selects the SHA2
+# instructions (about 2.7 GB/s, measured). The Claude resume checkpoint hashes
+# the whole transcript prefix on every resume, so on macOS arm64 the hash is
+# the floor of a resumed scan. Scoped to macOS arm64, the one target where
+# checkpoints are on (CLAUDE_CHECKPOINTS): `asm` builds sha2-asm, which the
+# MSVC targets do not support.
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"

@@ -49,6 +49,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Records every Claude transcript a scan continued from its checkpoint
+/// instead of parsing from byte 0. Paths are unique per test, so a test can
+/// assert on its own transcript while others run alongside it.
+#[cfg(test)]
+static CLAUDE_RESUMED_PATHS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Strip a CLIProxyAPI-style `(level)` reasoning-effort suffix from a model id.
 ///
 /// Mirrors <https://help.router-for.me/configuration/thinking>: the proxy
@@ -1139,6 +1145,43 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         messages
     }
 
+    /// One parse of a source file, and the Claude checkpoint it ended in, if
+    /// any (see [`sessions::claudecode::ClaudeCheckpoint`]).
+    struct SourceParse {
+        messages: Vec<UnifiedMessage>,
+        cacheable: bool,
+        claude_checkpoint: Option<sessions::claudecode::ClaudeCheckpoint>,
+    }
+
+    impl From<sessions::claudecode::ClaudeParse> for SourceParse {
+        fn from(parsed: sessions::claudecode::ClaudeParse) -> Self {
+            Self {
+                messages: parsed.messages,
+                // A read error left a truncated parse: never cache it.
+                cacheable: !parsed.read_failed,
+                claude_checkpoint: parsed.checkpoint,
+            }
+        }
+    }
+
+    impl SourceParse {
+        fn plain(messages: Vec<UnifiedMessage>, cacheable: bool) -> Self {
+            Self {
+                messages,
+                cacheable,
+                claude_checkpoint: None,
+            }
+        }
+    }
+
+    /// Continues a changed file's parse from the entry cached for it, or
+    /// returns `None` to have the whole file parsed instead.
+    type ResumeSource<'a> = &'a dyn Fn(
+        &Path,
+        &message_cache::CachedSourceEntry,
+        &message_cache::SourceFingerprint,
+    ) -> Option<SourceParse>;
+
     #[allow(clippy::too_many_arguments)]
     fn load_or_parse_source_with_fingerprint_and_policy<F, FingerprintFn>(
         path: &Path,
@@ -1149,9 +1192,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         fingerprint_from_path: FingerprintFn,
         parse: F,
         refresh_retained: &mut dyn FnMut(&mut UnifiedMessage, Option<&str>),
+        resume: Option<ResumeSource<'_>>,
     ) -> CachedParseOutcome
     where
-        F: Fn(&Path) -> (Vec<UnifiedMessage>, bool),
+        F: Fn(&Path) -> SourceParse,
         FingerprintFn: Fn(
             &Path,
             Option<&message_cache::SourceFingerprint>,
@@ -1161,7 +1205,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         let Some(fingerprint_status) =
             fingerprint_from_path(path, cached.map(|entry| &entry.fingerprint))
         else {
-            let (mut messages, _) = parse(path);
+            let mut messages = parse(path).messages;
             apply_pricing_to_messages(&mut messages, pricing);
             return CachedParseOutcome {
                 messages,
@@ -1203,7 +1247,18 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             }
         }
 
-        let (mut messages, cacheable) = parse(path);
+        // `resume` only sees a fingerprint that changed under a cached entry,
+        // and whatever it returns goes through the same retention merge and
+        // entry rebuild as a full parse.
+        let resumed = match (resume, cached) {
+            (Some(resume), Some(entry)) => resume(path, entry, &fingerprint),
+            _ => None,
+        };
+        let SourceParse {
+            mut messages,
+            cacheable,
+            claude_checkpoint,
+        } = resumed.unwrap_or_else(|| parse(path));
         // A changed fingerprint can mean that a client rewrote a transcript
         // and dropped messages it had already published, not only that new
         // content appeared. Retain only cacheable, keyed messages for the
@@ -1235,7 +1290,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                     Vec::new(),
                     None,
                 )
-                .with_retained_keys(retained_keys.clone()),
+                .with_retained_keys(retained_keys.clone())
+                // Describes the live messages, which come first in the entry.
+                .with_claude_checkpoint(claude_checkpoint),
             )
         };
         apply_pricing_to_messages(&mut messages, pricing);
@@ -1270,8 +1327,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             pricing,
             HistoryRetention::LiveFileOnly,
             fingerprint_from_path,
-            |path| (parse(path), true),
+            |path| SourceParse::plain(parse(path), true),
             &mut |_, _| {},
+            None,
         )
     }
 
@@ -1287,9 +1345,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         fingerprint_from_path: FingerprintFn,
         parse: F,
         refresh_retained: &mut dyn FnMut(&mut UnifiedMessage, Option<&str>),
+        resume: Option<ResumeSource<'_>>,
     ) -> CachedParseOutcome
     where
-        F: Fn(&Path) -> Vec<UnifiedMessage>,
+        F: Fn(&Path) -> SourceParse,
         FingerprintFn: Fn(
             &Path,
             Option<&message_cache::SourceFingerprint>,
@@ -1304,8 +1363,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 key_is_globally_stable,
             },
             fingerprint_from_path,
-            |path| (parse(path), true),
+            parse,
             refresh_retained,
+            resume,
         )
     }
 
@@ -1470,7 +1530,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                         Some(&claude_home),
                     )
                 },
-                |path| sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home)),
+                |path| {
+                    sessions::claudecode::parse_claude_file_with_checkpoint(
+                        path,
+                        Some(&claude_home),
+                    )
+                    .into()
+                },
                 &mut |message, live_agent| {
                     sessions::claudecode::refresh_retained_message_context(
                         message,
@@ -1479,6 +1545,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                         live_agent,
                     )
                 },
+                Some(&|path, entry, fingerprint| {
+                    resume_claude_source(path, entry, fingerprint, &claude_home).map(Into::into)
+                }),
             )
         })
         .collect();
@@ -1608,9 +1677,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 message_cache::SourceFingerprint::check_path_samples_only,
                 |path| {
                     let parsed = sessions::gemini::parse_gemini_file_with_cache_status(path);
-                    (parsed.messages, parsed.cacheable)
+                    SourceParse::plain(parsed.messages, parsed.cacheable)
                 },
                 &mut |_, _| {},
+                None,
             );
             (path.clone(), outcome)
         })
@@ -3930,6 +4000,37 @@ async fn get_window_usage_inner(
 /// to O(one batch of newly-parsed files), not O(corpus).
 const PARSE_BATCH_SIZE: usize = 32;
 
+/// Continue a Claude transcript that only grew since its entry was cached,
+/// or `None` for a full parse. A changed sidecar (the subagent `.meta.json`,
+/// a parent session, a cc-mirror `variant.json`) can change messages before
+/// the checkpoint, and each of them is a related file, so any change in
+/// `related_files` takes the full parse. Retained history after the live
+/// prefix is not the checkpoint's concern: `resume_claude_file` verifies only
+/// the first `message_count` messages.
+fn resume_claude_source(
+    path: &Path,
+    entry: &message_cache::CachedSourceEntry,
+    fingerprint: &message_cache::SourceFingerprint,
+    claude_home: &Path,
+) -> Option<sessions::claudecode::ClaudeParse> {
+    let checkpoint = entry.claude_checkpoint.as_ref()?;
+    if entry.fingerprint.related_files != fingerprint.related_files {
+        return None;
+    }
+    let parsed = sessions::claudecode::resume_claude_file(
+        path,
+        Some(claude_home),
+        checkpoint,
+        &entry.messages,
+    )?;
+    #[cfg(test)]
+    CLAUDE_RESUMED_PATHS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(path.to_path_buf());
+    Some(parsed)
+}
+
 /// Stage-A outcome for one Claude source. A cache hit carries no messages —
 /// stage B re-reads `cached.messages` by reference, exactly like the
 /// pre-batching cache-hit loop, so a batch of hits does not retain more than
@@ -3939,6 +4040,10 @@ enum ClaudeStageA {
     Miss {
         messages: Vec<UnifiedMessage>,
         fingerprint: Option<message_cache::SourceFingerprint>,
+        /// Where a later scan of this transcript resumes; stage B stores it.
+        checkpoint: Option<Box<sessions::claudecode::ClaudeCheckpoint>>,
+        /// False when a read error truncated the parse: not cached.
+        cacheable: bool,
     },
 }
 
@@ -3959,6 +4064,10 @@ fn claude_stage_a(
             cached.map(|entry| &entry.fingerprint),
             Some(claude_home),
         );
+    let changed = matches!(
+        fingerprint_status,
+        Some(message_cache::FingerprintStatus::Changed(_))
+    );
     let (cache_hit, fingerprint) = match fingerprint_status {
         Some(message_cache::FingerprintStatus::Unchanged) => {
             let cached =
@@ -3980,10 +4089,22 @@ fn claude_stage_a(
     if cache_hit {
         return ClaudeStageA::Hit;
     }
-    let messages = sessions::claudecode::parse_claude_file_with_home(path, Some(claude_home));
+    // Only a fingerprint that changed under a cached entry can be a grown
+    // transcript; an unchanged one with no messages has nothing to continue.
+    let resumed = match (changed, &fingerprint, cached) {
+        (true, Some(fingerprint), Some(entry)) => {
+            resume_claude_source(path, entry, fingerprint, claude_home)
+        }
+        _ => None,
+    };
+    let parsed = resumed.unwrap_or_else(|| {
+        sessions::claudecode::parse_claude_file_with_checkpoint(path, Some(claude_home))
+    });
     ClaudeStageA::Miss {
-        messages,
+        messages: parsed.messages,
         fingerprint,
+        checkpoint: parsed.checkpoint.map(Box::new),
+        cacheable: !parsed.read_failed,
     }
 }
 
@@ -4326,9 +4447,13 @@ where
                 ClaudeStageA::Miss {
                     messages: mut msgs,
                     fingerprint,
+                    checkpoint,
+                    cacheable,
                 } => {
                     let mut retained_keys: HashSet<String> = HashSet::new();
-                    if let Some(fingerprint) = fingerprint {
+                    // A truncated parse is neither retained against nor cached
+                    // (the materialized lane does the same).
+                    if let Some(fingerprint) = fingerprint.filter(|_| cacheable) {
                         retained_keys = retain_observed_messages(
                             &mut msgs,
                             source_cache.retainable_history(claude_identity, path),
@@ -4352,7 +4477,10 @@ where
                                     Vec::new(),
                                     None,
                                 )
-                                .with_retained_keys(retained_keys.clone()),
+                                .with_retained_keys(retained_keys.clone())
+                                // Describes the live messages, which come
+                                // first in the entry.
+                                .with_claude_checkpoint(checkpoint.map(|boxed| *boxed)),
                             );
                         }
                     }
@@ -9441,6 +9569,711 @@ mod tests {
             10 + 50,
             "the live turn is re-parsed from source and the retained one survives"
         );
+    }
+
+    // ---- S1b: Claude resume from a cached checkpoint ----
+
+    /// One human turn and the assistant response to it.
+    fn s1b_turn(n: u32, output: u32) -> String {
+        format!(
+            concat!(
+                r#"{{"type":"user","timestamp":"2026-10-01T10:{n:02}:00.000Z","message":{{"role":"user","content":"turn {n}"}}}}"#,
+                "\n",
+                r#"{{"type":"assistant","timestamp":"2026-10-01T10:{n:02}:05.000Z","requestId":"req_{n}","message":{{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{{"input_tokens":10,"output_tokens":{output},"cache_read_input_tokens":100}}}}}}"#,
+                "\n",
+            ),
+            n = n,
+            output = output
+        )
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    /// The streamed completion of a response whose first line is already
+    /// before the checkpoint.
+    fn s1b_completion(n: u32, output: u32) -> String {
+        format!(
+            concat!(
+                r#"{{"type":"assistant","timestamp":"2026-10-01T10:{n:02}:09.000Z","requestId":"req_{n}","message":{{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{{"input_tokens":10,"output_tokens":{output},"cache_read_input_tokens":100}}}}}}"#,
+                "\n",
+            ),
+            n = n,
+            output = output
+        )
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn s1b_append(path: &Path, text: &str) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    /// How many transcripts under `source_home` a scan continued from a
+    /// checkpoint so far (the recorder is process-wide; paths are per-test).
+    fn s1b_resumes(source_home: &Path) -> usize {
+        crate::CLAUDE_RESUMED_PATHS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|resumed| resumed.starts_with(source_home))
+            .count()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum S1bLane {
+        Materialized,
+        Streaming,
+        Count,
+    }
+
+    type S1bRow = (
+        i64,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        i64,
+        i32,
+        Option<String>,
+        String,
+        String,
+    );
+
+    /// Every field the three lanes share, sorted, so lanes and cold/warm
+    /// scans compare as plain values.
+    fn s1b_scan(lane: S1bLane, source_home: &Path) -> Vec<S1bRow> {
+        let unified = |m: &UnifiedMessage| -> S1bRow {
+            (
+                m.timestamp,
+                m.duration_ms,
+                m.tokens.input,
+                m.tokens.output,
+                m.tokens.cache_read,
+                m.tokens.cache_write,
+                m.message_count,
+                m.agent.clone(),
+                m.client.clone(),
+                m.model_id.clone(),
+            )
+        };
+        let mut rows: Vec<S1bRow> = match lane {
+            S1bLane::Materialized => parse_claude_fixture(source_home)
+                .iter()
+                .map(unified)
+                .collect(),
+            S1bLane::Streaming => collect_streamed_claude_fixture(source_home)
+                .iter()
+                .map(unified)
+                .collect(),
+            S1bLane::Count => parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["claude".to_string()]),
+                ..Default::default()
+            })
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| -> S1bRow {
+                (
+                    m.timestamp,
+                    m.duration_ms,
+                    m.input,
+                    m.output,
+                    m.cache_read,
+                    m.cache_write,
+                    m.message_count,
+                    m.agent.clone(),
+                    m.client.clone(),
+                    m.model_id.clone(),
+                )
+            })
+            .collect(),
+        };
+        rows.sort();
+        rows
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    /// A scan of `source_home` from an empty cache home, leaving the current
+    /// (warm) cache home untouched.
+    fn s1b_cold_scan(lane: S1bLane, source_home: &Path, cold_home: &Path) -> Vec<S1bRow> {
+        let _env = EnvGuard::set(&[
+            ("HOME", cold_home.as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cold_home.as_os_str()),
+        ]);
+        s1b_scan(lane, source_home)
+    }
+
+    /// The cached Claude entry of the only transcript a test scanned.
+    fn s1b_only_entry() -> message_cache::CachedSourceEntry {
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        let mut cache = message_cache::SourceMessageCache::load();
+        cache.ensure_namespace_loaded(identity);
+        let mut entries = cache
+            .entries
+            .values()
+            .filter(|entry| entry.path.to_path_buf().ends_with("session.jsonl"));
+        let entry = entries
+            .next()
+            .expect("the scan cached its transcript")
+            .clone();
+        assert!(entries.next().is_none(), "one transcript, one entry");
+        entry
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    /// A Claude transcript that only grew since the last scan continues from
+    /// its checkpoint on every lane, also after the checkpoint went through a
+    /// shard on disk, and the result equals a cold scan of the same bytes. A
+    /// rewritten one takes the full parse and the next append resumes again.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_grown_transcript_resumes_and_equals_a_cold_scan_on_every_lane() {
+        for lane in [S1bLane::Materialized, S1bLane::Streaming, S1bLane::Count] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let cold_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(&[
+                ("HOME", cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ]);
+            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let path = claude_dir.join("session.jsonl");
+            let mut colds = 0;
+            let mut cold = |lane| {
+                colds += 1;
+                s1b_cold_scan(
+                    lane,
+                    source_home.path(),
+                    &cold_home.path().join(colds.to_string()),
+                )
+            };
+            let resumes = || s1b_resumes(source_home.path());
+
+            std::fs::write(&path, format!("{}{}", s1b_turn(1, 5), s1b_turn(2, 1))).unwrap();
+            assert_eq!(s1b_scan(lane, source_home.path()).len(), 2, "{lane:?} seed");
+            assert_eq!(resumes(), 0, "{lane:?}");
+
+            s1b_append(
+                &path,
+                &format!("{}{}", s1b_completion(2, 50), s1b_turn(3, 7)),
+            );
+            let warm = s1b_scan(lane, source_home.path());
+            assert_eq!(resumes(), 1, "{lane:?}: a grown transcript resumes");
+            assert_eq!(
+                warm,
+                cold(lane),
+                "{lane:?}: the resumed scan equals a cold one"
+            );
+            assert_eq!(
+                warm.len(),
+                3,
+                "{lane:?}: the completion merges into its turn"
+            );
+            assert_eq!(
+                warm.iter().map(|r| r.3).sum::<i64>(),
+                5 + 50 + 7,
+                "{lane:?}"
+            );
+
+            // The previous scan stored the checkpoint it ended in, and a new
+            // process reads it back from the shard.
+            s1b_append(
+                &path,
+                &format!("{}{}", s1b_turn(4, 9), s1b_completion(4, 90)),
+            );
+            let warm = s1b_scan(lane, source_home.path());
+            assert_eq!(resumes(), 2, "{lane:?}: chained resume");
+            assert_eq!(warm, cold(lane), "{lane:?}");
+
+            // Rewritten in place, then grown: the full parse.
+            let rewritten = std::fs::read_to_string(&path).unwrap().replacen(
+                "\"output_tokens\":5,",
+                "\"output_tokens\":6,",
+                1,
+            );
+            std::fs::write(&path, rewritten).unwrap();
+            s1b_append(&path, &s1b_turn(5, 3));
+            let warm = s1b_scan(lane, source_home.path());
+            assert_eq!(
+                resumes(),
+                2,
+                "{lane:?}: a rewritten transcript does not resume"
+            );
+            assert_eq!(warm, cold(lane), "{lane:?}");
+
+            // The full parse stored a fresh checkpoint.
+            s1b_append(&path, &s1b_turn(6, 2));
+            let warm = s1b_scan(lane, source_home.path());
+            assert_eq!(resumes(), 3, "{lane:?}: resumes again after the fallback");
+            assert_eq!(warm, cold(lane), "{lane:?}");
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    /// A compacting rewrite (a full parse that keeps the turn the file lost)
+    /// followed by growth (a resume) keeps the retained turn, after the live
+    /// prefix, and counts the live turns once.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_compaction_then_growth_keeps_retained_turns_after_the_live_prefix() {
+        for lane in [S1bLane::Materialized, S1bLane::Streaming] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(&[
+                ("HOME", cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ]);
+            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let path = claude_dir.join("session.jsonl");
+
+            std::fs::write(&path, format!("{}{}", s1b_turn(1, 5), s1b_turn(2, 1))).unwrap();
+            assert_eq!(s1b_scan(lane, source_home.path()).len(), 2);
+            // Compaction: turn 1 leaves the file, only the cache holds it.
+            std::fs::write(&path, s1b_turn(2, 1)).unwrap();
+            assert_eq!(
+                s1b_scan(lane, source_home.path()).len(),
+                2,
+                "{lane:?} retained"
+            );
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                0,
+                "{lane:?}: a shrink is a full parse"
+            );
+
+            s1b_append(&path, &s1b_turn(3, 7));
+            let rows = s1b_scan(lane, source_home.path());
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                1,
+                "{lane:?}: growth resumes"
+            );
+            assert_eq!(
+                rows.iter().map(|r| r.3).sum::<i64>(),
+                5 + 1 + 7,
+                "{lane:?}: the retained turn and both live turns, each once"
+            );
+
+            let entry = s1b_only_entry();
+            let keys: Vec<_> = entry
+                .messages
+                .iter()
+                .map(|m| m.dedup_key.clone().unwrap())
+                .collect();
+            assert_eq!(
+                keys,
+                ["msg_2:req_2", "msg_3:req_3", "msg_1:req_1"],
+                "{lane:?}: live prefix first, retained history after it"
+            );
+            assert!(entry.retained_keys.contains("msg_1:req_1"), "{lane:?}");
+            assert!(entry.claude_checkpoint.is_some(), "{lane:?}");
+
+            // And the entry the resume stored is itself resumable.
+            s1b_append(&path, &s1b_turn(4, 2));
+            let rows = s1b_scan(lane, source_home.path());
+            assert_eq!(s1b_resumes(source_home.path()), 2, "{lane:?}");
+            assert_eq!(
+                rows.iter().map(|r| r.3).sum::<i64>(),
+                5 + 1 + 7 + 2,
+                "{lane:?}"
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    /// A save-merge that changes a live message under a stored checkpoint
+    /// leaves the checkpoint describing messages the entry no longer holds.
+    /// The next scan must take the full parse instead of resuming from them.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_save_merge_changing_a_live_message_forces_a_full_parse() {
+        for lane in [S1bLane::Materialized, S1bLane::Streaming] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let cold_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(&[
+                ("HOME", cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ]);
+            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let path = claude_dir.join("session.jsonl");
+            std::fs::write(&path, format!("{}{}", s1b_turn(1, 5), s1b_turn(2, 1))).unwrap();
+            s1b_scan(lane, source_home.path());
+            let seeded = s1b_only_entry();
+            assert!(seeded.claude_checkpoint.is_some());
+
+            // A concurrent writer saved a fuller copy of turn 2; this process
+            // then saves its own entry, and the save merges the stored copy
+            // into it field by field (`absorb_retained_history`).
+            let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+            let mut writer = message_cache::SourceMessageCache::load();
+            writer.ensure_namespace_loaded(identity);
+            let mut fuller = seeded.clone();
+            fuller
+                .messages
+                .iter_mut()
+                .find(|m| m.dedup_key.as_deref() == Some("msg_2:req_2"))
+                .unwrap()
+                .tokens
+                .output = 99;
+            writer.insert(fuller);
+            writer.save_if_dirty();
+
+            let mut ours = message_cache::SourceMessageCache::load();
+            ours.ensure_namespace_loaded(identity);
+            // Written back from an in-memory entry that predates `fuller`.
+            ours.entries.clear();
+            ours.insert(seeded.clone());
+            ours.save_if_dirty();
+            let merged = s1b_only_entry();
+            let merged_output = merged
+                .messages
+                .iter()
+                .find(|m| m.dedup_key.as_deref() == Some("msg_2:req_2"))
+                .unwrap()
+                .tokens
+                .output;
+            assert_eq!(merged_output, 99, "the save merged the stored copy");
+            assert_eq!(merged.claude_checkpoint, seeded.claude_checkpoint);
+
+            s1b_append(&path, &s1b_turn(3, 7));
+            let warm = s1b_scan(lane, source_home.path());
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                0,
+                "{lane:?}: the checkpoint no longer matches the cached messages"
+            );
+            assert_eq!(
+                warm,
+                s1b_cold_scan(lane, source_home.path(), cold_home.path()),
+                "{lane:?}: never a wrong result"
+            );
+        }
+    }
+
+    /// The cached entry of the only transcript, as comparable parts.
+    fn s1b_entry_parts() -> (
+        Vec<UnifiedMessage>,
+        message_cache::SourceFingerprint,
+        HashSet<String>,
+    ) {
+        let entry = s1b_only_entry();
+        (entry.messages, entry.fingerprint, entry.retained_keys)
+    }
+
+    fn s1b_entry_count() -> usize {
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        let mut cache = message_cache::SourceMessageCache::load();
+        cache.ensure_namespace_loaded(identity);
+        cache.entries.len()
+    }
+
+    /// A read or open error that truncates a parse must not be cached as the
+    /// file's whole truth, and must neither overwrite nor evict an entry that
+    /// is already cached (that scan may show fewer rows; the next one
+    /// recovers). Needs no checkpoint, so it runs on every target.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_read_failures_are_not_cached_and_keep_an_existing_entry() {
+        use sessions::claudecode::{set_read_fault_for_test, ReadFault};
+        for lane in [S1bLane::Materialized, S1bLane::Streaming, S1bLane::Count] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(&[
+                ("HOME", cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ]);
+            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let path = claude_dir.join("session.jsonl");
+            let first = s1b_turn(1, 5);
+            std::fs::write(&path, format!("{first}{}", s1b_turn(2, 1))).unwrap();
+
+            // No entry yet: a read error mid-file, then an open error.
+            set_read_fault_for_test(&path, Some(ReadFault::ReadsAfter(first.len() as u64)));
+            let rows = s1b_scan(lane, source_home.path());
+            assert_eq!(
+                rows.len(),
+                1,
+                "{lane:?}: only what was read before the error"
+            );
+            assert_eq!(
+                s1b_entry_count(),
+                0,
+                "{lane:?}: a truncated parse is not cached"
+            );
+            set_read_fault_for_test(&path, Some(ReadFault::Open));
+            assert!(s1b_scan(lane, source_home.path()).is_empty(), "{lane:?}");
+            assert_eq!(
+                s1b_entry_count(),
+                0,
+                "{lane:?}: an open error is not an empty file"
+            );
+
+            set_read_fault_for_test(&path, None);
+            assert_eq!(s1b_scan(lane, source_home.path()).len(), 2, "{lane:?}");
+            assert_eq!(s1b_entry_count(), 1, "{lane:?}: a healthy scan caches it");
+            let seeded = s1b_entry_parts();
+
+            // An entry exists and the file changed (a rewrite, so a full
+            // parse): an error during it leaves the entry as it was.
+            let third = s1b_turn(3, 7);
+            std::fs::write(&path, format!("{third}{}", s1b_turn(4, 2))).unwrap();
+            for fault in [ReadFault::ReadsAfter(third.len() as u64), ReadFault::Open] {
+                let fault_name = match fault {
+                    ReadFault::Open => "open",
+                    ReadFault::ReadsAfter(_) => "read",
+                };
+                set_read_fault_for_test(&path, Some(fault));
+                s1b_scan(lane, source_home.path());
+                assert_eq!(
+                    s1b_entry_parts(),
+                    seeded,
+                    "{lane:?}: a {fault_name} error keeps the cached entry"
+                );
+            }
+
+            set_read_fault_for_test(&path, None);
+            let rows = s1b_scan(lane, source_home.path());
+            assert_eq!(rows.len(), 4, "{lane:?}: the next scan recovers");
+            assert_ne!(s1b_entry_parts(), seeded, "{lane:?}");
+        }
+    }
+
+    /// The same for an open error and for a read error during a resumed parse:
+    /// the entry and its checkpoint are kept, and the next scan resumes from
+    /// them.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_read_error_during_a_resume_keeps_the_entry() {
+        use sessions::claudecode::{set_read_fault_for_test, ReadFault};
+        for lane in [S1bLane::Materialized, S1bLane::Streaming, S1bLane::Count] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(&[
+                ("HOME", cache_home.path().as_os_str()),
+                ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ]);
+            let claude_dir = source_home.path().join(".claude/projects/myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let path = claude_dir.join("session.jsonl");
+            std::fs::write(&path, format!("{}{}", s1b_turn(1, 5), s1b_turn(2, 1))).unwrap();
+            s1b_scan(lane, source_home.path());
+            let seeded = s1b_only_entry();
+            assert!(seeded.claude_checkpoint.is_some());
+
+            s1b_append(&path, &s1b_turn(3, 7));
+            // An append whose open fails: no resume, and the full parse that
+            // follows fails to open too. The entry is kept.
+            set_read_fault_for_test(&path, Some(ReadFault::Open));
+            s1b_scan(lane, source_home.path());
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                0,
+                "{lane:?}: an open error is no resume"
+            );
+            let kept = s1b_only_entry();
+            assert_eq!(kept.messages, seeded.messages, "{lane:?}");
+            assert_eq!(kept.claude_checkpoint, seeded.claude_checkpoint, "{lane:?}");
+
+            // The open works, the read of the appended tail fails.
+            set_read_fault_for_test(&path, Some(ReadFault::ReadsAfter(0)));
+            s1b_scan(lane, source_home.path());
+            set_read_fault_for_test(&path, None);
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                1,
+                "{lane:?}: the resume ran"
+            );
+            let kept = s1b_only_entry();
+            assert_eq!(kept.messages, seeded.messages, "{lane:?}");
+            assert_eq!(kept.fingerprint, seeded.fingerprint, "{lane:?}");
+            assert_eq!(kept.claude_checkpoint, seeded.claude_checkpoint, "{lane:?}");
+
+            let rows = s1b_scan(lane, source_home.path());
+            assert_eq!(
+                s1b_resumes(source_home.path()),
+                2,
+                "{lane:?}: recovers by resuming"
+            );
+            assert_eq!(rows.len(), 3, "{lane:?}");
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    const S1B_SIDECHAIN_LINE: &str = concat!(
+        r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-1","agentId":"sidecar1","timestamp":"2026-10-01T10:00:05.000Z","requestId":"req_{n}","message":{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        "\n"
+    );
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn s1b_sidechain_line(n: u32) -> String {
+        S1B_SIDECHAIN_LINE.replace("{n}", &n.to_string())
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    /// The agent name a subagent transcript takes from a sidecar, a parent
+    /// session or a cc-mirror variant file can change messages before the
+    /// checkpoint, so a change to any of them is a full parse.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_changed_sidecars_force_a_full_parse() {
+        struct Case {
+            name: &'static str,
+            transcript: &'static str,
+            setup: fn(&Path),
+            change: fn(&Path),
+        }
+        let cases = [
+            Case {
+                name: "meta.json",
+                transcript: ".claude/projects/myproject/agent-sidecar1.jsonl",
+                setup: |home| {
+                    std::fs::write(
+                        home.join(".claude/projects/myproject/agent-sidecar1.meta.json"),
+                        r#"{"agentType":"explorer"}"#,
+                    )
+                    .unwrap();
+                },
+                change: |home| {
+                    std::fs::write(
+                        home.join(".claude/projects/myproject/agent-sidecar1.meta.json"),
+                        r#"{"agentType":"reviewer"}"#,
+                    )
+                    .unwrap();
+                },
+            },
+            Case {
+                name: "parent session",
+                transcript: ".claude/projects/myproject/agent-sidecar1.jsonl",
+                setup: |home| {
+                    std::fs::write(
+                        home.join(".claude/projects/myproject/parent-1.jsonl"),
+                        concat!(
+                            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Agent","input":{"subagent_type":"explorer"}}]}}"#,
+                            "\n",
+                            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"agentId: sidecar1"}]}]}}"#,
+                            "\n"
+                        ),
+                    )
+                    .unwrap();
+                },
+                change: |home| {
+                    std::fs::write(
+                        home.join(".claude/projects/myproject/parent-1.jsonl"),
+                        concat!(
+                            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Agent","input":{"subagent_type":"reviewer"}}]}}"#,
+                            "\n",
+                            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"agentId: sidecar1"}]}]}}"#,
+                            "\n"
+                        ),
+                    )
+                    .unwrap();
+                },
+            },
+            Case {
+                name: "cc-mirror variant.json",
+                transcript: ".cc-mirror/zai-worker/config/projects/myproject/session.jsonl",
+                setup: |home| {
+                    let variant_dir = home.join(".cc-mirror/zai-worker");
+                    std::fs::write(
+                        variant_dir.join("variant.json"),
+                        serde_json::json!({
+                            "name": "zai-worker",
+                            "provider": "zai",
+                            "configDir": variant_dir.join("config"),
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                },
+                change: |home| {
+                    let variant_dir = home.join(".cc-mirror/zai-worker");
+                    std::fs::write(
+                        variant_dir.join("variant.json"),
+                        serde_json::json!({
+                            "name": "zai-worker-mk2",
+                            "provider": "moonshot",
+                            "configDir": variant_dir.join("config"),
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                },
+            },
+        ];
+        for case in cases {
+            for lane in [S1bLane::Materialized, S1bLane::Streaming] {
+                let cache_home = tempfile::TempDir::new().unwrap();
+                let cold_home = tempfile::TempDir::new().unwrap();
+                let source_home = tempfile::TempDir::new().unwrap();
+                let _env = EnvGuard::set(&[
+                    ("HOME", cache_home.path().as_os_str()),
+                    ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+                ]);
+                let path = source_home.path().join(case.transcript);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                (case.setup)(source_home.path());
+                let is_sidechain = case.transcript.contains("agent-");
+                let line = |n: u32| {
+                    if is_sidechain {
+                        s1b_sidechain_line(n)
+                    } else {
+                        s1b_turn(n, 5).lines().nth(1).unwrap().to_string() + "\n"
+                    }
+                };
+                std::fs::write(&path, line(1)).unwrap();
+                let seed = s1b_scan(lane, source_home.path());
+                assert!(!seed.is_empty(), "{} {lane:?}", case.name);
+
+                // Control: growth with nothing else changed resumes.
+                s1b_append(&path, &line(2));
+                s1b_scan(lane, source_home.path());
+                assert_eq!(
+                    s1b_resumes(source_home.path()),
+                    1,
+                    "{} {lane:?}: control",
+                    case.name
+                );
+
+                (case.change)(source_home.path());
+                s1b_append(&path, &line(3));
+                let warm = s1b_scan(lane, source_home.path());
+                assert_eq!(
+                    s1b_resumes(source_home.path()),
+                    1,
+                    "{} {lane:?}: a changed sidecar takes the full parse",
+                    case.name
+                );
+                let cold = s1b_cold_scan(lane, source_home.path(), cold_home.path());
+                assert_eq!(warm, cold, "{} {lane:?}", case.name);
+                // Every row, including the ones before the checkpoint, carries
+                // the new attribution.
+                let attribution = |rows: &[S1bRow]| {
+                    rows.iter()
+                        .map(|row| (row.7.clone(), row.8.clone()))
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                assert_eq!(attribution(&warm).len(), 1, "{} {lane:?}", case.name);
+                assert_ne!(
+                    attribution(&warm),
+                    attribution(&seed),
+                    "{} {lane:?}: the change reaches the rows",
+                    case.name
+                );
+            }
+        }
     }
 
     /// Claude S1a fixture lines: a bare prompt snapshot beside a real cache

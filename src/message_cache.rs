@@ -37,6 +37,21 @@ use std::time::UNIX_EPOCH;
 // out of a Claude transcript survive it. Everything else still goes cold,
 // which costs those namespaces nothing.
 const CACHE_FORMAT_VERSION: u32 = 4;
+// Claude stores the point a grown transcript resumes from beside each cached
+// entry (upstream #1461), in an envelope of its own: a new field on
+// CachedSourceEntry would need a generic CACHE_FORMAT_VERSION bump, and Claude
+// entries hold retained history a reparse cannot rebuild. A Claude shard
+// written at CACHE_FORMAT_VERSION still loads, without checkpoints. Upstream
+// spends 3, 4, 12 and 13 (12 = its Claude envelope); this value stays clear of
+// them so neither side can read the other's layout as its own. An older engine
+// reads this envelope as Stale, so rolling back needs the Claude-cache backup.
+const CLAUDE_CACHE_FORMAT_VERSION: u32 = 100;
+const _: () = assert!(
+    CLAUDE_CACHE_FORMAT_VERSION != CACHE_FORMAT_VERSION
+        && CLAUDE_CACHE_FORMAT_VERSION != 3
+        && CLAUDE_CACHE_FORMAT_VERSION != 12
+        && CLAUDE_CACHE_FORMAT_VERSION != 13
+);
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -1161,6 +1176,7 @@ impl From<format3::CachedSourceEntry> for CachedSourceEntry {
             fallback_timestamp_indices: old.fallback_timestamp_indices,
             codex_incremental: old.codex_incremental,
             retained_keys: old.retained_keys,
+            claude_checkpoint: None,
         }
     }
 }
@@ -1198,6 +1214,11 @@ pub(crate) struct CachedSourceEntry {
     /// positional layout for every namespace's serialized entries, not just
     /// Claude's.
     pub retained_keys: HashSet<String>,
+    /// Claude-only point a later scan of a grown transcript continues from.
+    /// Not part of the positional layout (so no generic format bump): the
+    /// Claude envelope serializes it beside the entry as versioned bytes.
+    #[serde(skip)]
+    pub claude_checkpoint: Option<crate::sessions::claudecode::ClaudeCheckpoint>,
 }
 
 impl CachedSourceEntry {
@@ -1218,7 +1239,19 @@ impl CachedSourceEntry {
             fallback_timestamp_indices,
             codex_incremental,
             retained_keys: HashSet::new(),
+            claude_checkpoint: None,
         }
+    }
+
+    /// Attach the point a later Claude scan resumes from. It describes the
+    /// first `message_count` messages of this entry, which are the live parse;
+    /// retained history follows them.
+    pub(crate) fn with_claude_checkpoint(
+        mut self,
+        checkpoint: Option<crate::sessions::claudecode::ClaudeCheckpoint>,
+    ) -> Self {
+        self.claude_checkpoint = checkpoint;
+        self
     }
 
     /// Tag which of `self.messages`' dedup keys are retained carry-overs
@@ -2208,14 +2241,25 @@ pub(crate) fn set_shard_parser_version_for_test(identity: CacheIdentity, parser_
             .with_limit(MAX_CACHE_SHARD_BYTES)
             .deserialize_from(BufReader::new(file))
             .expect("a shard this build wrote");
-        let mut entries: Vec<CachedSourceEntry> = bincode::options()
-            .with_limit(MAX_CACHE_SHARD_BYTES)
-            .deserialize(&envelope.payload)
-            .expect("a payload this build wrote");
-        for entry in entries.iter_mut() {
-            entry.parser_version = parser_version;
+        if envelope.format_version == CLAUDE_CACHE_FORMAT_VERSION {
+            let mut entries: Vec<(CachedSourceEntry, Option<Vec<u8>>)> = bincode::options()
+                .with_limit(MAX_CACHE_SHARD_BYTES)
+                .deserialize(&envelope.payload)
+                .expect("a payload this build wrote");
+            for (entry, _) in entries.iter_mut() {
+                entry.parser_version = parser_version;
+            }
+            envelope.payload = bincode::options().serialize(&entries).unwrap();
+        } else {
+            let mut entries: Vec<CachedSourceEntry> = bincode::options()
+                .with_limit(MAX_CACHE_SHARD_BYTES)
+                .deserialize(&envelope.payload)
+                .expect("a payload this build wrote");
+            for entry in entries.iter_mut() {
+                entry.parser_version = parser_version;
+            }
+            envelope.payload = bincode::options().serialize(&entries).unwrap();
         }
-        envelope.payload = bincode::options().serialize(&entries).unwrap();
         envelope.parser_version = parser_version;
         let mut writer = BufWriter::new(File::create(&path).unwrap());
         bincode::options()
@@ -2256,6 +2300,37 @@ fn read_shard_with_limit(
         Ok(envelope) => envelope,
         Err(error) => return ShardReadStatus::Invalid(error.to_string()),
     };
+    if envelope.format_version == CLAUDE_CACHE_FORMAT_VERSION {
+        if envelope.parser_namespace != ClientId::Claude.as_str()
+            || envelope.parser_namespace != identity.namespace
+        {
+            return ShardReadStatus::Stale;
+        }
+        if envelope.parser_version != identity.parser_version
+            && !parser_version_is_migratable(&envelope.parser_namespace, envelope.parser_version)
+        {
+            return ShardReadStatus::Stale;
+        }
+        // A checkpoint that fails to decode or verify costs only the resume,
+        // never the entry.
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<(CachedSourceEntry, Option<Vec<u8>>)>>(&envelope.payload)
+        {
+            Ok(entries) => ShardReadStatus::Loaded(
+                entries
+                    .into_iter()
+                    .map(|(entry, bytes)| {
+                        let checkpoint = bytes.and_then(|bytes| {
+                            crate::sessions::claudecode::ClaudeCheckpoint::decode(&bytes)
+                        });
+                        entry.with_claude_checkpoint(checkpoint)
+                    })
+                    .collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
     // A retaining namespace's older shard is decoded through its own layout
     // rather than dropped. Rejecting it here is what makes a format bump lose
     // the turns a compacting rewrite already took out of the source file.
@@ -2304,12 +2379,35 @@ fn write_shard_with_limit(
     entries: &[CachedSourceEntry],
     max_shard_bytes: u64,
 ) -> std::io::Result<()> {
-    let payload = bincode::options()
-        .with_limit(max_shard_bytes)
-        .serialize(entries)
-        .map_err(std::io::Error::other)?;
+    let is_claude = identity.namespace == ClientId::Claude.as_str();
+    let payload = if is_claude {
+        let wire: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry,
+                    entry
+                        .claude_checkpoint
+                        .as_ref()
+                        .and_then(crate::sessions::claudecode::ClaudeCheckpoint::encode),
+                )
+            })
+            .collect();
+        bincode::options()
+            .with_limit(max_shard_bytes)
+            .serialize(&wire)
+    } else {
+        bincode::options()
+            .with_limit(max_shard_bytes)
+            .serialize(entries)
+    }
+    .map_err(std::io::Error::other)?;
     let envelope = CachedShardEnvelope {
-        format_version: CACHE_FORMAT_VERSION,
+        format_version: if is_claude {
+            CLAUDE_CACHE_FORMAT_VERSION
+        } else {
+            CACHE_FORMAT_VERSION
+        },
         parser_namespace: identity.namespace.to_string(),
         parser_version: identity.parser_version,
         payload,
@@ -2699,6 +2797,170 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    fn claude_checkpointed_entry(dir: &TempDir) -> CachedSourceEntry {
+        let source = dir.path().join("session.jsonl");
+        std::fs::write(
+            &source,
+            r#"{"type":"assistant","timestamp":"2026-10-01T10:00:01.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-sonnet-4-5","usage":{"input_tokens":3,"output_tokens":1}}}
+"#,
+        )
+        .unwrap();
+        let parsed = crate::sessions::claudecode::parse_claude_file_with_checkpoint(&source, None);
+        // Checkpoints exist only on macOS arm64; elsewhere the entry is the
+        // same, without one.
+        assert_eq!(
+            parsed.checkpoint.is_some(),
+            crate::sessions::claudecode::CLAUDE_CHECKPOINTS
+        );
+        CachedSourceEntry::new(
+            CacheIdentity::for_client(ClientId::Claude),
+            &source,
+            SourceFingerprint::from_path(&source).unwrap(),
+            parsed.messages,
+            Vec::new(),
+            None,
+        )
+        .with_claude_checkpoint(parsed.checkpoint)
+    }
+
+    fn read_envelope(shard: &Path) -> CachedShardEnvelope {
+        bincode::options()
+            .deserialize_from(BufReader::new(File::open(shard).unwrap()))
+            .unwrap()
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn test_claude_envelope_round_trips_the_checkpoint_and_is_distinct() {
+        let dir = TempDir::new().unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let entry = claude_checkpointed_entry(&dir);
+        let shard = dir.path().join("shard.bin");
+        write_shard_with_limit(
+            &shard,
+            identity,
+            std::slice::from_ref(&entry),
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let envelope = read_envelope(&shard);
+        assert_eq!(envelope.format_version, CLAUDE_CACHE_FORMAT_VERSION);
+        assert_eq!(CACHE_FORMAT_VERSION, 4, "the generic format does not move");
+        let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
+            panic!("a Claude envelope loads");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].claude_checkpoint, entry.claude_checkpoint);
+        assert!(entries[0].claude_checkpoint.is_some());
+        assert_eq!(entries[0].messages, entry.messages);
+
+        // Another namespace keeps the generic format.
+        let other = CacheIdentity::for_client(ClientId::Codex);
+        let other_shard = dir.path().join("other.bin");
+        let other_entry = test_entry(other, &dir.path().join("session.jsonl"), "s");
+        write_shard_with_limit(&other_shard, other, &[other_entry], MAX_CACHE_SHARD_BYTES).unwrap();
+        assert_eq!(
+            read_envelope(&other_shard).format_version,
+            CACHE_FORMAT_VERSION
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn test_claude_checkpoint_bytes_that_fail_to_decode_cost_only_the_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let entry = claude_checkpointed_entry(&dir);
+        let shard = dir.path().join("shard.bin");
+        let good = entry.claude_checkpoint.as_ref().unwrap().encode().unwrap();
+
+        let mut corrupted = entry.clone();
+        corrupted
+            .claude_checkpoint
+            .as_mut()
+            .unwrap()
+            .corrupt_state_for_test();
+        let mut other_layout = good.clone();
+        other_layout[0] ^= 0xff;
+        let mut truncated = good.clone();
+        truncated.truncate(good.len() / 2);
+        let state_mutated = corrupted
+            .claude_checkpoint
+            .as_ref()
+            .unwrap()
+            .encode()
+            .unwrap();
+
+        for (case, bytes) in [
+            ("a valid-looking mutation of parser state", state_mutated),
+            ("a future wire version", other_layout),
+            ("truncated bytes", truncated),
+        ] {
+            let payload = bincode::options()
+                .serialize(&vec![(&entry, Some(bytes))])
+                .unwrap();
+            let envelope = CachedShardEnvelope {
+                format_version: CLAUDE_CACHE_FORMAT_VERSION,
+                parser_namespace: identity.namespace.to_string(),
+                parser_version: identity.parser_version,
+                payload,
+            };
+            std::fs::write(&shard, bincode::options().serialize(&envelope).unwrap()).unwrap();
+            let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
+                panic!("{case}: the entry still loads");
+            };
+            assert!(entries[0].claude_checkpoint.is_none(), "{case}");
+            assert_eq!(entries[0].messages, entry.messages, "{case}");
+        }
+    }
+
+    #[test]
+    fn test_claude_shard_at_the_shared_format_loads_without_a_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let entry = claude_checkpointed_entry(&dir);
+        // The layout every Claude shard had before the envelope: the entries
+        // alone, at CACHE_FORMAT_VERSION.
+        let envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options().serialize(&vec![&entry]).unwrap(),
+        };
+        let shard = dir.path().join("shard.bin");
+        std::fs::write(&shard, bincode::options().serialize(&envelope).unwrap()).unwrap();
+
+        let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
+            panic!("a format-{CACHE_FORMAT_VERSION} Claude shard still loads");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].messages, entry.messages);
+        // On macOS arm64 `entry` carries a checkpoint; the format-4 payload
+        // must not, because `claude_checkpoint` is `#[serde(skip)]`.
+        assert!(entries[0].claude_checkpoint.is_none());
+    }
+
+    #[test]
+    fn test_claude_envelope_read_by_another_namespace_is_stale() {
+        let dir = TempDir::new().unwrap();
+        let entry = claude_checkpointed_entry(&dir);
+        let shard = dir.path().join("shard.bin");
+        write_shard_with_limit(
+            &shard,
+            CacheIdentity::for_client(ClientId::Claude),
+            &[entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+        let other = CacheIdentity::for_client(ClientId::Codex);
+        let mut foreign = read_envelope(&shard);
+        foreign.parser_namespace = other.namespace.to_string();
+        foreign.parser_version = other.parser_version;
+        std::fs::write(&shard, bincode::options().serialize(&foreign).unwrap()).unwrap();
+        assert!(matches!(read_shard(&shard, other), ShardReadStatus::Stale));
     }
 
     fn keyed_message(namespace: &str, session_id: &str, dedup_key: &str) -> UnifiedMessage {
