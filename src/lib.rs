@@ -9607,7 +9607,6 @@ mod tests {
         )
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn s1b_append(path: &Path, text: &str) {
         use std::io::Write;
         std::fs::OpenOptions::new()
@@ -9618,7 +9617,6 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// How many transcripts under `source_home` a scan continued from a
     /// checkpoint so far (the recorder is process-wide; paths are per-test).
     fn s1b_resumes(source_home: &Path) -> usize {
@@ -9705,7 +9703,6 @@ mod tests {
         rows
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// A scan of `source_home` from an empty cache home, leaving the current
     /// (warm) cache home untouched.
     fn s1b_cold_scan(lane: S1bLane, source_home: &Path, cold_home: &Path) -> Vec<S1bRow> {
@@ -10117,18 +10114,15 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     const S1B_SIDECHAIN_LINE: &str = concat!(
         r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-1","agentId":"sidecar1","timestamp":"2026-10-01T10:00:05.000Z","requestId":"req_{n}","message":{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":5}}}"#,
         "\n"
     );
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn s1b_sidechain_line(n: u32) -> String {
         S1B_SIDECHAIN_LINE.replace("{n}", &n.to_string())
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn s1c_parent_session(subagent_type: &str) -> String {
         format!(
             concat!(
@@ -10141,13 +10135,13 @@ mod tests {
         )
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     /// A subagent whose `.meta.json` resolves its name no longer depends on the
     /// parent session: it still resumes on its own growth after the parent
     /// grew, and its name never differs from a cold scan. When the meta stops
     /// resolving, the parent becomes a dependency again (rewriting the meta
     /// with the transcript unchanged, then the parent), and a meta change is a
-    /// full parse, not a resume.
+    /// full parse, not a resume. Runs on every target: resumes exist only where
+    /// `CLAUDE_CHECKPOINTS` is on, so the resume count is asserted against that.
     #[test]
     #[serial_test::serial]
     fn test_claude_subagent_name_follows_the_meta_then_the_parent() {
@@ -10190,9 +10184,10 @@ mod tests {
             s1b_append(&parent, "\n");
             s1b_append(&child, &s1b_sidechain_line(2));
             let warm = s1b_scan(lane, source_home.path());
+            let resumed = s1b_resumes(source_home.path());
             assert_eq!(
-                s1b_resumes(source_home.path()),
-                1,
+                resumed,
+                usize::from(sessions::claudecode::CLAUDE_CHECKPOINTS),
                 "{lane:?}: the parent is not a dependency of a resolving subagent"
             );
             assert_eq!(warm, cold(lane), "{lane:?}");
@@ -10202,7 +10197,7 @@ mod tests {
             // now comes from the parent, and a meta change is not a resume.
             std::fs::write(&meta, "{}").unwrap();
             let warm = s1b_scan(lane, source_home.path());
-            assert_eq!(s1b_resumes(source_home.path()), 1, "{lane:?}");
+            assert_eq!(s1b_resumes(source_home.path()), resumed, "{lane:?}");
             assert_eq!(warm, cold(lane), "{lane:?}");
             let explorer = agents(&warm);
             assert_ne!(explorer[0], planner[0], "{lane:?}: now the parent's");
