@@ -2938,6 +2938,9 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].messages, entry.messages);
+        // On macOS arm64 `entry` carries a checkpoint; the format-4 payload
+        // must not, because `claude_checkpoint` is `#[serde(skip)]`.
+        assert!(entries[0].claude_checkpoint.is_none());
     }
 
     #[test]

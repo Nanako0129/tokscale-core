@@ -719,7 +719,9 @@ const CLAUDE_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// a 361 MB transcript takes 131 ms against 672 ms for the portable backend,
 /// which is slower than parsing the same bytes. Every other target, x86_64
 /// included, does not hash the transcript prefix, takes no checkpoint and
-/// never resumes. What
+/// never resumes. It still verifies the integrity digest of checkpoint bytes
+/// it loads from a shard a macOS arm64 build wrote into a shared cache
+/// (`ClaudeCheckpoint::decode` is ungated); UPSTREAM.md has the details. What
 /// changes on every target is read-error handling: a read or open error ends
 /// the parse, which is then neither cached nor retained (`read_failed`).
 pub(crate) const CLAUDE_CHECKPOINTS: bool = cfg!(all(target_arch = "aarch64", target_os = "macos"));
