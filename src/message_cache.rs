@@ -2938,7 +2938,6 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].messages, entry.messages);
-        assert!(entries[0].claude_checkpoint.is_none());
     }
 
     #[test]

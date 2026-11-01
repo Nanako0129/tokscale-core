@@ -718,7 +718,8 @@ const CLAUDE_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// measured: with sha2's `asm` feature (see Cargo.toml) the whole-prefix hash of
 /// a 361 MB transcript takes 131 ms against 672 ms for the portable backend,
 /// which is slower than parsing the same bytes. Every other target, x86_64
-/// included, hashes nothing, takes no checkpoint and never resumes. What
+/// included, does not hash the transcript prefix, takes no checkpoint and
+/// never resumes. What
 /// changes on every target is read-error handling: a read or open error ends
 /// the parse, which is then neither cached nor retained (`read_failed`).
 pub(crate) const CLAUDE_CHECKPOINTS: bool = cfg!(all(target_arch = "aarch64", target_os = "macos"));
@@ -4997,10 +4998,10 @@ mod checkpoint_gate_tests {
         path
     }
 
-    /// Targets other than macOS arm64 hash nothing and take no checkpoint;
-    /// there the same file checkpoints.
+    /// Targets other than macOS arm64 take no checkpoint; on macOS arm64 the
+    /// same file checkpoints.
     #[test]
-    fn test_checkpoints_exist_only_where_sha256_is_fast() {
+    fn test_checkpoints_exist_only_on_macos_arm64() {
         let dir = TempDir::new().unwrap();
         let path = transcript(&dir);
         std::fs::write(
