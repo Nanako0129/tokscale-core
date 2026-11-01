@@ -362,7 +362,7 @@ fn run_scan_tasks<P: Send>(
             .map(|(client_id, path, pattern)| {
                 (
                     client_id,
-                    scan_directory_path(root(&path), pattern, &exclusions.for_client(client_id)),
+                    scan_directory_path(root(&path), pattern, exclusions.for_client(client_id)),
                 )
             })
             .collect()
@@ -401,25 +401,32 @@ fn scan_directory_path(root_path: &Path, pattern: &str, excluded: &[PathBuf]) ->
     // the relative path (no syscall per entry), except for a symlink, which is
     // resolved on its own. The walk root itself is an entry, so an excluded
     // root yields nothing.
-    let canonical_root = (!excluded.is_empty())
-        .then(|| std::fs::canonicalize(root_path).ok())
-        .flatten();
+    let roots = (!excluded.is_empty()).then(|| {
+        (
+            lexical_normalize(root_path),
+            std::fs::canonicalize(root_path).ok(),
+        )
+    });
     let mut paths: Vec<PathBuf> = WalkDir::new(root_path)
         .into_iter()
         .filter_entry(|e| {
-            if excluded.is_empty() {
+            let Some((normalized_root, canonical_root)) = roots.as_ref() else {
                 return true;
-            }
+            };
             let found = e.path();
+            let Ok(relative) = found.strip_prefix(root_path) else {
+                return true;
+            };
             let resolved = if e.path_is_symlink() {
                 std::fs::canonicalize(found).ok()
             } else {
-                canonical_root
-                    .as_ref()
-                    .zip(found.strip_prefix(root_path).ok())
-                    .map(|(root, relative)| root.join(relative))
+                canonical_root.as_ref().map(|root| root.join(relative))
             };
-            !prefixes_cover(excluded, found, resolved.as_deref())
+            !prefixes_cover(
+                excluded,
+                &normalized_root.join(relative),
+                resolved.as_deref(),
+            )
         })
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -1004,20 +1011,24 @@ fn grok_unified_log_path_from_updates(updates_path: &Path) -> Option<PathBuf> {
 
 /// Caller-excluded prefixes, per client, built once per scan.
 ///
-/// Every prefix is held as given and, when it resolves, canonicalized. A path
-/// is excluded when either form of the path (as found, or resolved) starts
-/// with either form of a prefix. The "as found" half makes a symlink inside an
-/// excluded directory count as excluded even when it points elsewhere; the
-/// canonical half catches a path reached through a symlinked parent. Comparing
-/// raw with raw and canonical with canonical also keeps Windows `\\?\` verbatim
-/// paths (what `canonicalize` returns there) from silently never matching.
+/// Every prefix is held lexically normalized (`.`/`..` resolved without the
+/// disk) and, when it resolves, canonicalized. A path is excluded when its
+/// normalized form (as found) or its canonical form starts with either form of
+/// a prefix. The "as found" half makes a symlink inside an excluded directory
+/// count as excluded even when it points elsewhere, and normalizing keeps
+/// `A/../shared` from counting as under `A`; the canonical half catches a path
+/// reached through a symlinked parent. Comparing like with like also keeps
+/// Windows `\\?\` verbatim paths from silently never matching, and on Windows
+/// the comparison ignores case.
 ///
 /// The exclusion is applied where each source is *selected*, before the
 /// cross-client `seen` dedup and before a database candidate is chosen: the
 /// directory walk skips an excluded subtree (so nesting is covered and the
 /// subtree is never enumerated), and single-file and database sources ask
-/// [`Self::usable`], so an excluded candidate yields to the next one. A client
-/// with no prefix does no extra work.
+/// [`Self::usable`], so an excluded candidate yields to the next one; a final
+/// [`Self::sweep`] re-checks the whole result as a backstop. A client with no
+/// prefix does no extra work. (Deferred: the walk allocates a joined path per
+/// entry for clients that do have a prefix.)
 ///
 /// Not covered: the `synthetic` pseudo-client (the octofriend database) has no
 /// `ClientId`, so `excluded_scan_paths` cannot name it; and
@@ -1026,45 +1037,50 @@ fn grok_unified_log_path_from_updates(updates_path: &Path) -> Option<PathBuf> {
 /// (the walk of that directory is skipped).
 #[derive(Default)]
 struct ScanExclusions {
-    prefixes: Vec<(ClientId, PathBuf)>,
+    /// Indexed by `ClientId as usize`; empty when nothing is excluded.
+    by_client: Vec<Vec<PathBuf>>,
 }
 
 impl ScanExclusions {
+    /// Prefixes are lexically normalized (`.` and `..` resolved without
+    /// touching the disk) and, when they resolve, also canonicalized.
     fn new(scanner_settings: &ScannerSettings) -> Self {
-        let mut prefixes = Vec::new();
+        let mut by_client: Vec<Vec<PathBuf>> = Vec::new();
         for (client_str, paths) in &scanner_settings.excluded_scan_paths {
             let Some(client_id) = ClientId::from_str(client_str) else {
                 continue;
             };
+            by_client.resize_with(ClientId::COUNT, Vec::new);
+            let list = &mut by_client[client_id as usize];
             for path in paths.iter().filter(|path| !path.as_os_str().is_empty()) {
-                prefixes.push((client_id, path.clone()));
+                list.push(lexical_normalize(path));
                 if let Ok(canonical) = std::fs::canonicalize(path) {
-                    if &canonical != path {
-                        prefixes.push((client_id, canonical));
-                    }
+                    list.push(canonical);
                 }
             }
         }
-        Self { prefixes }
+        Self { by_client }
     }
 
-    fn for_client(&self, client_id: ClientId) -> Vec<PathBuf> {
-        self.prefixes
-            .iter()
-            .filter(|(id, _)| *id == client_id)
-            .map(|(_, prefix)| prefix.clone())
-            .collect()
+    fn for_client(&self, client_id: ClientId) -> &[PathBuf] {
+        self.by_client
+            .get(client_id as usize)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// One path (a database, a log, an exporter file): one `canonicalize`, and
     /// only for a client that has a prefix.
     fn excludes(&self, client_id: ClientId, path: &Path) -> bool {
-        let prefixes = self.for_client(client_id);
-        if prefixes.is_empty() {
+        if self.for_client(client_id).is_empty() {
             return false;
         }
-        let canonical = std::fs::canonicalize(path).ok();
-        prefixes_cover(&prefixes, path, canonical.as_deref())
+        self.excludes_with(client_id, path, std::fs::canonicalize(path).ok().as_deref())
+    }
+
+    /// As [`Self::excludes`] for a caller that already has the canonical form.
+    fn excludes_with(&self, client_id: ClientId, path: &Path, canonical: Option<&Path>) -> bool {
+        let prefixes = self.for_client(client_id);
+        !prefixes.is_empty() && prefixes_cover(prefixes, &lexical_normalize(path), canonical)
     }
 
     /// An existing file that is not excluded: what a database candidate must
@@ -1072,12 +1088,107 @@ impl ScanExclusions {
     fn usable(&self, client_id: ClientId, path: &Path) -> bool {
         path.is_file() && !self.excludes(client_id, path)
     }
+
+    fn usable_with(&self, client_id: ClientId, path: &Path, canonical: Option<&Path>) -> bool {
+        path.is_file() && !self.excludes_with(client_id, path, canonical)
+    }
+
+    /// Backstop over the finished result: every file list and every database
+    /// field gets the same check the per-candidate sites apply, so a source
+    /// added later cannot bypass an exclusion by forgetting its own check.
+    /// The destructuring has no `..`, so a new `ScanResult` field fails to
+    /// compile until it is handled here.
+    fn sweep(&self, result: &mut ScanResult) {
+        if self.by_client.is_empty() {
+            return;
+        }
+        let ScanResult {
+            files,
+            opencode_dbs,
+            copilot_desktop_db,
+            // No `ClientId`, so nothing can be excluded for it (see above).
+            synthetic_db: _,
+            kilo_db,
+            hermes_db,
+            goose_db,
+            zed_db,
+            kiro_db,
+            zcode_db,
+            crush_dbs,
+            // A stat pointer, not a source read for usage (see above).
+            opencode_json_dir: _,
+        } = result;
+        for client_id in ClientId::iter() {
+            if !self.for_client(client_id).is_empty() {
+                files[client_id as usize].retain(|path| !self.excludes(client_id, path));
+            }
+        }
+        let drop_db = |client_id: ClientId, db: &mut Option<PathBuf>| {
+            if db
+                .as_deref()
+                .is_some_and(|path| self.excludes(client_id, path))
+            {
+                *db = None;
+            }
+        };
+        drop_db(ClientId::Copilot, copilot_desktop_db);
+        drop_db(ClientId::Kilo, kilo_db);
+        drop_db(ClientId::Hermes, hermes_db);
+        drop_db(ClientId::Goose, goose_db);
+        drop_db(ClientId::Zed, zed_db);
+        drop_db(ClientId::Kiro, kiro_db);
+        drop_db(ClientId::Zcode, zcode_db);
+        opencode_dbs.retain(|path| !self.excludes(ClientId::OpenCode, path));
+        crush_dbs.retain(|db| !self.excludes(ClientId::Crush, &db.db_path));
+    }
 }
 
+/// Resolve `.` and `..` without touching the disk, so `a/../b` is compared as
+/// `b`. A `..` with nothing to pop is kept (relative paths) or dropped at a
+/// root, as the OS does.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// `Path::starts_with`, except that on Windows components compare case-
+/// insensitively, as the file system does. Without it a case-only difference
+/// silently disables an exclusion whenever `canonicalize` cannot correct it.
+fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let fold = |c: std::path::Component| c.as_os_str().to_string_lossy().to_lowercase();
+        let mut components = path.components();
+        prefix
+            .components()
+            .all(|expected| components.next().is_some_and(|c| fold(c) == fold(expected)))
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(prefix)
+    }
+}
+
+/// `found` must already be lexically normalized; `canonical` is its resolved
+/// form when known.
 fn prefixes_cover(prefixes: &[PathBuf], found: &Path, canonical: Option<&Path>) -> bool {
     prefixes.iter().any(|prefix| {
-        found.starts_with(prefix)
-            || canonical.is_some_and(|canonical| canonical.starts_with(prefix))
+        path_starts_with(found, prefix)
+            || canonical.is_some_and(|canonical| path_starts_with(canonical, prefix))
     })
 }
 
@@ -1629,8 +1740,9 @@ fn scan_all_clients_resolved_inner(
             .filter_map(|path| grok_unified_log_path_from_updates(path)),
     );
     for path in grok_unified_paths {
-        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if exclusions.usable(ClientId::Grok, &path) && seen.insert(key) {
+        let canonical = std::fs::canonicalize(&path).ok();
+        let key = canonical.clone().unwrap_or_else(|| path.clone());
+        if exclusions.usable_with(ClientId::Grok, &path, canonical.as_deref()) && seen.insert(key) {
             result.get_mut(ClientId::Grok).push(path);
         }
     }
@@ -1644,8 +1756,11 @@ fn scan_all_clients_resolved_inner(
         if use_env_roots && context.source_env_is_explicit("COPILOT_OTEL_FILE_EXPORTER_PATH") {
             if let Some(path) = context.source_env_path("COPILOT_OTEL_FILE_EXPORTER_PATH") {
                 let path = path.to_path_buf();
-                let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                if exclusions.usable(ClientId::Copilot, &path) && seen.insert(key) {
+                let canonical = std::fs::canonicalize(&path).ok();
+                let key = canonical.clone().unwrap_or_else(|| path.clone());
+                if exclusions.usable_with(ClientId::Copilot, &path, canonical.as_deref())
+                    && seen.insert(key)
+                {
                     result.get_mut(ClientId::Copilot).push(path);
                     result.get_mut(ClientId::Copilot).sort_unstable();
                 }
@@ -1654,6 +1769,7 @@ fn scan_all_clients_resolved_inner(
     }
 
     prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+    exclusions.sweep(&mut result);
 
     Ok(result)
 }
@@ -2186,8 +2302,9 @@ fn scan_all_clients_with_env_strategy_inner(
     );
 
     for path in grok_unified_paths {
-        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if exclusions.usable(ClientId::Grok, &path) && seen.insert(key) {
+        let canonical = std::fs::canonicalize(&path).ok();
+        let key = canonical.clone().unwrap_or_else(|| path.clone());
+        if exclusions.usable_with(ClientId::Grok, &path, canonical.as_deref()) && seen.insert(key) {
             result.get_mut(ClientId::Grok).push(path);
         }
     }
@@ -2200,8 +2317,11 @@ fn scan_all_clients_with_env_strategy_inner(
         }
 
         if let Some(path) = copilot_exporter_path_with_env_strategy(use_env_roots) {
-            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if exclusions.usable(ClientId::Copilot, &path) && seen.insert(key) {
+            let canonical = std::fs::canonicalize(&path).ok();
+            let key = canonical.clone().unwrap_or_else(|| path.clone());
+            if exclusions.usable_with(ClientId::Copilot, &path, canonical.as_deref())
+                && seen.insert(key)
+            {
                 let copilot_files = result.get_mut(ClientId::Copilot);
                 copilot_files.push(path);
                 copilot_files.sort_unstable();
@@ -2210,6 +2330,7 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+    exclusions.sweep(&mut result);
 
     result
 }
@@ -4088,6 +4209,159 @@ mod tests {
                 "symlink out of an excluded dir kept"
             );
         }
+    }
+
+    /// A `..` in the path as found must not make it look like it sits under
+    /// the directory it passed through: `A/../shared` is `shared`.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_resolve_dot_dot_before_comparing() {
+        // A cc-mirror variant whose configDir leaves the excluded directory.
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let excluded = home.join(".cc-mirror/A");
+        fs::create_dir_all(&excluded).unwrap();
+        let shared_file = home.join(".cc-mirror/shared/projects/p/session.jsonl");
+        touch(&shared_file);
+        let variant = home.join(".cc-mirror/v1");
+        fs::create_dir_all(&variant).unwrap();
+        fs::write(
+            variant.join("variant.json"),
+            serde_json::json!({ "configDir": excluded.join("../shared") }).to_string(),
+        )
+        .unwrap();
+        let settings = ScannerSettings {
+            excluded_scan_paths: exclude("claude", &[&excluded]),
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "claude", false, &settings) {
+            assert!(
+                result
+                    .get(ClientId::Claude)
+                    .iter()
+                    .any(|path| path.ends_with("shared/projects/p/session.jsonl")),
+                "a path that only passes through the excluded directory was dropped: {:?}",
+                result.get(ClientId::Claude)
+            );
+        }
+
+        // The same for a single file: the Copilot exporter path.
+        let mut env = EnvGuard::capture(&["COPILOT_OTEL_FILE_EXPORTER_PATH"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let excluded = home.join("excluded");
+        fs::create_dir_all(&excluded).unwrap();
+        let kept = home.join("kept/x.jsonl");
+        touch(&kept);
+        let via_dot_dot = excluded.join("../kept/x.jsonl");
+        env.set(
+            "COPILOT_OTEL_FILE_EXPORTER_PATH",
+            via_dot_dot.display().to_string(),
+        );
+        let settings = ScannerSettings {
+            excluded_scan_paths: exclude("copilot", &[&excluded]),
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "copilot", true, &settings) {
+            assert_eq!(result.get(ClientId::Copilot).len(), 1, "dropped by `..`");
+        }
+        // And a path that really is inside is still excluded when written with `..`.
+        let inside = excluded.join("../excluded/y.jsonl");
+        touch(&excluded.join("y.jsonl"));
+        env.set(
+            "COPILOT_OTEL_FILE_EXPORTER_PATH",
+            inside.display().to_string(),
+        );
+        for result in scan_both_entries(home, "copilot", true, &settings) {
+            assert!(result.get(ClientId::Copilot).is_empty(), "inside, kept");
+        }
+    }
+
+    /// The backstop: whatever a source's own selection did, the final sweep
+    /// clears every file list and every database field under an exclusion.
+    /// Fields are listed without `..`, so a new `ScanResult` field must be
+    /// added here (and to `ScanExclusions::sweep`) to compile.
+    #[test]
+    fn test_sweep_clears_every_scan_result_field() {
+        let root = PathBuf::from("/excluded-root");
+        let at = |name: &str| root.join(name);
+        let mut result = ScanResult {
+            files: std::array::from_fn(|i| vec![at(&format!("f{i}.jsonl"))]),
+            opencode_dbs: vec![at("oc.db")],
+            copilot_desktop_db: Some(at("copilot.db")),
+            synthetic_db: None,
+            kilo_db: Some(at("kilo.db")),
+            hermes_db: Some(at("hermes.db")),
+            goose_db: Some(at("goose.db")),
+            zed_db: Some(at("zed.db")),
+            kiro_db: Some(at("kiro.db")),
+            zcode_db: Some(at("zcode.db")),
+            crush_dbs: vec![CrushDbSource {
+                db_path: at("crush.db"),
+                workspace_key: None,
+                workspace_label: None,
+            }],
+            opencode_json_dir: None,
+        };
+        let settings = ScannerSettings {
+            excluded_scan_paths: ClientId::iter()
+                .map(|id| (id.as_str().to_string(), vec![root.clone()]))
+                .collect(),
+            ..Default::default()
+        };
+        ScanExclusions::new(&settings).sweep(&mut result);
+        let ScanResult {
+            files,
+            opencode_dbs,
+            copilot_desktop_db,
+            synthetic_db: _,
+            kilo_db,
+            hermes_db,
+            goose_db,
+            zed_db,
+            kiro_db,
+            zcode_db,
+            crush_dbs,
+            opencode_json_dir: _,
+        } = result;
+        assert!(files.iter().all(Vec::is_empty), "file list left populated");
+        assert!(opencode_dbs.is_empty() && crush_dbs.is_empty());
+        for (name, db) in [
+            ("copilot", copilot_desktop_db),
+            ("kilo", kilo_db),
+            ("hermes", hermes_db),
+            ("goose", goose_db),
+            ("zed", zed_db),
+            ("kiro", kiro_db),
+            ("zcode", zcode_db),
+        ] {
+            assert_eq!(db, None, "{name} database left populated");
+        }
+    }
+
+    #[test]
+    fn test_lexical_normalize_resolves_dot_segments() {
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../c/./d")),
+            Path::new("/a/c/d")
+        );
+        assert_eq!(lexical_normalize(Path::new("/../a")), Path::new("/a"));
+        assert_eq!(lexical_normalize(Path::new("../a/..")), Path::new(".."));
+    }
+
+    /// Windows compares paths without regard to case. Not run on the platform
+    /// this was written on: it compiles only on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn test_path_starts_with_ignores_case_on_windows() {
+        assert!(path_starts_with(
+            Path::new(r"C:\Users\Me\Work\a.jsonl"),
+            Path::new(r"c:\users\me\work")
+        ));
+        assert!(!path_starts_with(
+            Path::new(r"C:\Users\Me\Workshop"),
+            Path::new(r"c:\users\me\work")
+        ));
     }
 
     #[test]
