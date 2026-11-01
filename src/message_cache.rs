@@ -2799,6 +2799,10 @@ mod tests {
         )
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     fn claude_checkpointed_entry(dir: &TempDir) -> CachedSourceEntry {
         let source = dir.path().join("session.jsonl");
         std::fs::write(
@@ -2820,12 +2824,20 @@ mod tests {
         .with_claude_checkpoint(parsed.checkpoint)
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     fn read_envelope(shard: &Path) -> CachedShardEnvelope {
         bincode::options()
             .deserialize_from(BufReader::new(File::open(shard).unwrap()))
             .unwrap()
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     #[test]
     fn test_claude_envelope_round_trips_the_checkpoint_and_is_distinct() {
         let dir = TempDir::new().unwrap();
@@ -2862,6 +2874,10 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     #[test]
     fn test_claude_checkpoint_bytes_that_fail_to_decode_cost_only_the_checkpoint() {
         let dir = TempDir::new().unwrap();
@@ -2910,6 +2926,10 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     #[test]
     fn test_claude_shard_at_the_shared_format_loads_without_a_checkpoint() {
         let dir = TempDir::new().unwrap();
@@ -2934,6 +2954,10 @@ mod tests {
         assert!(entries[0].claude_checkpoint.is_none());
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     #[test]
     fn test_claude_envelope_read_by_another_namespace_is_stale() {
         let dir = TempDir::new().unwrap();

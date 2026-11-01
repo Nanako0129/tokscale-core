@@ -1153,6 +1153,16 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         claude_checkpoint: Option<sessions::claudecode::ClaudeCheckpoint>,
     }
 
+    impl From<sessions::claudecode::ClaudeParse> for SourceParse {
+        fn from(parsed: sessions::claudecode::ClaudeParse) -> Self {
+            Self {
+                messages: parsed.messages,
+                cacheable: true,
+                claude_checkpoint: parsed.checkpoint,
+            }
+        }
+    }
+
     impl SourceParse {
         fn plain(messages: Vec<UnifiedMessage>, cacheable: bool) -> Self {
             Self {
@@ -1520,15 +1530,11 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                     )
                 },
                 |path| {
-                    let parsed = sessions::claudecode::parse_claude_file_with_checkpoint(
+                    sessions::claudecode::parse_claude_file_with_checkpoint(
                         path,
                         Some(&claude_home),
-                    );
-                    SourceParse {
-                        messages: parsed.messages,
-                        cacheable: true,
-                        claude_checkpoint: parsed.checkpoint,
-                    }
+                    )
+                    .into()
                 },
                 &mut |message, live_agent| {
                     sessions::claudecode::refresh_retained_message_context(
@@ -1539,13 +1545,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                     )
                 },
                 Some(&|path, entry, fingerprint| {
-                    resume_claude_source(path, entry, fingerprint, &claude_home).map(|parsed| {
-                        SourceParse {
-                            messages: parsed.messages,
-                            cacheable: true,
-                            claude_checkpoint: parsed.checkpoint,
-                        }
-                    })
+                    resume_claude_source(path, entry, fingerprint, &claude_home).map(Into::into)
                 }),
             )
         })
@@ -9566,6 +9566,10 @@ mod tests {
 
     // ---- S1b: Claude resume from a cached checkpoint ----
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// One human turn and the assistant response to it.
     fn s1b_turn(n: u32, output: u32) -> String {
         format!(
@@ -9580,6 +9584,10 @@ mod tests {
         )
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// The streamed completion of a response whose first line is already
     /// before the checkpoint.
     fn s1b_completion(n: u32, output: u32) -> String {
@@ -9593,6 +9601,10 @@ mod tests {
         )
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     fn s1b_append(path: &Path, text: &str) {
         use std::io::Write;
         std::fs::OpenOptions::new()
@@ -9603,6 +9615,10 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// How many transcripts under `source_home` a scan continued from a
     /// checkpoint so far (the recorder is process-wide; paths are per-test).
     fn s1b_resumes(source_home: &Path) -> usize {
@@ -9614,6 +9630,10 @@ mod tests {
             .count()
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     #[derive(Clone, Copy, Debug)]
     enum S1bLane {
         Materialized,
@@ -9621,6 +9641,10 @@ mod tests {
         Count,
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     type S1bRow = (
         i64,
         Option<i64>,
@@ -9634,6 +9658,10 @@ mod tests {
         String,
     );
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// Every field the three lanes share, sorted, so lanes and cold/warm
     /// scans compare as plain values.
     fn s1b_scan(lane: S1bLane, source_home: &Path) -> Vec<S1bRow> {
@@ -9689,6 +9717,10 @@ mod tests {
         rows
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// A scan of `source_home` from an empty cache home, leaving the current
     /// (warm) cache home untouched.
     fn s1b_cold_scan(lane: S1bLane, source_home: &Path, cold_home: &Path) -> Vec<S1bRow> {
@@ -9699,6 +9731,10 @@ mod tests {
         s1b_scan(lane, source_home)
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// The cached Claude entry of the only transcript a test scanned.
     fn s1b_only_entry() -> message_cache::CachedSourceEntry {
         let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
@@ -9716,6 +9752,10 @@ mod tests {
         entry
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// A Claude transcript that only grew since the last scan continues from
     /// its checkpoint on every lane, also after the checkpoint went through a
     /// shard on disk, and the result equals a cold scan of the same bytes. A
@@ -9805,6 +9845,10 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// A compacting rewrite (a full parse that keeps the turn the file lost)
     /// followed by growth (a resume) keeps the retained turn, after the live
     /// prefix, and counts the live turns once.
@@ -9876,6 +9920,10 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// A save-merge that changes a live message under a stored checkpoint
     /// leaves the checkpoint describing messages the entry no longer holds.
     /// The next scan must take the full parse instead of resuming from them.
@@ -9947,15 +9995,27 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     const S1B_SIDECHAIN_LINE: &str = concat!(
         r#"{"type":"assistant","isSidechain":true,"sessionId":"parent-1","agentId":"sidecar1","timestamp":"2026-10-01T10:00:05.000Z","requestId":"req_{n}","message":{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":5}}}"#,
         "\n"
     );
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     fn s1b_sidechain_line(n: u32) -> String {
         S1B_SIDECHAIN_LINE.replace("{n}", &n.to_string())
     }
 
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     /// The agent name a subagent transcript takes from a sidecar, a parent
     /// session or a cc-mirror variant file can change messages before the
     /// checkpoint, so a change to any of them is a full parse.
