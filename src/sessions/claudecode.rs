@@ -510,6 +510,32 @@ pub fn parse_claude_file_with_cache(
     parse_claude_file_with_cache_and_home(path, parent_cache, home_dir.as_deref())
 }
 
+/// Test seam: how many times each path was parsed, so a test can tell a warm
+/// cache hit (no parse) from a re-parse. Keyed by path because lanes parse on
+/// worker threads and other tests run in parallel.
+#[cfg(test)]
+static PARSE_CALLS: std::sync::Mutex<Option<HashMap<PathBuf, usize>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_parse_for_test(path: &Path) {
+    *PARSE_CALLS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(path.to_path_buf())
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn parse_calls_for_test(path: &Path) -> usize {
+    PARSE_CALLS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|calls| calls.get(path).copied())
+        .unwrap_or(0)
+}
+
 pub fn parse_claude_file_with_cache_and_home(
     path: &Path,
     parent_cache: &mut ParentSubagentTypeCache,
@@ -519,6 +545,8 @@ pub fn parse_claude_file_with_cache_and_home(
     if is_workflow_journal(path) {
         return Vec::new();
     }
+    #[cfg(test)]
+    note_parse_for_test(path);
 
     let (workspace_key, workspace_label) = claude_workspace_from_path(path);
     let cc_mirror_metadata = cc_mirror_variant_metadata_from_path(path, home_dir);
@@ -1066,8 +1094,12 @@ fn merge_claude_duplicate(
     // When only one side reports the split, that side wins outright; when both
     // or neither do, the units agree and the max stands.
     match (usage.reports_cache_split(), existing_input_is_split) {
-        // `reports_cache_split` implies the input is stated.
-        (true, false) => t.input = usage.input_tokens.unwrap_or(0).max(0),
+        // A missing input is a no-op whatever `reports_cache_split` decides.
+        (true, false) => {
+            if let Some(input) = usage.input_tokens {
+                t.input = input.max(0);
+            }
+        }
         (false, true) => {}
         (true, true) | (false, false) => {
             t.input = t.input.max(usage.input_tokens.unwrap_or(0).max(0));
@@ -1103,6 +1135,12 @@ fn merge_claude_duplicate(
 /// `merge_claude_duplicate` does not survive the cache, so presence of cached
 /// tokens stands in for it: the cache-bearing copy's input wins outright when
 /// it states a positive remainder; otherwise (both, neither, or silent) max.
+///
+/// Known limitation: the cached `TokenBreakdown` stores "stated input 0" and
+/// "input missing" both as 0, so a fully cached turn that stated input 0
+/// (cache_read > 0) merged with an earlier cached bare snapshot keeps the
+/// snapshot's input here, while a cold parse of the same lines gives 0. Rare,
+/// and recorded in UPSTREAM.md.
 pub(crate) fn merge_cached_input(existing: &TokenBreakdown, stored: &TokenBreakdown) -> i64 {
     let has_cache = |t: &TokenBreakdown| t.cache_read > 0 || t.cache_write > 0;
     match (has_cache(existing), has_cache(stored)) {
@@ -3820,13 +3858,14 @@ mod s1a_tests {
     }
 
     #[test]
-    fn test_merge_cached_input_ignores_a_silent_or_zero_cache_bearing_copy() {
+    fn test_merge_cached_input_ignores_a_cache_bearing_copy_with_input_zero() {
         let t = |input, cache_read| TokenBreakdown {
             input,
             cache_read,
             ..Default::default()
         };
-        // Cache-bearing copy silent about input (0): the snapshot's input stays.
+        // Cache-bearing copy carrying input 0 (stated or missing, the cache
+        // cannot tell): the snapshot's input stays.
         assert_eq!(merge_cached_input(&t(0, 42_000), &t(500, 0)), 500);
         assert_eq!(merge_cached_input(&t(500, 0), &t(0, 42_000)), 500);
         // Cache-bearing copy with a positive remainder wins over the snapshot.

@@ -6446,7 +6446,8 @@ fn parse_local_clients_inner(
         } else {
             Vec::new()
         };
-    // Advisor rows carry `message_count` 0, so a row count would overcount.
+    // Advisor rows and tool_result rows carry `message_count` 0, so a row
+    // count would overcount; the sum excludes them.
     let claude_count = summed_parsed_message_count(&claude_msgs);
     counts.set(ClientId::Claude, claude_count);
     messages.extend(claude_msgs);
@@ -9713,7 +9714,16 @@ mod tests {
             let entry = cache.entries.values().next().unwrap();
             assert_eq!(entry.fingerprint, fingerprint);
             assert!(entry.retained_keys.contains("msg_compacted:req_old"));
-            assert_eq!(scan(), rebuilt, "a second scan is a warm hit");
+            let parses = sessions::claudecode::parse_calls_for_test(&source);
+            assert!(parses > 0, "the seam sees this source's parses");
+            assert_eq!(scan(), rebuilt, "a second scan returns the same rows");
+            // A warm hit parses nothing; a pv-5 entry that is always stale
+            // would be parsed again.
+            assert_eq!(
+                sessions::claudecode::parse_calls_for_test(&source),
+                parses,
+                "a second scan is a warm hit"
+            );
 
             std::fs::write(source.with_file_name("fork.jsonl"), record).unwrap();
             let usage = |messages: &[UnifiedMessage]| {
