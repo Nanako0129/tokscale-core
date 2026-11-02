@@ -20590,6 +20590,9 @@ mod tests {
         .unwrap();
     }
 
+    /// The task's reported `cost` is 0: a positive one is the extension's own
+    /// charge and is kept (#1406), which would leave nothing for the
+    /// history-rewrite repricing this fixture exists to check.
     fn write_roo_task_fixture(
         home: &Path,
         client: ClientId,
@@ -20602,7 +20605,7 @@ mod tests {
         let ui_messages = task_dir.join("ui_messages.json");
         std::fs::write(
             &ui_messages,
-            r#"[{"type":"say","say":"api_req_started","ts":"2026-06-25T10:00:00Z","text":"{\"cost\":0.125,\"tokensIn\":100,\"tokensOut\":25,\"cacheReads\":10,\"cacheWrites\":5,\"apiProtocol\":\"anthropic\"}"}]"#,
+            r#"[{"type":"say","say":"api_req_started","ts":"2026-06-25T10:00:00Z","text":"{\"cost\":0,\"tokensIn\":100,\"tokensOut\":25,\"cacheReads\":10,\"cacheWrites\":5,\"apiProtocol\":\"anthropic\"}"}]"#,
         )
         .unwrap();
         let history = sessions::roocode::history_path_for_ui_messages(&ui_messages);
@@ -20719,7 +20722,10 @@ mod tests {
             assert_eq!(materialized.session_id, format!("{client_name}-task"));
             assert_eq!(materialized.model_id, "new-model-with-longer-id");
             assert_eq!(materialized.agent.as_deref(), Some("new-agent"));
-            assert_eq!(materialized.tokens.input, 100);
+            // Roo and Kilo Code `tokensIn` is gross of the 10 + 5 cache
+            // buckets; Cline's is disjoint (#1406).
+            let expected_input = if client == ClientId::Cline { 100 } else { 85 };
+            assert_eq!(materialized.tokens.input, expected_input);
             assert_eq!(materialized.tokens.output, 25);
             assert_eq!(materialized.tokens.cache_read, 10);
             assert_eq!(materialized.tokens.cache_write, 5);

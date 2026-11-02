@@ -950,7 +950,15 @@ fn parser_version(client: ClientId) -> u32 {
         // Cline 4.x tasks stop resolving to `unknown/unknown` (upstream
         // #1340). All three clients share `parse_roo_kilo_file`, so all three
         // re-parse.
-        ClientId::RooCode | ClientId::KiloCode | ClientId::Cline => 2,
+        // 3: a positive `cost` is provider-reported instead of re-priced,
+        // Roo/Kilo Code `tokensIn` has the cache buckets it already contains
+        // subtracted out (Cline's stay disjoint), and a bare `apiProtocol` no
+        // longer outranks the provider named by the model id (upstream #1406).
+        // A finished task's files never change, so its fingerprint keeps
+        // matching and only this bump discards a v2 entry's double-counted
+        // input and mislabeled provider. These namespaces retain no history
+        // beyond the files, so the stale entry is simply re-parsed.
+        ClientId::RooCode | ClientId::KiloCode | ClientId::Cline => 3,
         // 3: `Input (w/ Cache Write)` is read as the cache-write bucket instead
         // of being reduced by `Input (w/o Cache Write)`, and any numeric
         // exported Cost (including an explicit `$0.00`) is provider-reported
@@ -5079,6 +5087,214 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    /// A finished Roo/Kilo/Cline task is never rewritten, so its fingerprint
+    /// stays valid and only the parser-version bump discards the v2 parse that
+    /// kept the cache buckets in input, took the provider from the wire
+    /// protocol and re-priced a cost the extension had reported. The stale
+    /// shard is written at the literal shipped version 2 (not
+    /// `parser_version - 1`) under the unchanged task's current fingerprint,
+    /// and every cached lane must rebuild it and rewrite the shard at version
+    /// 3: the env-strategy streaming and materialized lanes, and the
+    /// source-context streaming lane both apps report through. (The fork has
+    /// no cached materialized lane over a source context: its count lane,
+    /// `parse_local_clients_with_source_context`, parses without the cache.)
+    /// One shard per client: the three have separate namespaces, versions and
+    /// (for Cline) input rules.
+    #[test]
+    #[serial_test::serial]
+    fn test_roo_family_v2_same_fingerprint_shard_is_rebuilt_by_every_lane() {
+        let cache_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(cache_home.path());
+        for (client, input_after_rebuild) in [
+            (ClientId::RooCode, 300),
+            (ClientId::KiloCode, 300),
+            // Cline keeps its buckets disjoint, so input stays as written.
+            (ClientId::Cline, 1_000),
+        ] {
+            let name = client.as_str();
+            let source_home = TempDir::new().unwrap();
+            let home = source_home.path().to_str().unwrap();
+            let task_dir = PathBuf::from(client.data().resolve_path_with_env_strategy(home, false))
+                .join("task-warm");
+            std::fs::create_dir_all(&task_dir).unwrap();
+            let written = task_dir.join("ui_messages.json");
+            std::fs::write(
+                &written,
+                r#"[{"type":"say","say":"api_req_started","ts":1748038758034,"text":"{\"cost\":0.25,\"tokensIn\":1000,\"tokensOut\":10,\"cacheReads\":600,\"cacheWrites\":100,\"apiProtocol\":\"openai\"}"}]"#,
+            )
+            .unwrap();
+            std::fs::write(
+                task_dir.join("api_conversation_history.json"),
+                "<environment_details>\n<model>anthropic/claude-sonnet-4</model>\n</environment_details>",
+            )
+            .unwrap();
+
+            // Cache keys preserve the scanner-returned path spelling, which on
+            // Windows differs from `TempDir::join`'s (`/` against `\`) and
+            // would hash to another shard, and the two scanners spell a root
+            // differently from each other. Each lane is therefore seeded under
+            // the spelling of the scanner it uses.
+            let clients = [name.to_string()];
+            let settings = crate::scanner::ScannerSettings::default();
+            let context = crate::ResolvedLocalSourceContext::capture(
+                Some(source_home.path().to_path_buf()),
+                false,
+                settings.clone(),
+            )
+            .unwrap();
+            let env_scan = crate::scanner::scan_all_clients_with_scanner_settings(
+                home, &clients, false, &settings,
+            );
+            let context_scan =
+                crate::scanner::scan_all_clients_with_source_context(&context, &clients).unwrap();
+            let scanned_path = |scan: &crate::scanner::ScanResult, which: &str| {
+                let found = scan.get(client);
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "{name}: the {which} scanner must find the task"
+                );
+                assert_eq!(
+                    std::fs::canonicalize(&found[0]).unwrap(),
+                    std::fs::canonicalize(&written).unwrap()
+                );
+                found[0].clone()
+            };
+            let env_path = scanned_path(&env_scan, "env-strategy");
+            let context_path = scanned_path(&context_scan, "source-context");
+
+            let current = CacheIdentity::for_client(client);
+            assert_eq!(current.parser_version, 3, "{name}");
+            let stale = CacheIdentity {
+                namespace: current.namespace,
+                parser_version: 2,
+            };
+            // Every lane fingerprints a Roo-family task with its history
+            // sibling folded in (`from_roo_path` / `check_roo_path_samples_only`);
+            // seed that same fingerprint so only the version gate separates
+            // the v2 entry from a cache hit.
+            // The fingerprint embeds the history sibling's path, so it carries
+            // the same scanner spelling: compute it per lane path.
+            let fingerprint_of = |path: &Path| SourceFingerprint::from_roo_path(path).unwrap();
+            let shard_for = |path: &Path| {
+                shard_path(
+                    &cache_shard_dir().unwrap(),
+                    &CacheKey::new(current, path).shard(),
+                )
+            };
+            let seed_v2_shard = |path: &Path| {
+                let stale_path = shard_for(path);
+                let fingerprint = fingerprint_of(path);
+                // What the v2 parser cached: input gross of cache, provider
+                // from the wire protocol, cost left to the estimator.
+                let stale_message = UnifiedMessage::new(
+                    name,
+                    "anthropic/claude-sonnet-4",
+                    "openai",
+                    "task-warm",
+                    1_748_038_758_034,
+                    TokenBreakdown {
+                        input: 1_000,
+                        output: 10,
+                        cache_read: 600,
+                        cache_write: 100,
+                        ..Default::default()
+                    },
+                    0.25,
+                );
+                let stale_entry = CachedSourceEntry::new(
+                    stale,
+                    path,
+                    fingerprint.clone(),
+                    vec![stale_message],
+                    Vec::new(),
+                    None,
+                );
+                let payload = bincode::options().serialize(&vec![stale_entry]).unwrap();
+                ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+                let envelope = CachedShardEnvelope {
+                    format_version: CACHE_FORMAT_VERSION,
+                    parser_namespace: stale.namespace.to_string(),
+                    parser_version: stale.parser_version,
+                    payload,
+                };
+                let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+                bincode::options()
+                    .serialize_into(&mut writer, &envelope)
+                    .unwrap();
+                writer.flush().unwrap();
+                drop(writer);
+                assert!(
+                    matches!(read_shard(&stale_path, current), ShardReadStatus::Stale),
+                    "{name}: a version-2 shard must be Stale to the current parser"
+                );
+                assert_eq!(fingerprint_of(path), fingerprint);
+            };
+            let assert_rebuilt = |messages: &[UnifiedMessage], path: &Path, lane: &str| {
+                assert_eq!(messages.len(), 1, "{name} {lane}");
+                let message = &messages[0];
+                assert_eq!(
+                    message.tokens.input, input_after_rebuild,
+                    "{name} {lane} must not replay the v2 input"
+                );
+                assert_eq!(message.tokens.cache_read, 600, "{name} {lane}");
+                assert_eq!(message.provider_id, "anthropic", "{name} {lane}");
+                assert!(message.has_authoritative_cost(), "{name} {lane}");
+                // The rebuilt entry replaces the v2 shard at the current version.
+                match read_shard(&shard_for(path), current) {
+                    ShardReadStatus::Loaded(entries) => {
+                        assert_eq!(entries.len(), 1, "{name} {lane}");
+                        assert_eq!(entries[0].parser_version, 3, "{name} {lane}");
+                        assert_eq!(
+                            entries[0].fingerprint,
+                            fingerprint_of(path),
+                            "{name} {lane}"
+                        );
+                        assert_eq!(entries[0].messages[0].provider_id, "anthropic");
+                    }
+                    _ => panic!("{name} {lane} must rewrite the shard at the current version"),
+                }
+            };
+
+            seed_v2_shard(&env_path);
+            let mut streamed = Vec::new();
+            crate::scan_messages_streaming(
+                home,
+                &clients,
+                None,
+                false,
+                &settings,
+                &|_m: &UnifiedMessage| true,
+                &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+            );
+            assert_rebuilt(&streamed, &env_path, "streaming lane");
+
+            seed_v2_shard(&env_path);
+            let materialized = crate::parse_all_messages_with_pricing_with_env_strategy(
+                home, &clients, None, false, &settings, None,
+            );
+            assert_rebuilt(&materialized, &env_path, "materialized lane");
+
+            seed_v2_shard(&context_path);
+            let mut context_streamed = Vec::new();
+            crate::scan_messages_streaming_with_context(
+                &context,
+                &clients,
+                None,
+                None,
+                &|_m: &UnifiedMessage| true,
+                &mut |m: &UnifiedMessage| context_streamed.push(m.clone()),
+            )
+            .unwrap();
+            assert_rebuilt(
+                &context_streamed,
+                &context_path,
+                "source-context streaming lane",
+            );
+        }
+        restore_cache_env(prev_env);
+    }
+
     /// A shard written before RET-CLAUDE-001 (`CachedSourceEntry` without
     /// `retained_keys`) is tagged Claude `parser_version = 1`. Its payload's
     /// binary layout no longer matches the current 8-field struct, so
@@ -7057,8 +7273,9 @@ mod tests {
         // (2 carried the cross-session Pi dedup key, #1323).
         assert_eq!(parser_version(ClientId::Pi), 3);
         for client in [ClientId::RooCode, ClientId::KiloCode, ClientId::Cline] {
-            // 2: per-message `modelInfo` identity (#1340).
-            assert_eq!(parser_version(client), 2, "{}", client.as_str());
+            // 2: per-message `modelInfo` identity (#1340); 3: cost provenance,
+            // cache-overlap input and model-id provider (#1406).
+            assert_eq!(parser_version(client), 3, "{}", client.as_str());
         }
         assert_eq!(parser_version(ClientId::Crush), 1);
         assert_eq!(parser_version(ClientId::Hermes), 1);

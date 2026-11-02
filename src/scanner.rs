@@ -955,28 +955,33 @@ fn kimi_work_roots(home_dir: &Path, app_data: Option<&Path>) -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn cline_additional_vscode_task_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from(home_dir)
-        .join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks")];
+/// The VS Code extensions that share the Roo task-log format, with the id of
+/// each one's `globalStorage` directory.
+const VSCODE_TASK_EXTENSIONS: [(ClientId, &str); 3] = [
+    (ClientId::RooCode, "rooveterinaryinc.roo-cline"),
+    (ClientId::KiloCode, "kilocode.kilo-code"),
+    (ClientId::Cline, "saoudrizwan.claude-dev"),
+];
 
-    if cfg!(target_os = "windows") && use_env_roots {
-        if let Some(app_data) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
-            roots.push(
-                PathBuf::from(app_data)
-                    .join("Code/User/globalStorage/saoudrizwan.claude-dev/tasks"),
-            );
-        }
-    }
-
-    roots.push(
-        PathBuf::from(home_dir)
-            .join("AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/tasks"),
-    );
-    roots.push(
-        PathBuf::from(home_dir)
-            .join(".vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks"),
-    );
-
+/// Task roots for a VS Code extension beyond the client's declared (Linux
+/// `~/.config/Code`) path: macOS `~/Library/Application Support/Code`, the same
+/// tree under `~/AppData/Roaming`, VS Code Remote's `~/.vscode-server`
+/// (upstream #1406), and `<app_data>/Code` when `app_data` is given. The caller
+/// guards `app_data` (Windows with environment roots only), as for
+/// [`kimi_work_roots`]. Both scanners call this, so a root added here reaches
+/// the source-context scanner the apps use as well as the env-strategy one.
+fn additional_vscode_task_roots(
+    home_dir: &Path,
+    app_data: Option<&Path>,
+    extension_id: &str,
+) -> Vec<PathBuf> {
+    let tasks = format!("User/globalStorage/{extension_id}/tasks");
+    let mut roots = vec![home_dir
+        .join("Library/Application Support/Code")
+        .join(&tasks)];
+    roots.extend(app_data.map(|app_data| app_data.join("Code").join(&tasks)));
+    roots.push(home_dir.join("AppData/Roaming/Code").join(&tasks));
+    roots.push(home_dir.join(".vscode-server/data").join(&tasks));
     roots
 }
 
@@ -1387,6 +1392,14 @@ fn scan_all_clients_resolved_inner(
         }
     };
 
+    // The Windows `%APPDATA%` root, shared by the Kimi Work and VS Code task
+    // roots: only on Windows with environment roots enabled.
+    let app_data = if cfg!(target_os = "windows") && use_env_roots {
+        context.source_env_path("APPDATA")
+    } else {
+        None
+    };
+
     for client_id in &enabled {
         if matches!(
             client_id,
@@ -1427,11 +1440,6 @@ fn scan_all_clients_resolved_inner(
             home.join("sessions"),
             ClientId::Kimi.data().pattern,
         );
-        let app_data = if cfg!(target_os = "windows") && use_env_roots {
-            context.source_env_path("APPDATA")
-        } else {
-            None
-        };
         for root in kimi_work_roots(home_dir, app_data) {
             push(ClientId::Kimi, root, ClientId::Kimi.data().pattern);
         }
@@ -1549,51 +1557,16 @@ fn scan_all_clients_resolved_inner(
         }
     }
 
-    if enabled.contains(&ClientId::RooCode) {
-        push(
-            ClientId::RooCode,
-            context.resolve_client_path(ClientId::RooCode)?,
-            ClientId::RooCode.data().pattern,
-        );
-        push(
-            ClientId::RooCode,
-            home_dir
-                .join(".vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks"),
-            ClientId::RooCode.data().pattern,
-        );
-    }
-    if enabled.contains(&ClientId::KiloCode) {
-        push(
-            ClientId::KiloCode,
-            context.resolve_client_path(ClientId::KiloCode)?,
-            ClientId::KiloCode.data().pattern,
-        );
-        push(
-            ClientId::KiloCode,
-            home_dir.join(".vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks"),
-            ClientId::KiloCode.data().pattern,
-        );
-    }
-    if enabled.contains(&ClientId::Cline) {
-        push(
-            ClientId::Cline,
-            context.resolve_client_path(ClientId::Cline)?,
-            ClientId::Cline.data().pattern,
-        );
-        let mut roots = vec![
-            home_dir.join(
-                "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
-            ),
-            home_dir.join("AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/tasks"),
-            home_dir.join(".vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks"),
-        ];
-        if cfg!(target_os = "windows") && use_env_roots {
-            if let Some(app_data) = context.source_env_path("APPDATA") {
-                roots.push(app_data.join("Code/User/globalStorage/saoudrizwan.claude-dev/tasks"));
+    for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
+        if enabled.contains(&client_id) {
+            push(
+                client_id,
+                context.resolve_client_path(client_id)?,
+                client_id.data().pattern,
+            );
+            for root in additional_vscode_task_roots(home_dir, app_data, extension_id) {
+                push(client_id, root, client_id.data().pattern);
             }
-        }
-        for root in roots {
-            push(ClientId::Cline, root, ClientId::Cline.data().pattern);
         }
     }
 
@@ -1794,6 +1767,16 @@ fn scan_all_clients_with_env_strategy_inner(
     let mut tasks: Vec<(ClientId, String, &str)> = Vec::new();
     let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
 
+    // The Windows `%APPDATA%` root, shared by the Kimi Work and VS Code task
+    // roots: only on Windows with environment roots enabled.
+    let app_data = if cfg!(target_os = "windows") && use_env_roots {
+        std::env::var_os("APPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+
     for client_id in &enabled {
         if matches!(
             client_id,
@@ -1834,13 +1817,6 @@ fn scan_all_clients_with_env_strategy_inner(
             ClientId::Kimi,
             format!("{}/sessions", kimi_code_home),
         );
-        let app_data = if cfg!(target_os = "windows") && use_env_roots {
-            std::env::var_os("APPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        } else {
-            None
-        };
         for root in kimi_work_roots(Path::new(home_dir), app_data.as_deref()) {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Kimi, root);
         }
@@ -2038,65 +2014,17 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
-    if enabled.contains(&ClientId::RooCode) {
-        let local_path = ClientId::RooCode
-            .data()
-            .resolve_path_with_env_strategy(home_dir, use_env_roots);
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::RooCode,
-            local_path,
-        );
-
-        let server_path = format!(
-            "{}/.vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks",
-            home_dir
-        );
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::RooCode,
-            server_path,
-        );
-    }
-
-    if enabled.contains(&ClientId::KiloCode) {
-        let local_path = ClientId::KiloCode
-            .data()
-            .resolve_path_with_env_strategy(home_dir, use_env_roots);
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::KiloCode,
-            local_path,
-        );
-
-        let server_path = format!(
-            "{}/.vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks",
-            home_dir
-        );
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::KiloCode,
-            server_path,
-        );
-    }
-
-    if enabled.contains(&ClientId::Cline) {
-        let local_path = ClientId::Cline
-            .data()
-            .resolve_path_with_env_strategy(home_dir, use_env_roots);
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::Cline,
-            local_path,
-        );
-
-        for root in cline_additional_vscode_task_roots(home_dir, use_env_roots) {
-            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Cline, root);
+    for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
+        if enabled.contains(&client_id) {
+            let local_path = client_id
+                .data()
+                .resolve_path_with_env_strategy(home_dir, use_env_roots);
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, local_path);
+            for root in
+                additional_vscode_task_roots(Path::new(home_dir), app_data.as_deref(), extension_id)
+            {
+                push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, root);
+            }
         }
     }
 
@@ -2360,6 +2288,7 @@ pub fn scan_all_clients(home_dir: &str, clients: &[String]) -> ScanResult {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::collections::BTreeSet;
     use std::fs::{self, File};
     use std::io::Write;
     use tempfile::TempDir;
@@ -3040,27 +2969,28 @@ mod tests {
         index.write_all(b"{}").unwrap();
     }
 
+    /// One `ui_messages.json` per root of a VS Code extension's task tree:
+    /// the declared Linux path, macOS, Windows-under-home and VS Code Remote.
+    fn setup_mock_vscode_task_dirs(base: &std::path::Path, extension_id: &str) {
+        let tasks = format!("User/globalStorage/{extension_id}/tasks");
+        for (root, task) in [
+            (".config/Code", "task-local"),
+            ("Library/Application Support/Code", "task-macos"),
+            ("AppData/Roaming/Code", "task-windows"),
+            (".vscode-server/data", "task-server"),
+        ] {
+            let task_dir = base.join(root).join(&tasks).join(task);
+            fs::create_dir_all(&task_dir).unwrap();
+            File::create(task_dir.join("ui_messages.json")).unwrap();
+        }
+    }
+
     fn setup_mock_roocode_dir(base: &std::path::Path) {
-        let local = base
-            .join(".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/task-local");
-        let server = base.join(
-            ".vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks/task-server",
-        );
-        fs::create_dir_all(&local).unwrap();
-        fs::create_dir_all(&server).unwrap();
-        File::create(local.join("ui_messages.json")).unwrap();
-        File::create(server.join("ui_messages.json")).unwrap();
+        setup_mock_vscode_task_dirs(base, "rooveterinaryinc.roo-cline");
     }
 
     fn setup_mock_kilocode_dir(base: &std::path::Path) {
-        let local =
-            base.join(".config/Code/User/globalStorage/kilocode.kilo-code/tasks/task-local");
-        let server = base
-            .join(".vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks/task-server");
-        fs::create_dir_all(&local).unwrap();
-        fs::create_dir_all(&server).unwrap();
-        File::create(local.join("ui_messages.json")).unwrap();
-        File::create(server.join("ui_messages.json")).unwrap();
+        setup_mock_vscode_task_dirs(base, "kilocode.kilo-code");
     }
 
     fn setup_mock_cline_dir(base: &std::path::Path) {
@@ -6289,7 +6219,7 @@ mod tests {
             &["roocode".to_string()],
             false,
         );
-        assert_eq!(result.get(ClientId::RooCode).len(), 2);
+        assert_eq!(result.get(ClientId::RooCode).len(), 4);
         assert!(result
             .get(ClientId::RooCode)
             .iter()
@@ -6307,7 +6237,7 @@ mod tests {
             &["kilocode".to_string()],
             false,
         );
-        assert_eq!(result.get(ClientId::KiloCode).len(), 2);
+        assert_eq!(result.get(ClientId::KiloCode).len(), 4);
         assert!(result
             .get(ClientId::KiloCode)
             .iter()
@@ -6330,6 +6260,268 @@ mod tests {
             .get(ClientId::Cline)
             .iter()
             .all(|p| p.ends_with("ui_messages.json")));
+    }
+
+    /// `<code_root>/User/globalStorage/<extension>/tasks/<task>/ui_messages.json`
+    fn vscode_task_file(base: &Path, code_root: &str, extension_id: &str, task: &str) -> PathBuf {
+        let file = base
+            .join(code_root)
+            .join("User/globalStorage")
+            .join(extension_id)
+            .join("tasks")
+            .join(task)
+            .join("ui_messages.json");
+        touch(&file);
+        file
+    }
+
+    /// Upstream #1406: every `Code` root of Roo, Kilo Code and Cline is
+    /// scanned. Each root gets a home of its own with that root as the only
+    /// source, so a miss is a 0 and no other root can cover for it. Both
+    /// entries are asserted: the apps scan through the source context, which
+    /// the upstream patch did not touch.
+    #[test]
+    #[serial]
+    fn test_vscode_task_roots_are_each_scanned_by_both_entries() {
+        let mut env = EnvGuard::capture(&["APPDATA"]);
+        env.remove("APPDATA");
+        for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
+            for code_root in [
+                ".config/Code",
+                "Library/Application Support/Code",
+                "AppData/Roaming/Code",
+                ".vscode-server/data",
+            ] {
+                let dir = TempDir::new().unwrap();
+                let home = dir.path();
+                let expected = vscode_task_file(home, code_root, extension_id, "task-only");
+                let results =
+                    scan_both_entries(home, client_id.as_str(), false, &ScannerSettings::default());
+                for (entry, result) in results.iter().enumerate() {
+                    let files: Vec<PathBuf> = result
+                        .get(client_id)
+                        .iter()
+                        .map(|file| fs::canonicalize(file).unwrap())
+                        .collect();
+                    assert_eq!(
+                        files,
+                        vec![fs::canonicalize(&expected).unwrap()],
+                        "{client_id:?} root {code_root:?}, entry {entry} (0 = env strategy, 1 = source context)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The root list is finite: Insiders, Cursor, VSCodium and Remote-Insiders
+    /// trees are not scanned, with the listed macOS root present as a control
+    /// that proves the fixture is live.
+    #[test]
+    #[serial]
+    fn test_vscode_task_roots_do_not_include_unlisted_variants() {
+        let mut env = EnvGuard::capture(&["APPDATA"]);
+        env.remove("APPDATA");
+        for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
+            let dir = TempDir::new().unwrap();
+            let home = dir.path();
+            let listed = vscode_task_file(
+                home,
+                "Library/Application Support/Code",
+                extension_id,
+                "task-listed",
+            );
+            for code_root in [
+                "Library/Application Support/Code - Insiders",
+                "Library/Application Support/Cursor",
+                "Library/Application Support/VSCodium",
+                "AppData/Roaming/Code - Insiders",
+                "AppData/Roaming/Cursor",
+                ".config/Code - Insiders",
+                ".config/Cursor",
+                ".cursor-server/data",
+                ".vscode-server-insiders/data",
+            ] {
+                vscode_task_file(home, code_root, extension_id, "task-unlisted");
+            }
+            let results =
+                scan_both_entries(home, client_id.as_str(), false, &ScannerSettings::default());
+            for (entry, result) in results.iter().enumerate() {
+                let files = result.get(client_id);
+                assert_eq!(
+                    files.len(),
+                    1,
+                    "{client_id:?} entry {entry} scanned an unlisted root: {files:?}"
+                );
+                assert_eq!(
+                    fs::canonicalize(&files[0]).unwrap(),
+                    fs::canonicalize(&listed).unwrap()
+                );
+            }
+        }
+    }
+
+    /// A root that is both derived and handed in as an extra scan path yields
+    /// each of its files once. This observes only the file count, not the
+    /// number of scan tasks: root-level dedup (`seen_scan_roots`) and
+    /// file-level dedup (canonical paths in the aggregation) each mask the
+    /// other, so removing either alone cannot fail it; only removing both can.
+    #[test]
+    #[serial]
+    fn test_vscode_task_root_reached_by_default_and_extra_path_counts_once() {
+        let mut env = EnvGuard::capture(&["APPDATA"]);
+        env.remove("APPDATA");
+        for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
+            let dir = TempDir::new().unwrap();
+            let home = dir.path();
+            vscode_task_file(
+                home,
+                "Library/Application Support/Code",
+                extension_id,
+                "task-macos",
+            );
+            vscode_task_file(home, ".vscode-server/data", extension_id, "task-server");
+            let settings = ScannerSettings {
+                extra_scan_paths: BTreeMap::from([(
+                    client_id.as_str().to_string(),
+                    vec![home
+                        .join("Library/Application Support/Code/User/globalStorage")
+                        .join(extension_id)
+                        .join("tasks")],
+                )]),
+                ..Default::default()
+            };
+            for (entry, result) in scan_both_entries(home, client_id.as_str(), false, &settings)
+                .iter()
+                .enumerate()
+            {
+                let files = result.get(client_id);
+                assert_eq!(
+                    files.len(),
+                    2,
+                    "{client_id:?} entry {entry}: a doubly reached root must count once: {files:?}"
+                );
+            }
+        }
+    }
+
+    /// `excluded_scan_paths` applies to the new macOS root in the source-context
+    /// scanner (and the env-strategy one), both when the entry is the root
+    /// itself and when it is a task directory below it. Exclusions are not
+    /// applied where roots are derived: they prune the walk (`run_scan_tasks`
+    /// -> `scan_directory_path(.., exclusions.for_client)`) and are re-checked
+    /// on the whole result (`exclusions.sweep`). The unexcluded
+    /// `.vscode-server` task is the control.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_apply_to_the_new_vscode_roots() {
+        let mut env = EnvGuard::capture(&["APPDATA"]);
+        env.remove("APPDATA");
+        for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
+            let dir = TempDir::new().unwrap();
+            let home = dir.path();
+            let code_root = "Library/Application Support/Code";
+            let macos = vscode_task_file(home, code_root, extension_id, "task-macos");
+            let nested = vscode_task_file(home, code_root, extension_id, "task-nested");
+            let server = vscode_task_file(home, ".vscode-server/data", extension_id, "task-server");
+            let macos_tasks = macos.parent().unwrap().parent().unwrap();
+            assert!(macos_tasks.ends_with("tasks"));
+            let nested_dir = nested.parent().unwrap();
+
+            let scan = |excluded: &[&Path]| -> Vec<BTreeSet<PathBuf>> {
+                let settings = ScannerSettings {
+                    excluded_scan_paths: exclude(client_id.as_str(), excluded),
+                    ..Default::default()
+                };
+                scan_both_entries(home, client_id.as_str(), false, &settings)
+                    .iter()
+                    .map(|result| {
+                        result
+                            .get(client_id)
+                            .iter()
+                            .map(|file| fs::canonicalize(file).unwrap())
+                            .collect()
+                    })
+                    .collect()
+            };
+            let canon = |paths: &[&Path]| -> BTreeSet<PathBuf> {
+                paths
+                    .iter()
+                    .map(|path| fs::canonicalize(path).unwrap())
+                    .collect()
+            };
+
+            for (excluded, expected, what) in [
+                (
+                    vec![],
+                    canon(&[&macos, &nested, &server]),
+                    "no exclusion (the fixture is inert if this fails)",
+                ),
+                (vec![macos_tasks], canon(&[&server]), "the root itself"),
+                (
+                    vec![nested_dir],
+                    canon(&[&macos, &server]),
+                    "a task directory below the root",
+                ),
+            ] {
+                for (entry, found) in scan(&excluded).iter().enumerate() {
+                    assert_eq!(
+                        *found, expected,
+                        "{client_id:?} excluding {what}, entry {entry} (0 = env strategy, 1 = source context)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `%APPDATA%\Code` is a Windows root: read from the captured source
+    /// environment by the context scanner and from the process environment by
+    /// the env-strategy one, and only with environment roots on.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "windows")]
+    fn test_vscode_task_roots_include_appdata_code_on_windows() {
+        let mut env = EnvGuard::capture(&["APPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]);
+        env.remove("XDG_CONFIG_HOME");
+        env.remove("XDG_DATA_HOME");
+        for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
+            let dir = TempDir::new().unwrap();
+            let home = dir.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            let app_data = dir.path().join("roaming");
+            let expected = vscode_task_file(&app_data, "Code", extension_id, "task-appdata");
+            env.set("APPDATA", &app_data);
+
+            for (entry, result) in
+                scan_both_entries(&home, client_id.as_str(), true, &ScannerSettings::default())
+                    .iter()
+                    .enumerate()
+            {
+                let files: Vec<PathBuf> = result
+                    .get(client_id)
+                    .iter()
+                    .map(|file| fs::canonicalize(file).unwrap())
+                    .collect();
+                assert_eq!(
+                    files,
+                    vec![fs::canonicalize(&expected).unwrap()],
+                    "{client_id:?} entry {entry}: %APPDATA%\\Code root"
+                );
+            }
+            for (entry, result) in scan_both_entries(
+                &home,
+                client_id.as_str(),
+                false,
+                &ScannerSettings::default(),
+            )
+            .iter()
+            .enumerate()
+            {
+                assert!(
+                    result.get(client_id).is_empty(),
+                    "{client_id:?} entry {entry}: %APPDATA% read with environment roots off"
+                );
+            }
+        }
     }
 
     #[test]

@@ -177,7 +177,8 @@ const REMOTE_DOMAIN: &[u8] = b"tokenbar-remote-source-context-v1";
 /// 2: Kimi Work scan roots under the desktop app-data tree (upstream #1170).
 /// 3: the `pi` client no longer derives `~/.omp/agent/sessions` as a scan
 ///    root; that tree belongs to the new `omp` client (upstream #1161).
-const RESOLVER_CONTRACT_VERSION: u32 = 3;
+/// 4: Roo/Kilo/Cline VS Code roots (upstream #1406).
+const RESOLVER_CONTRACT_VERSION: u32 = 4;
 
 const ENV_HOME: &str = "HOME";
 const ENV_XDG_DATA_HOME: &str = "XDG_DATA_HOME";
@@ -472,16 +473,19 @@ impl ResolvedLocalSourceContext {
             ENV_XDG_CONFIG_HOME,
             ResolvedPathInput::unavailable(platform_config_dir.clone()),
         );
-        // On Windows the injected platform roots *are* the roots the Cline and
-        // Hermes lanes reach for, so leaving these two keys derived from
-        // `home_dir` would skip an approved but redirected profile entirely:
+        // On Windows the injected platform roots *are* the roots the Cline,
+        // Roo Code, Kilo Code and Kimi Work lanes (`APPDATA`) and the Hermes
+        // lane (`LOCALAPPDATA`) reach for, so leaving these two keys derived
+        // from `home_dir` would skip an approved but redirected profile entirely:
         // `fallback_source_env_path` would hand back `home/AppData/Roaming`
         // and `home/AppData/Local`, which the scanner already probes directly,
         // so the caller's roots would never be scanned at all.
         //
-        // Only Windows, deliberately. Both consumers are guarded by
-        // `cfg!(target_os = "windows")` (`scanner.rs`), so elsewhere these keys
-        // are never read and remapping them would churn the context identity —
+        // Only Windows, deliberately. Every consumer is guarded by
+        // `cfg!(target_os = "windows")` at its call site in `scanner.rs` (the
+        // `APPDATA` lookup shared by the Roo, Kilo Code and Cline roots, the
+        // Kimi Work one, and the Hermes `LOCALAPPDATA` one), so elsewhere these
+        // keys are never read and remapping them would churn the context identity —
         // what an approved source-scope token binds to — for no effect. Worse,
         // on macOS it would aim `APPDATA` at a real `Application Support` tree
         // instead of the inert `home/AppData/Roaming` placeholder it is now.
@@ -2799,15 +2803,25 @@ mod tests {
         // Codex's pattern `*.jsonl` -> `*.jsonl*` (its `.jsonl.zst` archives,
         // upstream #1423) moved it again: macOS measured on Apple hardware,
         // Linux in a `rust:1.96.1` aarch64 container.
+        //
+        // `RESOLVER_CONTRACT_VERSION` 3 -> 4 (Roo/Kilo/Cline VS Code roots,
+        // upstream #1406) moved it once more, and only through that field. The
+        // macOS value was measured on Apple hardware under Rust 1.96.1. The
+        // Linux value was first computed on a Mac with every `target_os`
+        // branch in `src/` switched (`"linux"` -> `all()`, `"macos"` ->
+        // `any()`), because the `rust:1.96.1` container run hung; that method
+        // reproduced the previous Linux value above at version 3. It was then
+        // measured by CI's ubuntu-latest leg (tokscale-core PR #82, run
+        // 41516068307), which passed this assertion.
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:20cbed559a4e5993dcf90e11feb44f430fbc421fe8c00a7bef8b4fc58c3c989a"
+            "sc1:360fd836c99bf9f0a5e03995ad85204979ce2720351feee2eb832c522f269c6d"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:b624585ff7382f112ada7ed8330400e7ceabb782e27cf25e9ad7c2793283718c"
+            "sc1:96762ac9b6eb2bd11f19882997979658269cd6a44fbd092de6c803f152f78591"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely
@@ -2877,9 +2891,12 @@ mod tests {
     }
 
     /// A redirected Windows profile: the approved platform roots are nowhere
-    /// under `home`. The Cline (`APPDATA`) and Hermes (`LOCALAPPDATA`) lanes
-    /// must reach the approved roots, not a guess derived from `home`, which
-    /// the scanner already probes on its own.
+    /// under `home`. The Cline, Roo Code, Kilo Code and Kimi Work
+    /// (`APPDATA`) and Hermes (`LOCALAPPDATA`) lanes read these keys through
+    /// `source_env_path`, so they must map to the approved roots, not a guess
+    /// derived from `home`, which the scanner already probes on its own. This
+    /// test checks that mapping; the Roo Code lane reaching the redirected
+    /// root is checked by `remote_explicit_appdata_code_root_is_scanned`.
     #[cfg(windows)]
     #[test]
     fn remote_explicit_roots_replace_home_derived_appdata() {
@@ -2910,6 +2927,45 @@ mod tests {
         assert_ne!(
             context.source_env_path(ENV_LOCALAPPDATA),
             Some(home.join("AppData/Local").as_path())
+        );
+    }
+
+    /// A Roo Code task under `<APPDATA>/Code` of a redirected remote Windows
+    /// profile (outside `home`) is found by the context scanner, which reads
+    /// `APPDATA` through `source_env_path`.
+    #[cfg(windows)]
+    #[test]
+    fn remote_explicit_appdata_code_root_is_scanned() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("profile/home");
+        let config = dir.path().join("redirected/Roaming");
+        let data = dir.path().join("redirected/Local");
+        let task =
+            config.join("Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/task-redirected");
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("ui_messages.json"), "[]").unwrap();
+        let context = ResolvedLocalSourceContext::from_remote_explicit(
+            &home,
+            &config,
+            &data,
+            &dir.path().join("syrtis-cache"),
+            &ScannerSettings::default(),
+        )
+        .unwrap();
+
+        let scan = crate::scanner::scan_all_clients_with_source_context(
+            &context,
+            &["roocode".to_string()],
+        )
+        .unwrap();
+        let found: Vec<PathBuf> = scan
+            .get(ClientId::RooCode)
+            .iter()
+            .map(|file| fs::canonicalize(file).unwrap())
+            .collect();
+        assert_eq!(
+            found,
+            vec![fs::canonicalize(task.join("ui_messages.json")).unwrap()]
         );
     }
 
