@@ -158,7 +158,7 @@ pub(crate) fn parse_roo_kilo_file(path: &Path, source: &str) -> Vec<UnifiedMessa
         // also what the extension writes when *it* has no rate for the model,
         // indistinguishable here from a free request: marking it authoritative
         // would submit a known-priced request as a complete $0, so zero is
-        // left for repricing (`CostProvenance::WhenPositive`).
+        // left for repricing (`has_authoritative_cost` stays false).
         if payload.cost_reported && payload.cost > 0.0 {
             message.mark_provider_reported_cost();
         }

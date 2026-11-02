@@ -2807,12 +2807,12 @@ mod tests {
         // `RESOLVER_CONTRACT_VERSION` 3 -> 4 (Roo/Kilo/Cline VS Code roots,
         // upstream #1406) moved it once more, and only through that field. The
         // macOS value was measured on Apple hardware under Rust 1.96.1. The
-        // Linux value was NOT measured on Linux: the `rust:1.96.1` container
-        // run hung and was abandoned, so it was computed on a Mac with every
-        // `target_os` branch in `src/` switched (`"linux"` -> `all()`,
-        // `"macos"` -> `any()`), a method checked first on this tree at
-        // version 3, where it reproduced the previous Linux value above. CI's
-        // Linux leg is the confirmation.
+        // Linux value was first computed on a Mac with every `target_os`
+        // branch in `src/` switched (`"linux"` -> `all()`, `"macos"` ->
+        // `any()`), because the `rust:1.96.1` container run hung; that method
+        // reproduced the previous Linux value above at version 3. It was then
+        // measured by CI's ubuntu-latest leg (tokscale-core PR #82, run
+        // 41516068307), which passed this assertion.
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
