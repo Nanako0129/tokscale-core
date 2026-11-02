@@ -177,7 +177,8 @@ const REMOTE_DOMAIN: &[u8] = b"tokenbar-remote-source-context-v1";
 /// 2: Kimi Work scan roots under the desktop app-data tree (upstream #1170).
 /// 3: the `pi` client no longer derives `~/.omp/agent/sessions` as a scan
 ///    root; that tree belongs to the new `omp` client (upstream #1161).
-const RESOLVER_CONTRACT_VERSION: u32 = 3;
+/// 4: Roo/Kilo/Cline VS Code roots (upstream #1406).
+const RESOLVER_CONTRACT_VERSION: u32 = 4;
 
 const ENV_HOME: &str = "HOME";
 const ENV_XDG_DATA_HOME: &str = "XDG_DATA_HOME";
@@ -2799,15 +2800,25 @@ mod tests {
         // Codex's pattern `*.jsonl` -> `*.jsonl*` (its `.jsonl.zst` archives,
         // upstream #1423) moved it again: macOS measured on Apple hardware,
         // Linux in a `rust:1.96.1` aarch64 container.
+        //
+        // `RESOLVER_CONTRACT_VERSION` 3 -> 4 (Roo/Kilo/Cline VS Code roots,
+        // upstream #1406) moved it once more, and only through that field. The
+        // macOS value was measured on Apple hardware under Rust 1.96.1. The
+        // Linux value was NOT measured on Linux: the `rust:1.96.1` container
+        // run hung and was abandoned, so it was computed on a Mac with every
+        // `target_os` branch in `src/` switched (`"linux"` -> `all()`,
+        // `"macos"` -> `any()`), a method checked first on this tree at
+        // version 3, where it reproduced the previous Linux value above. CI's
+        // Linux leg is the confirmation.
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:20cbed559a4e5993dcf90e11feb44f430fbc421fe8c00a7bef8b4fc58c3c989a"
+            "sc1:360fd836c99bf9f0a5e03995ad85204979ce2720351feee2eb832c522f269c6d"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:b624585ff7382f112ada7ed8330400e7ceabb782e27cf25e9ad7c2793283718c"
+            "sc1:96762ac9b6eb2bd11f19882997979658269cd6a44fbd092de6c803f152f78591"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely
