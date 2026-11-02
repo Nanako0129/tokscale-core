@@ -14217,6 +14217,134 @@ mod tests {
         assert_eq!(counted.messages[0].session_id, "session-bom");
     }
 
+    // Droid parser_version 2 -> 3: each apportioned record carries its own
+    // reply count. A finished session's settings.json and transcript never
+    // change, so its fingerprint keeps matching; only the identity bump can
+    // deliver per-date counts to a v2 entry that parked every reply on the
+    // first record. Seed that v2 entry under the current fingerprint and
+    // require both cached lanes to rebuild it. The control step shows the
+    // seeded counts are served while the entry carries the current identity,
+    // so the harness is not inert.
+    #[test]
+    #[serial_test::serial]
+    fn test_droid_parser_v2_same_fingerprint_rebuilds_per_date_reply_counts() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let sessions_dir = source_home.path().join(".factory/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("droid-dates.settings.json"),
+            r#"{"model":"custom:Kimi-K3-0","tokenUsage":{"inputTokens":1000}}"#,
+        )
+        .unwrap();
+        let assistant = |timestamp: &str| {
+            format!(
+                r#"{{"type":"message","timestamp":"{timestamp}","message":{{"role":"assistant","content":"xxxxxxxxxx"}}}}"#
+            )
+        };
+        // Two replies on one day (a second apart), one three days later.
+        std::fs::write(
+            sessions_dir.join("droid-dates.jsonl"),
+            [
+                assistant("2026-08-07T12:00:00Z"),
+                assistant("2026-08-07T12:00:01Z"),
+                assistant("2026-08-10T12:00:00Z"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["droid".to_string()];
+        let scan_result = scan_test_sources(
+            source_home.path(),
+            &clients,
+            &scanner::ScannerSettings::default(),
+        );
+        let path = scan_result.get(ClientId::Droid)[0].clone();
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Droid);
+        let per_date = |messages: &[UnifiedMessage]| {
+            let mut counts: std::collections::BTreeMap<String, i32> = Default::default();
+            for message in messages {
+                *counts.entry(message.date.clone()).or_default() += message.message_count;
+            }
+            counts.into_values().collect::<Vec<_>>()
+        };
+
+        // The v2 entry: the same records, every reply on the first one.
+        let seed_v2_entry = |relabel_as_v2: bool| {
+            let mut messages = sessions::droid::parse_droid_file(&path);
+            assert_eq!(
+                per_date(&messages),
+                vec![2, 1],
+                "the current parse is per date"
+            );
+            messages.sort_by_key(|m| m.timestamp);
+            for (index, message) in messages.iter_mut().enumerate() {
+                message.message_count = if index == 0 { 3 } else { 0 };
+            }
+            assert_eq!(per_date(&messages), vec![3, 0]);
+            let mut cache = message_cache::SourceMessageCache::load();
+            cache.insert(message_cache::CachedSourceEntry::new(
+                identity,
+                &path,
+                message_cache::SourceFingerprint::from_droid_path(&path).unwrap(),
+                messages,
+                Vec::new(),
+                None,
+            ));
+            cache.save_if_dirty();
+            if relabel_as_v2 {
+                message_cache::set_shard_parser_version_for_test(identity, 2);
+            }
+        };
+        let stream = || {
+            let mut streamed = Vec::new();
+            scan_messages_streaming(
+                home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                &|_m: &UnifiedMessage| true,
+                &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+            );
+            streamed
+        };
+        let materialize = || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                home,
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                None,
+            )
+        };
+
+        // Control: at the current identity the seeded first-record counts hit.
+        seed_v2_entry(false);
+        assert_eq!(
+            per_date(&stream()),
+            vec![3, 0],
+            "control: stale counts served"
+        );
+
+        seed_v2_entry(true);
+        assert_eq!(per_date(&stream()), vec![2, 1], "streaming lane rebuilt");
+
+        seed_v2_entry(true);
+        assert_eq!(
+            per_date(&materialize()),
+            vec![2, 1],
+            "materialized lane rebuilt"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_parse_local_clients_kimi_deduplicates_repeated_status_updates() {
