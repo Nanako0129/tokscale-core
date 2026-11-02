@@ -2426,7 +2426,9 @@ fn read_shard_with_limit(
             .with_limit(max_shard_bytes)
             .deserialize::<Vec<format3::CachedSourceEntry>>(&envelope.payload)
         {
-            Ok(entries) => ShardReadStatus::Loaded(entries.into_iter().map(Into::into).collect()),
+            Ok(entries) => {
+                ShardReadStatus::Loaded(entries.into_iter().map(Into::into).collect())
+            }
             Err(error) => ShardReadStatus::Invalid(error.to_string()),
         };
     }
@@ -5091,9 +5093,13 @@ mod tests {
     /// protocol and re-priced a cost the extension had reported. The stale
     /// shard is written at the literal shipped version 2 (not
     /// `parser_version - 1`) under the unchanged task's current fingerprint,
-    /// and both the streaming and the materialized lane must rebuild it and
-    /// rewrite the shard at version 3. One shard per client: the three have
-    /// separate namespaces, versions and (for Cline) input rules.
+    /// and every cached lane must rebuild it and rewrite the shard at version
+    /// 3: the env-strategy streaming and materialized lanes, and the
+    /// source-context streaming lane both apps report through. (The fork has
+    /// no cached materialized lane over a source context: its count lane,
+    /// `parse_local_clients_with_source_context`, parses without the cache.)
+    /// One shard per client: the three have separate namespaces, versions and
+    /// (for Cline) input rules.
     #[test]
     #[serial_test::serial]
     fn test_roo_family_v2_same_fingerprint_shard_is_rebuilt_by_every_lane() {
@@ -5125,21 +5131,37 @@ mod tests {
 
             // Cache keys preserve the scanner-returned path spelling, which on
             // Windows differs from `TempDir::join`'s (`/` against `\`) and
-            // would hash to another shard. Seed under the scanner's spelling.
+            // would hash to another shard, and the two scanners spell a root
+            // differently from each other. Each lane is therefore seeded under
+            // the spelling of the scanner it uses.
             let clients = [name.to_string()];
-            let scanned = crate::scanner::scan_all_clients_with_scanner_settings(
-                home,
-                &clients,
+            let settings = crate::scanner::ScannerSettings::default();
+            let context = crate::ResolvedLocalSourceContext::capture(
+                Some(source_home.path().to_path_buf()),
                 false,
-                &crate::scanner::ScannerSettings::default(),
+                settings.clone(),
+            )
+            .unwrap();
+            let env_scan = crate::scanner::scan_all_clients_with_scanner_settings(
+                home, &clients, false, &settings,
             );
-            let scanned = scanned.get(client);
-            assert_eq!(scanned.len(), 1, "{name}: the scanner must find the task");
-            assert_eq!(
-                std::fs::canonicalize(&scanned[0]).unwrap(),
-                std::fs::canonicalize(&written).unwrap()
-            );
-            let path = scanned[0].clone();
+            let context_scan =
+                crate::scanner::scan_all_clients_with_source_context(&context, &clients).unwrap();
+            let scanned_path = |scan: &crate::scanner::ScanResult, which: &str| {
+                let found = scan.get(client);
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "{name}: the {which} scanner must find the task"
+                );
+                assert_eq!(
+                    std::fs::canonicalize(&found[0]).unwrap(),
+                    std::fs::canonicalize(&written).unwrap()
+                );
+                found[0].clone()
+            };
+            let env_path = scanned_path(&env_scan, "env-strategy");
+            let context_path = scanned_path(&context_scan, "source-context");
 
             let current = CacheIdentity::for_client(client);
             assert_eq!(current.parser_version, 3, "{name}");
@@ -5147,16 +5169,19 @@ mod tests {
                 namespace: current.namespace,
                 parser_version: 2,
             };
-            // Both lanes fingerprint a Roo-family task with its history
+            // Every lane fingerprints a Roo-family task with its history
             // sibling folded in (`from_roo_path` / `check_roo_path_samples_only`);
             // seed that same fingerprint so only the version gate separates
             // the v2 entry from a cache hit.
-            let fingerprint = SourceFingerprint::from_roo_path(&path).unwrap();
-            let stale_path = shard_path(
-                &cache_shard_dir().unwrap(),
-                &CacheKey::new(current, &path).shard(),
-            );
-            let seed_v2_shard = || {
+            let fingerprint = SourceFingerprint::from_roo_path(&env_path).unwrap();
+            let shard_for = |path: &Path| {
+                shard_path(
+                    &cache_shard_dir().unwrap(),
+                    &CacheKey::new(current, path).shard(),
+                )
+            };
+            let seed_v2_shard = |path: &Path| {
+                let stale_path = shard_for(path);
                 // What the v2 parser cached: input gross of cache, provider
                 // from the wire protocol, cost left to the estimator.
                 let stale_message = UnifiedMessage::new(
@@ -5176,7 +5201,7 @@ mod tests {
                 );
                 let stale_entry = CachedSourceEntry::new(
                     stale,
-                    &path,
+                    path,
                     fingerprint.clone(),
                     vec![stale_message],
                     Vec::new(),
@@ -5200,12 +5225,9 @@ mod tests {
                     matches!(read_shard(&stale_path, current), ShardReadStatus::Stale),
                     "{name}: a version-2 shard must be Stale to the current parser"
                 );
-                assert_eq!(
-                    SourceFingerprint::from_roo_path(&path).unwrap(),
-                    fingerprint
-                );
+                assert_eq!(SourceFingerprint::from_roo_path(path).unwrap(), fingerprint);
             };
-            let assert_rebuilt = |messages: &[UnifiedMessage], lane: &str| {
+            let assert_rebuilt = |messages: &[UnifiedMessage], path: &Path, lane: &str| {
                 assert_eq!(messages.len(), 1, "{name} {lane}");
                 let message = &messages[0];
                 assert_eq!(
@@ -5216,7 +5238,7 @@ mod tests {
                 assert_eq!(message.provider_id, "anthropic", "{name} {lane}");
                 assert!(message.has_authoritative_cost(), "{name} {lane}");
                 // The rebuilt entry replaces the v2 shard at the current version.
-                match read_shard(&stale_path, current) {
+                match read_shard(&shard_for(path), current) {
                     ShardReadStatus::Loaded(entries) => {
                         assert_eq!(entries.len(), 1, "{name} {lane}");
                         assert_eq!(entries[0].parser_version, 3, "{name} {lane}");
@@ -5227,29 +5249,41 @@ mod tests {
                 }
             };
 
-            seed_v2_shard();
+            seed_v2_shard(&env_path);
             let mut streamed = Vec::new();
             crate::scan_messages_streaming(
                 home,
                 &clients,
                 None,
                 false,
-                &crate::scanner::ScannerSettings::default(),
+                &settings,
                 &|_m: &UnifiedMessage| true,
                 &mut |m: &UnifiedMessage| streamed.push(m.clone()),
             );
-            assert_rebuilt(&streamed, "streaming lane");
+            assert_rebuilt(&streamed, &env_path, "streaming lane");
 
-            seed_v2_shard();
+            seed_v2_shard(&env_path);
             let materialized = crate::parse_all_messages_with_pricing_with_env_strategy(
-                home,
+                home, &clients, None, false, &settings, None,
+            );
+            assert_rebuilt(&materialized, &env_path, "materialized lane");
+
+            seed_v2_shard(&context_path);
+            let mut context_streamed = Vec::new();
+            crate::scan_messages_streaming_with_context(
+                &context,
                 &clients,
                 None,
-                false,
-                &crate::scanner::ScannerSettings::default(),
                 None,
+                &|_m: &UnifiedMessage| true,
+                &mut |m: &UnifiedMessage| context_streamed.push(m.clone()),
+            )
+            .unwrap();
+            assert_rebuilt(
+                &context_streamed,
+                &context_path,
+                "source-context streaming lane",
             );
-            assert_rebuilt(&materialized, "materialized lane");
         }
         restore_cache_env(prev_env);
     }
@@ -5469,12 +5503,7 @@ mod tests {
                 assert_eq!(entries.len(), 1, "the format-3 payload must decode");
                 let tokens = &entries[0].messages[0].tokens;
                 assert_eq!(
-                    (
-                        tokens.input,
-                        tokens.output,
-                        tokens.cache_read,
-                        tokens.cache_write
-                    ),
+                    (tokens.input, tokens.output, tokens.cache_read, tokens.cache_write),
                     (11, 22, 33, 44),
                     "every pre-existing lane must survive the layout change"
                 );
@@ -5503,12 +5532,7 @@ mod tests {
         let source = write_temp_file(b"compacted claude transcript\n");
         let claude = CacheIdentity::for_client(ClientId::Claude);
 
-        seed_format3_shard(
-            claude,
-            source.path(),
-            "msg_kept:req_kept",
-            &["msg_kept:req_kept"],
-        );
+        seed_format3_shard(claude, source.path(), "msg_kept:req_kept", &["msg_kept:req_kept"]);
 
         let loaded = SourceMessageCache::load();
         let history = loaded.retainable_history(claude, source.path());
@@ -7220,7 +7244,11 @@ mod tests {
         // fingerprint unchanged since the `session`-only parse must re-parse
         // instead of replaying the dropped-empty result.
         assert_eq!(parser_version(ClientId::OpenCode), 2);
-        for client in [ClientId::Amp, ClientId::MiMoCode, ClientId::Mux] {
+        for client in [
+            ClientId::Amp,
+            ClientId::MiMoCode,
+            ClientId::Mux,
+        ] {
             assert_eq!(
                 parser_version(client),
                 2,

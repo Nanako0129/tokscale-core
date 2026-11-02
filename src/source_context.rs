@@ -473,16 +473,19 @@ impl ResolvedLocalSourceContext {
             ENV_XDG_CONFIG_HOME,
             ResolvedPathInput::unavailable(platform_config_dir.clone()),
         );
-        // On Windows the injected platform roots *are* the roots the Cline and
-        // Hermes lanes reach for, so leaving these two keys derived from
-        // `home_dir` would skip an approved but redirected profile entirely:
+        // On Windows the injected platform roots *are* the roots the Cline,
+        // Roo Code, Kilo Code and Kimi Work lanes (`APPDATA`) and the Hermes
+        // lane (`LOCALAPPDATA`) reach for, so leaving these two keys derived
+        // from `home_dir` would skip an approved but redirected profile entirely:
         // `fallback_source_env_path` would hand back `home/AppData/Roaming`
         // and `home/AppData/Local`, which the scanner already probes directly,
         // so the caller's roots would never be scanned at all.
         //
-        // Only Windows, deliberately. Both consumers are guarded by
-        // `cfg!(target_os = "windows")` (`scanner.rs`), so elsewhere these keys
-        // are never read and remapping them would churn the context identity —
+        // Only Windows, deliberately. Every consumer is guarded by
+        // `cfg!(target_os = "windows")` at its call site in `scanner.rs` (the
+        // `APPDATA` lookup shared by the Roo, Kilo Code and Cline roots, the
+        // Kimi Work one, and the Hermes `LOCALAPPDATA` one), so elsewhere these
+        // keys are never read and remapping them would churn the context identity —
         // what an approved source-scope token binds to — for no effect. Worse,
         // on macOS it would aim `APPDATA` at a real `Application Support` tree
         // instead of the inert `home/AppData/Roaming` placeholder it is now.
@@ -2888,9 +2891,10 @@ mod tests {
     }
 
     /// A redirected Windows profile: the approved platform roots are nowhere
-    /// under `home`. The Cline (`APPDATA`) and Hermes (`LOCALAPPDATA`) lanes
-    /// must reach the approved roots, not a guess derived from `home`, which
-    /// the scanner already probes on its own.
+    /// under `home`. The Cline, Roo Code, Kilo Code and Kimi Work
+    /// (`APPDATA`) and Hermes (`LOCALAPPDATA`) lanes must reach the approved
+    /// roots, not a guess derived from `home`, which the scanner already
+    /// probes on its own.
     #[cfg(windows)]
     #[test]
     fn remote_explicit_roots_replace_home_derived_appdata() {

@@ -964,29 +964,24 @@ const VSCODE_TASK_EXTENSIONS: [(ClientId, &str); 3] = [
 ];
 
 /// Task roots for a VS Code extension beyond the client's declared (Linux
-/// `~/.config/Code`) path: macOS `~/Library/Application Support/Code`, Windows
-/// `%APPDATA%/Code` (only with environment roots on Windows), the same tree
-/// under `~/AppData/Roaming`, and VS Code Remote's `~/.vscode-server` (upstream
-/// #1406). Both scanners call this, so a root added here reaches the
-/// source-context scanner the apps use as well as the env-strategy one.
+/// `~/.config/Code`) path: macOS `~/Library/Application Support/Code`, the same
+/// tree under `~/AppData/Roaming`, VS Code Remote's `~/.vscode-server`
+/// (upstream #1406), and `<app_data>/Code` when `app_data` is given. The caller
+/// guards `app_data` (Windows with environment roots only), as for
+/// [`kimi_work_roots`]. Both scanners call this, so a root added here reaches
+/// the source-context scanner the apps use as well as the env-strategy one.
 fn additional_vscode_task_roots(
     home_dir: &Path,
-    use_env_roots: bool,
-    app_data: Option<PathBuf>,
+    app_data: Option<&Path>,
     extension_id: &str,
 ) -> Vec<PathBuf> {
     let tasks = format!("User/globalStorage/{extension_id}/tasks");
     let mut roots = vec![home_dir
         .join("Library/Application Support/Code")
         .join(&tasks)];
-
-    if cfg!(target_os = "windows") && use_env_roots {
-        roots.extend(app_data.map(|app_data| app_data.join("Code").join(&tasks)));
-    }
-
+    roots.extend(app_data.map(|app_data| app_data.join("Code").join(&tasks)));
     roots.push(home_dir.join("AppData/Roaming/Code").join(&tasks));
     roots.push(home_dir.join(".vscode-server/data").join(&tasks));
-
     roots
 }
 
@@ -1559,6 +1554,11 @@ fn scan_all_clients_resolved_inner(
         }
     }
 
+    let vscode_app_data = if cfg!(target_os = "windows") && use_env_roots {
+        context.source_env_path("APPDATA")
+    } else {
+        None
+    };
     for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
         if enabled.contains(&client_id) {
             push(
@@ -1566,10 +1566,7 @@ fn scan_all_clients_resolved_inner(
                 context.resolve_client_path(client_id)?,
                 client_id.data().pattern,
             );
-            let app_data = context.source_env_path("APPDATA").map(Path::to_path_buf);
-            for root in
-                additional_vscode_task_roots(home_dir, use_env_roots, app_data, extension_id)
-            {
+            for root in additional_vscode_task_roots(home_dir, vscode_app_data, extension_id) {
                 push(client_id, root, client_id.data().pattern);
             }
         }
@@ -2016,19 +2013,22 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
+    let vscode_app_data = if cfg!(target_os = "windows") && use_env_roots {
+        std::env::var_os("APPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
     for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
         if enabled.contains(&client_id) {
             let local_path = client_id
                 .data()
                 .resolve_path_with_env_strategy(home_dir, use_env_roots);
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, local_path);
-            let app_data = std::env::var_os("APPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from);
             for root in additional_vscode_task_roots(
                 Path::new(home_dir),
-                use_env_roots,
-                app_data,
+                vscode_app_data.as_deref(),
                 extension_id,
             ) {
                 push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, root);
@@ -6367,8 +6367,11 @@ mod tests {
         }
     }
 
-    /// A root that is both derived and handed in as an extra scan path is one
-    /// scan task, so its tasks are not counted twice.
+    /// A root that is both derived and handed in as an extra scan path yields
+    /// each of its files once. This observes only the file count, not the
+    /// number of scan tasks: root-level dedup (`seen_scan_roots`) and
+    /// file-level dedup (canonical paths in the aggregation) each mask the
+    /// other, so removing either alone cannot fail it; only removing both can.
     #[test]
     #[serial]
     fn test_vscode_task_root_reached_by_default_and_extra_path_counts_once() {
@@ -6403,6 +6406,64 @@ mod tests {
                     files.len(),
                     2,
                     "{client_id:?} entry {entry}: a doubly reached root must count once: {files:?}"
+                );
+            }
+        }
+    }
+
+    /// An `excluded_scan_paths` entry under a new macOS root removes its files
+    /// in the source-context scanner (and the env-strategy one). Exclusions
+    /// are not applied where roots are derived: they prune the walk
+    /// (`run_scan_tasks` -> `scan_directory_path(.., exclusions.for_client)`)
+    /// and are re-checked on the whole result (`exclusions.sweep`). The
+    /// unexcluded `.vscode-server` task is the control.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_apply_to_the_new_vscode_roots() {
+        let mut env = EnvGuard::capture(&["APPDATA"]);
+        env.remove("APPDATA");
+        for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
+            let dir = TempDir::new().unwrap();
+            let home = dir.path();
+            let macos = vscode_task_file(
+                home,
+                "Library/Application Support/Code",
+                extension_id,
+                "task-macos",
+            );
+            let server = vscode_task_file(home, ".vscode-server/data", extension_id, "task-server");
+            let macos_tasks = macos.parent().unwrap().parent().unwrap();
+            assert!(macos_tasks.ends_with("tasks"));
+
+            for (entry, result) in
+                scan_both_entries(home, client_id.as_str(), false, &ScannerSettings::default())
+                    .iter()
+                    .enumerate()
+            {
+                assert_eq!(
+                    result.get(client_id).len(),
+                    2,
+                    "{client_id:?} entry {entry}: the fixture is inert"
+                );
+            }
+
+            let settings = ScannerSettings {
+                excluded_scan_paths: exclude(client_id.as_str(), &[macos_tasks]),
+                ..Default::default()
+            };
+            for (entry, result) in scan_both_entries(home, client_id.as_str(), false, &settings)
+                .iter()
+                .enumerate()
+            {
+                let files: Vec<PathBuf> = result
+                    .get(client_id)
+                    .iter()
+                    .map(|file| fs::canonicalize(file).unwrap())
+                    .collect();
+                assert_eq!(
+                    files,
+                    vec![fs::canonicalize(&server).unwrap()],
+                    "{client_id:?} entry {entry} (0 = env strategy, 1 = source context)"
                 );
             }
         }

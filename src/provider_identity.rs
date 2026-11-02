@@ -167,10 +167,14 @@ pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
     inferred_provider_from_model_inner(model, false)
 }
 
-/// Delimiter-aware inference (upstream #1095), for damaged-input recovery
-/// paths only: it rejects words that merely contain a family name
-/// (`declaude-x`), which plain inference would attribute. Every other caller
-/// keeps `inferred_provider_from_model`.
+/// Delimiter-aware inference (upstream #1095): it rejects words that merely
+/// contain a family name (`declaude-x`), which plain inference would
+/// attribute. It has two callers and every other one keeps
+/// `inferred_provider_from_model`: Reasonix's damaged-provider recovery, and
+/// the Roo family (Roo Code, Kilo Code, Cline) as a deliberate second caller
+/// on its normal path (upstream #1406, `roocode::provider_from_model_id`),
+/// where gateway ids such as `anthropic/claude-sonnet-4` need the delimiter so
+/// a wrong vendor is not guessed from a word that merely contains a family.
 pub(crate) fn inferred_provider_from_model_delimited(model: &str) -> Option<&'static str> {
     inferred_provider_from_model_inner(model, true)
 }
