@@ -252,9 +252,12 @@ mod tests {
         }
     }
 
-    /// Pin for upstream #1425: the reasoning-effort tiers, `-thinking` and dotted
-    /// `5.5` spellings of Claude 5.5, and the 4.6 tiers, price as their base
-    /// model. The fork resolves these in the lookup's normalization, so no alias
+    /// Pin for upstream #1425. Every spelling its patch maps (the 54 `m.insert`
+    /// lines, copied below as `(raw, base)`: Sonnet 4.6 tiers, Claude 5.5
+    /// `-thinking`, bare, dotted and `-low/-medium/-high` forms of
+    /// sonnet/opus/haiku, and the `anthropic/` forms) must price exactly as its
+    /// base model, plus `claude-opus-4-6-{low,medium,high}`, which #1425 does not
+    /// list. The fork resolves these in the lookup's normalization, so no alias
     /// rows are needed; this fails if that stops being true. Each base gets
     /// distinct rates so a fallback to a sibling model cannot pass.
     #[test]
@@ -284,25 +287,68 @@ mod tests {
             ..Default::default()
         };
 
-        let mut cases: Vec<(String, &str)> = Vec::new();
-        for base in [
-            "claude-sonnet-5-5",
-            "claude-opus-5-5",
-            "claude-haiku-5-5",
-            "claude-sonnet-4-6",
-            "claude-opus-4-6",
-        ] {
-            for tier in ["low", "medium", "high"] {
-                cases.push((format!("{base}-{tier}"), base));
-            }
-        }
-        for (model_id, base) in [
+        let upstream_1425: [(&str, &str); 54] = [
+            ("claude-sonnet-4-6-low", "claude-sonnet-4-6"),
+            ("claude-sonnet-4-6-medium", "claude-sonnet-4-6"),
+            ("claude-sonnet-4-6-high", "claude-sonnet-4-6"),
+            ("claude-sonnet-4.6-low", "claude-sonnet-4-6"),
+            ("claude-sonnet-4.6-medium", "claude-sonnet-4-6"),
+            ("claude-sonnet-4.6-high", "claude-sonnet-4-6"),
+            ("claude-opus-5-5-thinking", "claude-opus-5-5"),
+            ("claude-sonnet-5-5-thinking", "claude-sonnet-5-5"),
+            ("claude-haiku-5-5-thinking", "claude-haiku-5-5"),
             ("claude-opus-5.5-thinking", "claude-opus-5-5"),
+            ("claude-sonnet-5.5-thinking", "claude-sonnet-5-5"),
+            ("claude-haiku-5.5-thinking", "claude-haiku-5-5"),
+            ("claude-opus-5-5", "claude-opus-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("claude-haiku-5-5", "claude-haiku-5-5"),
+            ("claude-opus-5.5", "claude-opus-5-5"),
+            ("claude-sonnet-5.5", "claude-sonnet-5-5"),
+            ("claude-haiku-5.5", "claude-haiku-5-5"),
+            ("claude-sonnet-5-5-low", "claude-sonnet-5-5"),
+            ("claude-sonnet-5-5-medium", "claude-sonnet-5-5"),
+            ("claude-sonnet-5-5-high", "claude-sonnet-5-5"),
             ("claude-sonnet-5.5-low", "claude-sonnet-5-5"),
             ("claude-sonnet-5.5-medium", "claude-sonnet-5-5"),
             ("claude-sonnet-5.5-high", "claude-sonnet-5-5"),
-        ] {
-            cases.push((model_id.to_string(), base));
+            ("claude-opus-5-5-low", "claude-opus-5-5"),
+            ("claude-opus-5-5-medium", "claude-opus-5-5"),
+            ("claude-opus-5-5-high", "claude-opus-5-5"),
+            ("claude-opus-5.5-low", "claude-opus-5-5"),
+            ("claude-opus-5.5-medium", "claude-opus-5-5"),
+            ("claude-opus-5.5-high", "claude-opus-5-5"),
+            ("claude-haiku-5-5-low", "claude-haiku-5-5"),
+            ("claude-haiku-5-5-medium", "claude-haiku-5-5"),
+            ("claude-haiku-5-5-high", "claude-haiku-5-5"),
+            ("claude-haiku-5.5-low", "claude-haiku-5-5"),
+            ("claude-haiku-5.5-medium", "claude-haiku-5-5"),
+            ("claude-haiku-5.5-high", "claude-haiku-5-5"),
+            ("anthropic/claude-5-5-opus", "claude-opus-5-5"),
+            ("anthropic/claude-5-5-sonnet", "claude-sonnet-5-5"),
+            ("anthropic/claude-5-5-haiku", "claude-haiku-5-5"),
+            ("anthropic/claude-5.5-opus", "claude-opus-5-5"),
+            ("anthropic/claude-5.5-sonnet", "claude-sonnet-5-5"),
+            ("anthropic/claude-5.5-haiku", "claude-haiku-5-5"),
+            ("anthropic/claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5.5", "claude-sonnet-5-5"),
+            ("anthropic/claude-opus-5-5", "claude-opus-5-5"),
+            ("anthropic/claude-opus-5.5", "claude-opus-5-5"),
+            ("anthropic/claude-haiku-5-5", "claude-haiku-5-5"),
+            ("anthropic/claude-haiku-5.5", "claude-haiku-5-5"),
+            ("anthropic/claude-sonnet-5-5-low", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5-5-medium", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5-5-high", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5.5-low", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5.5-medium", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5.5-high", "claude-sonnet-5-5"),
+        ];
+        let mut cases: Vec<(String, &str)> = upstream_1425
+            .iter()
+            .map(|(raw, base)| (raw.to_string(), *base))
+            .collect();
+        for tier in ["low", "medium", "high"] {
+            cases.push((format!("claude-opus-4-6-{tier}"), "claude-opus-4-6"));
         }
 
         for (model_id, base) in cases {

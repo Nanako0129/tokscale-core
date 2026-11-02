@@ -60,10 +60,12 @@ fn qwen_token_breakdown(usage: &UsageMetadata) -> TokenBreakdown {
     // A cached count above the prompt cannot be a subset of it, so there is
     // nothing to split out; keep both as reported.
     //
-    // Known limit, as upstream: cache-creation tokens that a provider counts
-    // inside `promptTokenCount` (the Anthropic converter adds cache writes to
-    // `input_tokens`) stay in `input`, and `cache_write` below is always 0, so
-    // an Anthropic-backed Qwen session prices its cache writes at the input rate.
+    // Known limit: only `cachedContentTokenCount` is split out of the prompt,
+    // and `cache_write` below is always 0, so cache-creation tokens that a
+    // provider counts inside `promptTokenCount` stay in `input` and are priced
+    // at the input rate. Upstream's parser has the same code; whether a given
+    // Qwen Code converter puts cache writes there is upstream's comment, not
+    // measured here.
     let input = if cache_read <= prompt {
         prompt - cache_read
     } else {
