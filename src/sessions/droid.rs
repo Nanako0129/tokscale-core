@@ -526,7 +526,7 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
                 // of the replies it folded, at the run's latest timestamp. The
                 // fork's `sessionize` groups by `(client, session_id)`, so
                 // spreading the count over records does not split the session.
-                message.message_count = turn.replies.max(1);
+                message.message_count = turn.replies;
                 message
             })
             .collect();

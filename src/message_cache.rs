@@ -1014,7 +1014,7 @@ fn parser_version(client: ClientId) -> u32 {
         // entry's single lock-anchored record. Vendor-local numbering: never
         // copy upstream's parser_version 7 (see UPSTREAM.md).
         // 3: each apportioned record carries its own turn's reply count
-        // (`turn.replies.max(1)`) instead of the session's whole count riding
+        // (`turn.replies`) instead of the session's whole count riding
         // on the first record, so a multi-day session's message count follows
         // the dates of its replies (upstream #1579). A finished session's
         // settings.json and transcript never change, so its fingerprint keeps

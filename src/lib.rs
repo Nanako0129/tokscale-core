@@ -6681,7 +6681,7 @@ fn parse_local_clients_inner(
                 .collect::<Vec<_>>()
         })
         .collect();
-    let droid_count = droid_msgs.len() as i32;
+    let droid_count = summed_parsed_message_count(&droid_msgs);
     counts.set(ClientId::Droid, droid_count);
     messages.extend(droid_msgs);
 
@@ -14337,12 +14337,70 @@ mod tests {
         seed_v2_entry(true);
         assert_eq!(per_date(&stream()), vec![2, 1], "streaming lane rebuilt");
 
+        // Control for the materialized lane: it too serves the seeded counts
+        // while the entry carries the current identity, so the assertion below
+        // can only pass because of the version.
+        seed_v2_entry(false);
+        assert_eq!(
+            per_date(&materialize()),
+            vec![3, 0],
+            "control: materialized lane serves stale counts"
+        );
+
         seed_v2_entry(true);
         assert_eq!(
             per_date(&materialize()),
             vec![2, 1],
             "materialized lane rebuilt"
         );
+    }
+
+    // The count lane must report a Droid session's replies, not its records:
+    // a session past `MAX_TURNS_PER_SESSION` (1024) is coalesced into at most
+    // that many records, each standing for several replies.
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_droid_count_is_the_reply_total_for_coalesced_sessions() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let sessions_dir = source_home.path().join(".factory/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("droid-long.settings.json"),
+            r#"{"model":"custom:Kimi-K3-0","tokenUsage":{"inputTokens":1000}}"#,
+        )
+        .unwrap();
+        let replies = 1200;
+        let transcript: Vec<String> = (0..replies)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"message","timestamp":"2026-08-07T12:{:02}:{:02}Z","message":{{"role":"assistant","content":"xxxxxxxxxx"}}}}"#,
+                    (i / 60) % 60,
+                    i % 60
+                )
+            })
+            .collect();
+        std::fs::write(sessions_dir.join("droid-long.jsonl"), transcript.join("\n")).unwrap();
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["droid".to_string()]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(
+            parsed.messages.len() < replies,
+            "the session was not coalesced: {} records",
+            parsed.messages.len()
+        );
+        assert_eq!(parsed.counts.get(ClientId::Droid), replies as i32);
     }
 
     #[test]
