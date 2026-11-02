@@ -174,7 +174,9 @@ pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
 /// the Roo family (Roo Code, Kilo Code, Cline) as a deliberate second caller
 /// on its normal path (upstream #1406, `roocode::provider_from_model_id`).
 /// The inputs that reach it there are bare ids (`claude-sonnet-3-7`),
-/// unknown-vendor prefixes (`my-gateway/claude-sonnet-4`), and `ollama/…` ids
+/// prefixes `canonical_provider` rejects (e.g. ones containing a digit,
+/// `gw2/claude-sonnet-4`; a plain unknown prefix such as `my-gateway/` is kept
+/// as its own provider by `canonical_provider`), and `ollama/…` ids
 /// through `infer_provider_from_family`; a known vendor prefix such as
 /// `anthropic/claude-sonnet-4` resolves through `canonical_provider` first.
 /// The delimiter keeps a wrong vendor from being guessed out of a word that
