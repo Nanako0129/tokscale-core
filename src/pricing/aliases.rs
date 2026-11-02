@@ -252,6 +252,117 @@ mod tests {
         }
     }
 
+    /// Pin for upstream #1425. Every spelling its patch maps (the 54 `m.insert`
+    /// lines, copied below as `(raw, base)`: Sonnet 4.6 tiers, Claude 5.5
+    /// `-thinking`, bare, dotted and `-low/-medium/-high` forms of
+    /// sonnet/opus/haiku, and the `anthropic/` forms) must price exactly as its
+    /// base model, plus `claude-opus-4-6-{low,medium,high}`, which #1425 does not
+    /// list. The fork resolves these in the lookup's normalization, so no alias
+    /// rows are needed; this fails if that stops being true. Each base gets
+    /// distinct rates so a fallback to a sibling model cannot pass.
+    #[test]
+    fn claude_effort_tiers_price_as_their_base_model() {
+        let rates = |input: f64, output: f64| super::super::litellm::ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            cache_read_input_token_cost: Some(input / 10.0),
+            cache_creation_input_token_cost: Some(input * 1.25),
+            ..Default::default()
+        };
+        let service = super::super::PricingService::new(
+            HashMap::from([
+                ("claude-sonnet-5-5".to_string(), rates(2e-6, 10e-6)),
+                ("claude-opus-5-5".to_string(), rates(4e-6, 20e-6)),
+                ("claude-haiku-5-5".to_string(), rates(1e-6, 5e-6)),
+                ("claude-sonnet-4-6".to_string(), rates(3e-6, 15e-6)),
+                ("claude-opus-4-6".to_string(), rates(5e-6, 25e-6)),
+            ]),
+            HashMap::new(),
+        );
+        let usage = crate::TokenBreakdown {
+            input: 1_000,
+            output: 100,
+            cache_read: 500,
+            cache_write: 200,
+            ..Default::default()
+        };
+
+        let upstream_1425: [(&str, &str); 54] = [
+            ("claude-sonnet-4-6-low", "claude-sonnet-4-6"),
+            ("claude-sonnet-4-6-medium", "claude-sonnet-4-6"),
+            ("claude-sonnet-4-6-high", "claude-sonnet-4-6"),
+            ("claude-sonnet-4.6-low", "claude-sonnet-4-6"),
+            ("claude-sonnet-4.6-medium", "claude-sonnet-4-6"),
+            ("claude-sonnet-4.6-high", "claude-sonnet-4-6"),
+            ("claude-opus-5-5-thinking", "claude-opus-5-5"),
+            ("claude-sonnet-5-5-thinking", "claude-sonnet-5-5"),
+            ("claude-haiku-5-5-thinking", "claude-haiku-5-5"),
+            ("claude-opus-5.5-thinking", "claude-opus-5-5"),
+            ("claude-sonnet-5.5-thinking", "claude-sonnet-5-5"),
+            ("claude-haiku-5.5-thinking", "claude-haiku-5-5"),
+            ("claude-opus-5-5", "claude-opus-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("claude-haiku-5-5", "claude-haiku-5-5"),
+            ("claude-opus-5.5", "claude-opus-5-5"),
+            ("claude-sonnet-5.5", "claude-sonnet-5-5"),
+            ("claude-haiku-5.5", "claude-haiku-5-5"),
+            ("claude-sonnet-5-5-low", "claude-sonnet-5-5"),
+            ("claude-sonnet-5-5-medium", "claude-sonnet-5-5"),
+            ("claude-sonnet-5-5-high", "claude-sonnet-5-5"),
+            ("claude-sonnet-5.5-low", "claude-sonnet-5-5"),
+            ("claude-sonnet-5.5-medium", "claude-sonnet-5-5"),
+            ("claude-sonnet-5.5-high", "claude-sonnet-5-5"),
+            ("claude-opus-5-5-low", "claude-opus-5-5"),
+            ("claude-opus-5-5-medium", "claude-opus-5-5"),
+            ("claude-opus-5-5-high", "claude-opus-5-5"),
+            ("claude-opus-5.5-low", "claude-opus-5-5"),
+            ("claude-opus-5.5-medium", "claude-opus-5-5"),
+            ("claude-opus-5.5-high", "claude-opus-5-5"),
+            ("claude-haiku-5-5-low", "claude-haiku-5-5"),
+            ("claude-haiku-5-5-medium", "claude-haiku-5-5"),
+            ("claude-haiku-5-5-high", "claude-haiku-5-5"),
+            ("claude-haiku-5.5-low", "claude-haiku-5-5"),
+            ("claude-haiku-5.5-medium", "claude-haiku-5-5"),
+            ("claude-haiku-5.5-high", "claude-haiku-5-5"),
+            ("anthropic/claude-5-5-opus", "claude-opus-5-5"),
+            ("anthropic/claude-5-5-sonnet", "claude-sonnet-5-5"),
+            ("anthropic/claude-5-5-haiku", "claude-haiku-5-5"),
+            ("anthropic/claude-5.5-opus", "claude-opus-5-5"),
+            ("anthropic/claude-5.5-sonnet", "claude-sonnet-5-5"),
+            ("anthropic/claude-5.5-haiku", "claude-haiku-5-5"),
+            ("anthropic/claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5.5", "claude-sonnet-5-5"),
+            ("anthropic/claude-opus-5-5", "claude-opus-5-5"),
+            ("anthropic/claude-opus-5.5", "claude-opus-5-5"),
+            ("anthropic/claude-haiku-5-5", "claude-haiku-5-5"),
+            ("anthropic/claude-haiku-5.5", "claude-haiku-5-5"),
+            ("anthropic/claude-sonnet-5-5-low", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5-5-medium", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5-5-high", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5.5-low", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5.5-medium", "claude-sonnet-5-5"),
+            ("anthropic/claude-sonnet-5.5-high", "claude-sonnet-5-5"),
+        ];
+        let mut cases: Vec<(String, &str)> = upstream_1425
+            .iter()
+            .map(|(raw, base)| (raw.to_string(), *base))
+            .collect();
+        for tier in ["low", "medium", "high"] {
+            cases.push((format!("claude-opus-4-6-{tier}"), "claude-opus-4-6"));
+        }
+
+        for (model_id, base) in cases {
+            let expected = service.calculate_cost_with_provider(base, Some("anthropic"), &usage);
+            assert!(expected > 0.0, "{base} must price on the fixture");
+            let result = service
+                .lookup_with_source_and_provider(&model_id, None, Some("anthropic"))
+                .unwrap_or_else(|| panic!("{model_id} must resolve"));
+            assert_eq!(result.matched_key, base, "{model_id}");
+            let cost = service.calculate_cost_with_provider(&model_id, Some("anthropic"), &usage);
+            assert!((cost - expected).abs() < 1e-12, "{model_id}: {cost}");
+        }
+    }
+
     #[test]
     fn resolves_kimi_coding_plan_and_work_ids_to_their_underlying_models() {
         assert_eq!(resolve_alias("k3"), Some("kimi-k3"));

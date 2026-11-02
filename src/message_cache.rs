@@ -1054,6 +1054,14 @@ fn parser_version(client: ClientId) -> u32 {
         // 1: Hindsight's usage-ledger parser (upstream `parse_hindsight_file`
         // plus the vendor-local `split_cached_input`).
         ClientId::Hindsight => 1,
+        // 2: Qwen Code's `promptTokenCount` already contains the cached
+        // prefix and, on OpenAI-compatible providers, `candidatesTokenCount`
+        // already contains `thoughtsTokenCount`. The parser now splits both
+        // subsets out (upstream #1527, #1531 together: upstream's v3 is this
+        // fork's v2 because the fork shipped neither step, vendor-local
+        // numbering). A transcript that is never appended to keeps its
+        // fingerprint, so only this bump discards the double-counted v1 parse.
+        ClientId::Qwen => 2,
         // 1: Kimchi's Pi-format parser (`parse_pi_format_file`, session-scoped
         // keys). Kimchi shares that parser with Pi: a parse change that bumps
         // `ClientId::Pi` must bump this arm too, or warm Kimchi caches keep
@@ -4918,6 +4926,159 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    /// A finished Qwen transcript is never appended to, so its fingerprint stays
+    /// valid and only the parser-version bump discards the v1 parse that counted
+    /// the cached prefix and the reasoning twice. The stale shard is written at
+    /// the literal shipped version 1 (not `parser_version - 1`) under the
+    /// unchanged source's current fingerprint, and both the streaming and the
+    /// materialized lane must rebuild it and rewrite the shard at version 2.
+    #[test]
+    #[serial_test::serial]
+    fn test_qwen_v1_same_fingerprint_shard_is_rebuilt_by_every_lane() {
+        let cache_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(cache_home.path());
+        let source_home = TempDir::new().unwrap();
+        let chats = source_home.path().join(".qwen/projects/demo/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let written = chats.join("session1.jsonl");
+        std::fs::write(
+            &written,
+            br#"{"type": "assistant", "model": "qwen3.5-plus", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 10000, "candidatesTokenCount": 300, "totalTokenCount": 10300, "cachedContentTokenCount": 9000, "thoughtsTokenCount": 120}}
+"#,
+        )
+        .unwrap();
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["qwen".to_string()];
+        // Cache keys preserve the scanner-returned path spelling. On Windows the
+        // explicit-home resolver joins with `/` (`<home>/.qwen/projects\demo\..`)
+        // while `TempDir::join` produces `\`, which hashes to a different shard,
+        // so the seeded shard and the shard the lanes rewrite would not be the
+        // same file. Seed and read back under the production scanner spelling.
+        let scanned = crate::scanner::scan_all_clients_with_scanner_settings(
+            home,
+            &clients,
+            false,
+            &crate::scanner::ScannerSettings::default(),
+        );
+        let scanned = scanned.get(ClientId::Qwen);
+        assert_eq!(scanned.len(), 1, "the scanner must find the written file");
+        assert_eq!(
+            std::fs::canonicalize(&scanned[0]).unwrap(),
+            std::fs::canonicalize(&written).unwrap()
+        );
+        let path = scanned[0].clone();
+
+        let current = CacheIdentity::for_client(ClientId::Qwen);
+        let stale = CacheIdentity {
+            namespace: current.namespace,
+            parser_version: 1,
+        };
+        // The lanes fingerprint with `from_path_samples_only`; seed the same one so
+        // only the version gate separates the v1 entry from a cache hit.
+        let fingerprint = SourceFingerprint::from_path_samples_only(&path).unwrap();
+        let stale_path = shard_path(
+            &cache_shard_dir().unwrap(),
+            &CacheKey::new(current, &path).shard(),
+        );
+        // What the v1 parser cached: cache and reasoning counted twice.
+        let seed_v1_shard = || {
+            let stale_message = UnifiedMessage::new(
+                "qwen",
+                "qwen3.5-plus",
+                "qwen",
+                "session1",
+                1_771_856_696_857,
+                TokenBreakdown {
+                    input: 10_000,
+                    output: 300,
+                    cache_read: 9_000,
+                    reasoning: 120,
+                    ..Default::default()
+                },
+                0.0,
+            );
+            let stale_entry = CachedSourceEntry::new(
+                stale,
+                &path,
+                fingerprint.clone(),
+                vec![stale_message],
+                Vec::new(),
+                None,
+            );
+            let payload = bincode::options().serialize(&vec![stale_entry]).unwrap();
+            ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+            let envelope = CachedShardEnvelope {
+                format_version: CACHE_FORMAT_VERSION,
+                parser_namespace: stale.namespace.to_string(),
+                parser_version: stale.parser_version,
+                payload,
+            };
+            let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+            bincode::options()
+                .serialize_into(&mut writer, &envelope)
+                .unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+            assert!(
+                matches!(read_shard(&stale_path, current), ShardReadStatus::Stale),
+                "a version-1 shard must be Stale to the current parser"
+            );
+            assert_eq!(
+                SourceFingerprint::from_path_samples_only(&path).unwrap(),
+                fingerprint
+            );
+        };
+        let assert_rebuilt = |messages: &[UnifiedMessage], lane: &str| {
+            assert_eq!(messages.len(), 1, "{lane}");
+            let tokens = &messages[0].tokens;
+            assert_eq!(
+                (
+                    tokens.input,
+                    tokens.output,
+                    tokens.reasoning,
+                    tokens.cache_read
+                ),
+                (1_000, 180, 120, 9_000),
+                "{lane} must not replay the v1 double-counted buckets"
+            );
+            assert_eq!(tokens.total(), 10_300, "{lane}");
+            // The rebuilt entry replaces the v1 shard at the current version.
+            match read_shard(&stale_path, current) {
+                ShardReadStatus::Loaded(entries) => {
+                    assert_eq!(entries.len(), 1, "{lane}");
+                    assert_eq!(entries[0].parser_version, 2, "{lane}");
+                    assert_eq!(entries[0].messages[0].tokens.input, 1_000, "{lane}");
+                }
+                _ => panic!("{lane} must rewrite the shard at the current version"),
+            }
+        };
+
+        seed_v1_shard();
+        let mut streamed = Vec::new();
+        crate::scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &crate::scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+        );
+        assert_rebuilt(&streamed, "streaming lane");
+
+        seed_v1_shard();
+        let materialized = crate::parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            &clients,
+            None,
+            false,
+            &crate::scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_rebuilt(&materialized, "materialized lane");
+        restore_cache_env(prev_env);
+    }
+
     /// A shard written before RET-CLAUDE-001 (`CachedSourceEntry` without
     /// `retained_keys`) is tagged Claude `parser_version = 1`. Its payload's
     /// binary layout no longer matches the current 8-field struct, so
@@ -6901,6 +7062,9 @@ mod tests {
         }
         assert_eq!(parser_version(ClientId::Crush), 1);
         assert_eq!(parser_version(ClientId::Hermes), 1);
+        // 2 splits Qwen's cached prefix and reasoning out of the prompt and
+        // candidates (upstream #1527 + #1531, one step in this fork's numbering).
+        assert_eq!(parser_version(ClientId::Qwen), 2);
         assert_eq!(parser_version(ClientId::Trae), 1);
         // 2 was RET-CLAUDE-001 retention; 3 dropped the tool_result char
         // estimate, which keeping migratable entries makes non-lossy; 4 reads
@@ -6939,6 +7103,7 @@ mod tests {
                     | ClientId::Pi
                     | ClientId::Droid
                     | ClientId::Kiro
+                    | ClientId::Qwen
             ) {
                 assert_eq!(
                     parser_version(client),
