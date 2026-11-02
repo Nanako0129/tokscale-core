@@ -198,9 +198,8 @@ fn resolve_usage_timestamp(lock_timestamp: Option<i64>, modified: Option<i64>) -
 /// bytes, which is what the call produced.
 ///
 /// `replies` is how many assistant replies the turn stands for. It is 1 until
-/// `coalesce_turns` folds a run together. The session's replies are summed and
-/// carried on a single emitted record, so the session reports the number of
-/// calls it made without its apportioned records counting as separate sessions.
+/// `coalesce_turns` folds a run together. Each emitted record carries its own
+/// turn's count, so a reply is counted on the date it was written.
 struct TranscriptTurn {
     timestamp: i64,
     context_weight: u128,
@@ -501,12 +500,6 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
         let output = apportion(totals.output, &output_weights, total_output);
         let reasoning = apportion(totals.reasoning, &output_weights, total_output);
 
-        // One Droid session made this many API calls, however many records its
-        // spend is spread over.
-        let session_replies = turns
-            .iter()
-            .fold(0i32, |sum, turn| sum.saturating_add(turn.replies.max(1)));
-
         return turns
             .iter()
             .enumerate()
@@ -527,17 +520,13 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
                     },
                     0.0,
                 );
-                // These records are attribution fragments of one session, not
-                // separate sessions. Upstream carries the session's reply total
-                // on exactly one record (the rest count 0) because its
-                // `sessionize` opens a new interval whenever two records sit
-                // more than the idle gap apart. This fork's `sessionize` groups
-                // by `(client, session_id)` instead, so here the rule is kept
-                // for fidelity, not for the session count; its visible effect
-                // is that a multi-day session's reply count lands on the day
-                // of its first reply. The guard for the rule is
-                // `test_reply_count_rides_on_exactly_one_record`.
-                message.message_count = if index == 0 { session_replies } else { 0 };
+                // Each record counts the replies it stands for, so a multi-day
+                // session reports its calls on the days they were made. A
+                // coalesced run (over `MAX_TURNS_PER_SESSION`) keeps the count
+                // of the replies it folded, at the run's latest timestamp. The
+                // fork's `sessionize` groups by `(client, session_id)`, so
+                // spreading the count over records does not split the session.
+                message.message_count = turn.replies;
                 message
             })
             .collect();
@@ -984,25 +973,33 @@ mod tests {
     }
 
     #[test]
-    fn test_reply_count_rides_on_exactly_one_record() {
+    fn test_reply_counts_follow_their_own_dates() {
         let temp_dir = tempfile::TempDir::new().unwrap();
+        // One session spanning two days (three apart, so no local timezone
+        // folds them together): two replies on the first, one on the second.
+        // The two replies on the first day sit one second apart, which no
+        // whole-minute UTC offset can split across local midnight. Each date
+        // must report the replies written on it; a rule that parks the
+        // session's calls on its first record shows 3 and 0.
         let settings = write_session(
             temp_dir.path(),
             "aaaaaaaa-2222-2222-2222-222222222222",
             r#"{"inputTokens":1000}"#,
             &[
                 &assistant("2026-08-07T12:00:00Z", 10),
-                &assistant("2026-08-08T12:00:00Z", 10),
+                &assistant("2026-08-07T12:00:01Z", 10),
+                &assistant("2026-08-10T12:00:00Z", 10),
             ],
         );
 
         let messages = parse_droid_file(&settings);
 
-        assert_eq!(messages.len(), 2);
-        // Both calls are counted, but only one record is countable: the second
-        // is an attribution fragment of the same session, not a new session.
-        assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 2);
-        assert_eq!(messages.iter().filter(|m| m.message_count > 0).count(), 1);
+        assert_eq!(messages.len(), 3);
+        let mut per_date: std::collections::BTreeMap<&str, i32> = Default::default();
+        for message in &messages {
+            *per_date.entry(message.date.as_str()).or_default() += message.message_count;
+        }
+        assert_eq!(per_date.values().copied().collect::<Vec<_>>(), vec![2, 1]);
     }
 
     #[test]
@@ -1010,9 +1007,9 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         // 40 replies ten minutes apart. Ported from upstream, where every gap
         // would open its own session interval. This fork's `sessionize` groups
-        // by session_id, so the session count is 1 here regardless of how
-        // message_count is split: on the fork this test cannot fail on its
-        // own; `test_reply_count_rides_on_exactly_one_record` is the guard.
+        // by session_id, so the session count is 1 whatever the per-record
+        // message_count split is; this pins that the per-reply counts do not
+        // turn one session into many.
         let replies = 40;
         let transcript: Vec<String> = (0..replies)
             .map(|i| {

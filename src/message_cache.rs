@@ -1013,7 +1013,15 @@ fn parser_version(client: ClientId) -> u32 {
         // fingerprint stays valid forever and only this bump discards a v1
         // entry's single lock-anchored record. Vendor-local numbering: never
         // copy upstream's parser_version 7 (see UPSTREAM.md).
-        ClientId::Droid => 2,
+        // 3: each apportioned record carries its own turn's reply count
+        // (`turn.replies`) instead of the session's whole count riding
+        // on the first record, so a multi-day session's message count follows
+        // the dates of its replies (upstream #1579). A finished session's
+        // settings.json and transcript never change, so its fingerprint keeps
+        // matching and only this bump discards a v2 entry's first-record
+        // counts. Droid retains no history (see `retained_history_key_filter`),
+        // so the stale entry is simply re-parsed.
+        ClientId::Droid => 3,
         // 2: OpenCode 2.x renamed the session metadata table `session` ->
         // `session_v2`, so the v2 `session_message` parse now falls back to
         // the renamed join table. An unchanged database fingerprint whose
@@ -6903,9 +6911,10 @@ mod tests {
         // correctness set (1h clamp after assembly, bare-snapshot input,
         // advisor iterations).
         assert_eq!(parser_version(ClientId::Claude), 5);
-        // 2 is the transcript-weighted per-reply attribution split (vendor-local
-        // numbering; never upstream's 7 — see UPSTREAM.md).
-        assert_eq!(parser_version(ClientId::Droid), 2);
+        // 2 was the transcript-weighted per-reply attribution split
+        // (vendor-local numbering; never upstream's 7 — see UPSTREAM.md); 3
+        // puts each reply's count on its own record.
+        assert_eq!(parser_version(ClientId::Droid), 3);
         // 2 carries Kiro credits as provider-reported cost and source request
         // counts (#1342, credits half).
         assert_eq!(parser_version(ClientId::Kiro), 2);
