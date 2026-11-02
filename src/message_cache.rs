@@ -5173,7 +5173,9 @@ mod tests {
             // sibling folded in (`from_roo_path` / `check_roo_path_samples_only`);
             // seed that same fingerprint so only the version gate separates
             // the v2 entry from a cache hit.
-            let fingerprint = SourceFingerprint::from_roo_path(&env_path).unwrap();
+            // The fingerprint embeds the history sibling's path, so it carries
+            // the same scanner spelling: compute it per lane path.
+            let fingerprint_of = |path: &Path| SourceFingerprint::from_roo_path(path).unwrap();
             let shard_for = |path: &Path| {
                 shard_path(
                     &cache_shard_dir().unwrap(),
@@ -5182,6 +5184,7 @@ mod tests {
             };
             let seed_v2_shard = |path: &Path| {
                 let stale_path = shard_for(path);
+                let fingerprint = fingerprint_of(path);
                 // What the v2 parser cached: input gross of cache, provider
                 // from the wire protocol, cost left to the estimator.
                 let stale_message = UnifiedMessage::new(
@@ -5225,7 +5228,7 @@ mod tests {
                     matches!(read_shard(&stale_path, current), ShardReadStatus::Stale),
                     "{name}: a version-2 shard must be Stale to the current parser"
                 );
-                assert_eq!(SourceFingerprint::from_roo_path(path).unwrap(), fingerprint);
+                assert_eq!(fingerprint_of(path), fingerprint);
             };
             let assert_rebuilt = |messages: &[UnifiedMessage], path: &Path, lane: &str| {
                 assert_eq!(messages.len(), 1, "{name} {lane}");
@@ -5242,7 +5245,11 @@ mod tests {
                     ShardReadStatus::Loaded(entries) => {
                         assert_eq!(entries.len(), 1, "{name} {lane}");
                         assert_eq!(entries[0].parser_version, 3, "{name} {lane}");
-                        assert_eq!(entries[0].fingerprint, fingerprint, "{name} {lane}");
+                        assert_eq!(
+                            entries[0].fingerprint,
+                            fingerprint_of(path),
+                            "{name} {lane}"
+                        );
                         assert_eq!(entries[0].messages[0].provider_id, "anthropic");
                     }
                     _ => panic!("{name} {lane} must rewrite the shard at the current version"),
