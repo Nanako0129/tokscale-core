@@ -252,6 +252,58 @@ mod tests {
         }
     }
 
+    /// Pin for upstream #1425: reasoning-effort tiers of Claude 5.5 and 4.6 price
+    /// as their base model. The fork resolves the `-low/-medium/-high` suffix in
+    /// the lookup's normalization, so no alias rows are needed; this fails if
+    /// that stops being true. Each base gets distinct rates so a fallback to a
+    /// sibling model cannot pass.
+    #[test]
+    fn claude_effort_tiers_price_as_their_base_model() {
+        let rates = |input: f64, output: f64| super::super::litellm::ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            cache_read_input_token_cost: Some(input / 10.0),
+            cache_creation_input_token_cost: Some(input * 1.25),
+            ..Default::default()
+        };
+        let service = super::super::PricingService::new(
+            HashMap::from([
+                ("claude-sonnet-5-5".to_string(), rates(2e-6, 10e-6)),
+                ("claude-opus-5-5".to_string(), rates(4e-6, 20e-6)),
+                ("claude-sonnet-4-6".to_string(), rates(3e-6, 15e-6)),
+                ("claude-opus-4-6".to_string(), rates(5e-6, 25e-6)),
+            ]),
+            HashMap::new(),
+        );
+        let usage = crate::TokenBreakdown {
+            input: 1_000,
+            output: 100,
+            cache_read: 500,
+            cache_write: 200,
+            ..Default::default()
+        };
+
+        for base in [
+            "claude-sonnet-5-5",
+            "claude-opus-5-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+        ] {
+            let expected = service.calculate_cost_with_provider(base, Some("anthropic"), &usage);
+            assert!(expected > 0.0, "{base} must price on the fixture");
+            for tier in ["low", "medium", "high"] {
+                let model_id = format!("{base}-{tier}");
+                let result = service
+                    .lookup_with_source_and_provider(&model_id, None, Some("anthropic"))
+                    .unwrap_or_else(|| panic!("{model_id} must resolve"));
+                assert_eq!(result.matched_key, base, "{model_id}");
+                let cost =
+                    service.calculate_cost_with_provider(&model_id, Some("anthropic"), &usage);
+                assert!((cost - expected).abs() < 1e-12, "{model_id}: {cost}");
+            }
+        }
+    }
+
     #[test]
     fn resolves_kimi_coding_plan_and_work_ids_to_their_underlying_models() {
         assert_eq!(resolve_alias("k3"), Some("kimi-k3"));

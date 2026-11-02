@@ -1046,6 +1046,14 @@ fn parser_version(client: ClientId) -> u32 {
         // 1: Hindsight's usage-ledger parser (upstream `parse_hindsight_file`
         // plus the vendor-local `split_cached_input`).
         ClientId::Hindsight => 1,
+        // 2: Qwen Code's `promptTokenCount` already contains the cached
+        // prefix and, on OpenAI-compatible providers, `candidatesTokenCount`
+        // already contains `thoughtsTokenCount`. The parser now splits both
+        // subsets out (upstream #1527, #1531 together: upstream's v3 is this
+        // fork's v2 because the fork shipped neither step, vendor-local
+        // numbering). A transcript that is never appended to keeps its
+        // fingerprint, so only this bump discards the double-counted v1 parse.
+        ClientId::Qwen => 2,
         // 1: Kimchi's Pi-format parser (`parse_pi_format_file`, session-scoped
         // keys). Kimchi shares that parser with Pi: a parse change that bumps
         // `ClientId::Pi` must bump this arm too, or warm Kimchi caches keep
@@ -4910,6 +4918,93 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
+    #[test]
+    fn test_qwen_parser_version_invalidates_v1_entries() {
+        assert_eq!(parser_version(ClientId::Qwen), 2);
+    }
+
+    /// A finished Qwen transcript is never appended to, so its fingerprint stays
+    /// valid and only the parser-version bump discards the v1 parse that counted
+    /// the cached prefix and the reasoning twice. The stale shard is written at
+    /// the literal shipped version 1, not `parser_version - 1`.
+    #[test]
+    #[serial_test::serial]
+    fn test_qwen_v1_same_fingerprint_shard_is_rebuilt_without_double_counting() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(
+            br#"{"type": "assistant", "model": "qwen3.5-plus", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 10000, "candidatesTokenCount": 300, "totalTokenCount": 10300, "cachedContentTokenCount": 9000, "thoughtsTokenCount": 120}}
+"#,
+        );
+        let current = CacheIdentity::for_client(ClientId::Qwen);
+        let stale = CacheIdentity {
+            namespace: current.namespace,
+            parser_version: 1,
+        };
+        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        // What the v1 parser cached: cache and reasoning counted twice.
+        let stale_message = UnifiedMessage::new(
+            "qwen",
+            "qwen3.5-plus",
+            "qwen",
+            "session1",
+            1_771_856_696_857,
+            TokenBreakdown {
+                input: 10_000,
+                output: 300,
+                cache_read: 9_000,
+                reasoning: 120,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let stale_entry = CachedSourceEntry::new(
+            stale,
+            source.path(),
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        );
+        let payload = bincode::options().serialize(&vec![stale_entry]).unwrap();
+        let stale_key = CacheKey::new(current, source.path()).shard();
+        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        let stale_envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: stale.namespace.to_string(),
+            parser_version: stale.parser_version,
+            payload,
+        };
+        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &stale_envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            SourceFingerprint::from_path(source.path()).unwrap(),
+            fingerprint,
+            "the parser-only invalidation must rebuild an unchanged source"
+        );
+        assert!(matches!(
+            read_shard(&stale_path, current),
+            ShardReadStatus::Stale
+        ));
+        let cache = SourceMessageCache::load();
+        assert!(cache.get(current, source.path()).is_none());
+
+        let rebuilt = crate::sessions::qwen::parse_qwen_file(source.path());
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].tokens.input, 1_000);
+        assert_eq!(rebuilt[0].tokens.output, 180);
+        assert_eq!(rebuilt[0].tokens.reasoning, 120);
+        assert_eq!(rebuilt[0].tokens.cache_read, 9_000);
+        assert_eq!(rebuilt[0].tokens.total(), 10_300);
+        restore_cache_env(prev_env);
+    }
+
     /// A shard written before RET-CLAUDE-001 (`CachedSourceEntry` without
     /// `retained_keys`) is tagged Claude `parser_version = 1`. Its payload's
     /// binary layout no longer matches the current 8-field struct, so
@@ -6893,6 +6988,9 @@ mod tests {
         }
         assert_eq!(parser_version(ClientId::Crush), 1);
         assert_eq!(parser_version(ClientId::Hermes), 1);
+        // 2 splits Qwen's cached prefix and reasoning out of the prompt and
+        // candidates (upstream #1527 + #1531, one step in this fork's numbering).
+        assert_eq!(parser_version(ClientId::Qwen), 2);
         assert_eq!(parser_version(ClientId::Trae), 1);
         // 2 was RET-CLAUDE-001 retention; 3 dropped the tool_result char
         // estimate, which keeping migratable entries makes non-lossy; 4 reads
@@ -6930,6 +7028,7 @@ mod tests {
                     | ClientId::Pi
                     | ClientId::Droid
                     | ClientId::Kiro
+                    | ClientId::Qwen
             ) {
                 assert_eq!(
                     parser_version(client),

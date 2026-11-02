@@ -154,6 +154,16 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                 } else {
                     (0.0, false, false)
                 };
+            // `reasoning_tokens` is `completion_tokens_details.reasoning_tokens`,
+            // a SUBSET of the `completion_tokens` stored in `output_tokens`.
+            // `TokenBreakdown` buckets are additive (`total()` sums them,
+            // `compute_cost` prices output + reasoning at the output rate), so
+            // carrying the raw output while also filling `reasoning` billed
+            // every reasoning token twice. Split the overlap out of output, as
+            // `codex.rs` does, clamped so a malformed row cannot go negative
+            // (upstream #1411).
+            let output = output.max(0);
+            let reasoning = reasoning.max(0).min(output);
             let mut msg = UnifiedMessage::new_with_agent(
                 "hermes",
                 model_id,
@@ -162,10 +172,10 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                 timestamp_secs_to_ms(started_at),
                 TokenBreakdown {
                     input: input.max(0),
-                    output: output.max(0),
+                    output: output - reasoning,
                     cache_read: cache_read.max(0),
                     cache_write: cache_write.max(0),
-                    reasoning: reasoning.max(0),
+                    reasoning,
                     cache_write_1h: 0,
                 },
                 cost,
