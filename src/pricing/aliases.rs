@@ -252,11 +252,11 @@ mod tests {
         }
     }
 
-    /// Pin for upstream #1425: reasoning-effort tiers of Claude 5.5 and 4.6 price
-    /// as their base model. The fork resolves the `-low/-medium/-high` suffix in
-    /// the lookup's normalization, so no alias rows are needed; this fails if
-    /// that stops being true. Each base gets distinct rates so a fallback to a
-    /// sibling model cannot pass.
+    /// Pin for upstream #1425: the reasoning-effort tiers, `-thinking` and dotted
+    /// `5.5` spellings of Claude 5.5, and the 4.6 tiers, price as their base
+    /// model. The fork resolves these in the lookup's normalization, so no alias
+    /// rows are needed; this fails if that stops being true. Each base gets
+    /// distinct rates so a fallback to a sibling model cannot pass.
     #[test]
     fn claude_effort_tiers_price_as_their_base_model() {
         let rates = |input: f64, output: f64| super::super::litellm::ModelPricing {
@@ -270,6 +270,7 @@ mod tests {
             HashMap::from([
                 ("claude-sonnet-5-5".to_string(), rates(2e-6, 10e-6)),
                 ("claude-opus-5-5".to_string(), rates(4e-6, 20e-6)),
+                ("claude-haiku-5-5".to_string(), rates(1e-6, 5e-6)),
                 ("claude-sonnet-4-6".to_string(), rates(3e-6, 15e-6)),
                 ("claude-opus-4-6".to_string(), rates(5e-6, 25e-6)),
             ]),
@@ -283,24 +284,36 @@ mod tests {
             ..Default::default()
         };
 
+        let mut cases: Vec<(String, &str)> = Vec::new();
         for base in [
             "claude-sonnet-5-5",
             "claude-opus-5-5",
+            "claude-haiku-5-5",
             "claude-sonnet-4-6",
             "claude-opus-4-6",
         ] {
+            for tier in ["low", "medium", "high"] {
+                cases.push((format!("{base}-{tier}"), base));
+            }
+        }
+        for (model_id, base) in [
+            ("claude-opus-5.5-thinking", "claude-opus-5-5"),
+            ("claude-sonnet-5.5-low", "claude-sonnet-5-5"),
+            ("claude-sonnet-5.5-medium", "claude-sonnet-5-5"),
+            ("claude-sonnet-5.5-high", "claude-sonnet-5-5"),
+        ] {
+            cases.push((model_id.to_string(), base));
+        }
+
+        for (model_id, base) in cases {
             let expected = service.calculate_cost_with_provider(base, Some("anthropic"), &usage);
             assert!(expected > 0.0, "{base} must price on the fixture");
-            for tier in ["low", "medium", "high"] {
-                let model_id = format!("{base}-{tier}");
-                let result = service
-                    .lookup_with_source_and_provider(&model_id, None, Some("anthropic"))
-                    .unwrap_or_else(|| panic!("{model_id} must resolve"));
-                assert_eq!(result.matched_key, base, "{model_id}");
-                let cost =
-                    service.calculate_cost_with_provider(&model_id, Some("anthropic"), &usage);
-                assert!((cost - expected).abs() < 1e-12, "{model_id}: {cost}");
-            }
+            let result = service
+                .lookup_with_source_and_provider(&model_id, None, Some("anthropic"))
+                .unwrap_or_else(|| panic!("{model_id} must resolve"));
+            assert_eq!(result.matched_key, base, "{model_id}");
+            let cost = service.calculate_cost_with_provider(&model_id, Some("anthropic"), &usage);
+            assert!((cost - expected).abs() < 1e-12, "{model_id}: {cost}");
         }
     }
 

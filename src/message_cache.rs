@@ -4918,90 +4918,133 @@ mod tests {
         restore_cache_env(prev_env);
     }
 
-    #[test]
-    fn test_qwen_parser_version_invalidates_v1_entries() {
-        assert_eq!(parser_version(ClientId::Qwen), 2);
-    }
-
     /// A finished Qwen transcript is never appended to, so its fingerprint stays
     /// valid and only the parser-version bump discards the v1 parse that counted
     /// the cached prefix and the reasoning twice. The stale shard is written at
-    /// the literal shipped version 1, not `parser_version - 1`.
+    /// the literal shipped version 1 (not `parser_version - 1`) under the
+    /// unchanged source's current fingerprint, and both the streaming and the
+    /// materialized lane must rebuild it and rewrite the shard at version 2.
     #[test]
     #[serial_test::serial]
-    fn test_qwen_v1_same_fingerprint_shard_is_rebuilt_without_double_counting() {
-        let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
-        let source = write_temp_file(
+    fn test_qwen_v1_same_fingerprint_shard_is_rebuilt_by_every_lane() {
+        let cache_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(cache_home.path());
+        let source_home = TempDir::new().unwrap();
+        let chats = source_home.path().join(".qwen/projects/demo/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let path = chats.join("session1.jsonl");
+        std::fs::write(
+            &path,
             br#"{"type": "assistant", "model": "qwen3.5-plus", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 10000, "candidatesTokenCount": 300, "totalTokenCount": 10300, "cachedContentTokenCount": 9000, "thoughtsTokenCount": 120}}
 "#,
-        );
+        )
+        .unwrap();
+        let home = source_home.path().to_str().unwrap();
+        let clients = ["qwen".to_string()];
+
         let current = CacheIdentity::for_client(ClientId::Qwen);
         let stale = CacheIdentity {
             namespace: current.namespace,
             parser_version: 1,
         };
-        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
-        // What the v1 parser cached: cache and reasoning counted twice.
-        let stale_message = UnifiedMessage::new(
-            "qwen",
-            "qwen3.5-plus",
-            "qwen",
-            "session1",
-            1_771_856_696_857,
-            TokenBreakdown {
-                input: 10_000,
-                output: 300,
-                cache_read: 9_000,
-                reasoning: 120,
-                ..Default::default()
-            },
-            0.0,
+        let fingerprint = SourceFingerprint::from_path(&path).unwrap();
+        let stale_path = shard_path(
+            &cache_shard_dir().unwrap(),
+            &CacheKey::new(current, &path).shard(),
         );
-        let stale_entry = CachedSourceEntry::new(
-            stale,
-            source.path(),
-            fingerprint.clone(),
-            vec![stale_message],
-            Vec::new(),
+        // What the v1 parser cached: cache and reasoning counted twice.
+        let seed_v1_shard = || {
+            let stale_message = UnifiedMessage::new(
+                "qwen",
+                "qwen3.5-plus",
+                "qwen",
+                "session1",
+                1_771_856_696_857,
+                TokenBreakdown {
+                    input: 10_000,
+                    output: 300,
+                    cache_read: 9_000,
+                    reasoning: 120,
+                    ..Default::default()
+                },
+                0.0,
+            );
+            let stale_entry = CachedSourceEntry::new(
+                stale,
+                &path,
+                fingerprint.clone(),
+                vec![stale_message],
+                Vec::new(),
+                None,
+            );
+            let payload = bincode::options().serialize(&vec![stale_entry]).unwrap();
+            ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+            let envelope = CachedShardEnvelope {
+                format_version: CACHE_FORMAT_VERSION,
+                parser_namespace: stale.namespace.to_string(),
+                parser_version: stale.parser_version,
+                payload,
+            };
+            let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+            bincode::options()
+                .serialize_into(&mut writer, &envelope)
+                .unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+            assert!(
+                matches!(read_shard(&stale_path, current), ShardReadStatus::Stale),
+                "a version-1 shard must be Stale to the current parser"
+            );
+            assert_eq!(SourceFingerprint::from_path(&path).unwrap(), fingerprint);
+        };
+        let assert_rebuilt = |messages: &[UnifiedMessage], lane: &str| {
+            assert_eq!(messages.len(), 1, "{lane}");
+            let tokens = &messages[0].tokens;
+            assert_eq!(
+                (
+                    tokens.input,
+                    tokens.output,
+                    tokens.reasoning,
+                    tokens.cache_read
+                ),
+                (1_000, 180, 120, 9_000),
+                "{lane} must not replay the v1 double-counted buckets"
+            );
+            assert_eq!(tokens.total(), 10_300, "{lane}");
+            // The rebuilt entry replaces the v1 shard at the current version.
+            match read_shard(&stale_path, current) {
+                ShardReadStatus::Loaded(entries) => {
+                    assert_eq!(entries.len(), 1, "{lane}");
+                    assert_eq!(entries[0].parser_version, 2, "{lane}");
+                    assert_eq!(entries[0].messages[0].tokens.input, 1_000, "{lane}");
+                }
+                _ => panic!("{lane} must rewrite the shard at the current version"),
+            }
+        };
+
+        seed_v1_shard();
+        let mut streamed = Vec::new();
+        crate::scan_messages_streaming(
+            home,
+            &clients,
+            None,
+            false,
+            &crate::scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+        );
+        assert_rebuilt(&streamed, "streaming lane");
+
+        seed_v1_shard();
+        let materialized = crate::parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            &clients,
+            None,
+            false,
+            &crate::scanner::ScannerSettings::default(),
             None,
         );
-        let payload = bincode::options().serialize(&vec![stale_entry]).unwrap();
-        let stale_key = CacheKey::new(current, source.path()).shard();
-        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
-        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
-        let stale_envelope = CachedShardEnvelope {
-            format_version: CACHE_FORMAT_VERSION,
-            parser_namespace: stale.namespace.to_string(),
-            parser_version: stale.parser_version,
-            payload,
-        };
-        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
-        bincode::options()
-            .serialize_into(&mut writer, &stale_envelope)
-            .unwrap();
-        writer.flush().unwrap();
-        drop(writer);
-
-        assert_eq!(
-            SourceFingerprint::from_path(source.path()).unwrap(),
-            fingerprint,
-            "the parser-only invalidation must rebuild an unchanged source"
-        );
-        assert!(matches!(
-            read_shard(&stale_path, current),
-            ShardReadStatus::Stale
-        ));
-        let cache = SourceMessageCache::load();
-        assert!(cache.get(current, source.path()).is_none());
-
-        let rebuilt = crate::sessions::qwen::parse_qwen_file(source.path());
-        assert_eq!(rebuilt.len(), 1);
-        assert_eq!(rebuilt[0].tokens.input, 1_000);
-        assert_eq!(rebuilt[0].tokens.output, 180);
-        assert_eq!(rebuilt[0].tokens.reasoning, 120);
-        assert_eq!(rebuilt[0].tokens.cache_read, 9_000);
-        assert_eq!(rebuilt[0].tokens.total(), 10_300);
+        assert_rebuilt(&materialized, "materialized lane");
         restore_cache_env(prev_env);
     }
 

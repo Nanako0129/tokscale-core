@@ -59,6 +59,11 @@ fn qwen_token_breakdown(usage: &UsageMetadata) -> TokenBreakdown {
 
     // A cached count above the prompt cannot be a subset of it, so there is
     // nothing to split out; keep both as reported.
+    //
+    // Known limit, as upstream: cache-creation tokens that a provider counts
+    // inside `promptTokenCount` (the Anthropic converter adds cache writes to
+    // `input_tokens`) stay in `input`, and `cache_write` below is always 0, so
+    // an Anthropic-backed Qwen session prices its cache writes at the input rate.
     let input = if cache_read <= prompt {
         prompt - cache_read
     } else {
@@ -488,9 +493,9 @@ not valid json at all
 
     #[test]
     fn test_parse_qwen_keeps_fully_cached_prompt() {
-        // A fully cached prompt leaves no uncached input. With no output either,
-        // the cache reads are the only usage, so the record must not be
-        // skipped as a zero-token entry.
+        // Guards the cache split on a fully cached prompt: the whole prompt moves
+        // to `cache_read`, `input` goes to 0, and the record's total stays the
+        // prompt (5000) instead of dropping to 0 or doubling.
         let content = r#"{"type": "assistant", "model": "qwen3.5-plus", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 5000, "candidatesTokenCount": 0, "totalTokenCount": 5000, "cachedContentTokenCount": 5000, "thoughtsTokenCount": 0}}"#;
         let file = create_test_file(content);
 
