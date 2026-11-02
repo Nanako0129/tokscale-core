@@ -2892,9 +2892,11 @@ mod tests {
 
     /// A redirected Windows profile: the approved platform roots are nowhere
     /// under `home`. The Cline, Roo Code, Kilo Code and Kimi Work
-    /// (`APPDATA`) and Hermes (`LOCALAPPDATA`) lanes must reach the approved
-    /// roots, not a guess derived from `home`, which the scanner already
-    /// probes on its own.
+    /// (`APPDATA`) and Hermes (`LOCALAPPDATA`) lanes read these keys through
+    /// `source_env_path`, so they must map to the approved roots, not a guess
+    /// derived from `home`, which the scanner already probes on its own. This
+    /// test checks that mapping; the Roo Code lane reaching the redirected
+    /// root is checked by `remote_explicit_appdata_code_root_is_scanned`.
     #[cfg(windows)]
     #[test]
     fn remote_explicit_roots_replace_home_derived_appdata() {
@@ -2925,6 +2927,45 @@ mod tests {
         assert_ne!(
             context.source_env_path(ENV_LOCALAPPDATA),
             Some(home.join("AppData/Local").as_path())
+        );
+    }
+
+    /// A Roo Code task under `<APPDATA>/Code` of a redirected remote Windows
+    /// profile (outside `home`) is found by the context scanner, which reads
+    /// `APPDATA` through `source_env_path`.
+    #[cfg(windows)]
+    #[test]
+    fn remote_explicit_appdata_code_root_is_scanned() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("profile/home");
+        let config = dir.path().join("redirected/Roaming");
+        let data = dir.path().join("redirected/Local");
+        let task =
+            config.join("Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/task-redirected");
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("ui_messages.json"), "[]").unwrap();
+        let context = ResolvedLocalSourceContext::from_remote_explicit(
+            &home,
+            &config,
+            &data,
+            &dir.path().join("syrtis-cache"),
+            &ScannerSettings::default(),
+        )
+        .unwrap();
+
+        let scan = crate::scanner::scan_all_clients_with_source_context(
+            &context,
+            &["roocode".to_string()],
+        )
+        .unwrap();
+        let found: Vec<PathBuf> = scan
+            .get(ClientId::RooCode)
+            .iter()
+            .map(|file| fs::canonicalize(file).unwrap())
+            .collect();
+        assert_eq!(
+            found,
+            vec![fs::canonicalize(task.join("ui_messages.json")).unwrap()]
         );
     }
 

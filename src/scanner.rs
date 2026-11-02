@@ -1392,6 +1392,14 @@ fn scan_all_clients_resolved_inner(
         }
     };
 
+    // The Windows `%APPDATA%` root, shared by the Kimi Work and VS Code task
+    // roots: only on Windows with environment roots enabled.
+    let app_data = if cfg!(target_os = "windows") && use_env_roots {
+        context.source_env_path("APPDATA")
+    } else {
+        None
+    };
+
     for client_id in &enabled {
         if matches!(
             client_id,
@@ -1432,11 +1440,6 @@ fn scan_all_clients_resolved_inner(
             home.join("sessions"),
             ClientId::Kimi.data().pattern,
         );
-        let app_data = if cfg!(target_os = "windows") && use_env_roots {
-            context.source_env_path("APPDATA")
-        } else {
-            None
-        };
         for root in kimi_work_roots(home_dir, app_data) {
             push(ClientId::Kimi, root, ClientId::Kimi.data().pattern);
         }
@@ -1554,11 +1557,6 @@ fn scan_all_clients_resolved_inner(
         }
     }
 
-    let vscode_app_data = if cfg!(target_os = "windows") && use_env_roots {
-        context.source_env_path("APPDATA")
-    } else {
-        None
-    };
     for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
         if enabled.contains(&client_id) {
             push(
@@ -1566,7 +1564,7 @@ fn scan_all_clients_resolved_inner(
                 context.resolve_client_path(client_id)?,
                 client_id.data().pattern,
             );
-            for root in additional_vscode_task_roots(home_dir, vscode_app_data, extension_id) {
+            for root in additional_vscode_task_roots(home_dir, app_data, extension_id) {
                 push(client_id, root, client_id.data().pattern);
             }
         }
@@ -1769,6 +1767,16 @@ fn scan_all_clients_with_env_strategy_inner(
     let mut tasks: Vec<(ClientId, String, &str)> = Vec::new();
     let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
 
+    // The Windows `%APPDATA%` root, shared by the Kimi Work and VS Code task
+    // roots: only on Windows with environment roots enabled.
+    let app_data = if cfg!(target_os = "windows") && use_env_roots {
+        std::env::var_os("APPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+
     for client_id in &enabled {
         if matches!(
             client_id,
@@ -1809,13 +1817,6 @@ fn scan_all_clients_with_env_strategy_inner(
             ClientId::Kimi,
             format!("{}/sessions", kimi_code_home),
         );
-        let app_data = if cfg!(target_os = "windows") && use_env_roots {
-            std::env::var_os("APPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        } else {
-            None
-        };
         for root in kimi_work_roots(Path::new(home_dir), app_data.as_deref()) {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Kimi, root);
         }
@@ -2013,24 +2014,15 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
-    let vscode_app_data = if cfg!(target_os = "windows") && use_env_roots {
-        std::env::var_os("APPDATA")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    } else {
-        None
-    };
     for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
         if enabled.contains(&client_id) {
             let local_path = client_id
                 .data()
                 .resolve_path_with_env_strategy(home_dir, use_env_roots);
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, local_path);
-            for root in additional_vscode_task_roots(
-                Path::new(home_dir),
-                vscode_app_data.as_deref(),
-                extension_id,
-            ) {
+            for root in
+                additional_vscode_task_roots(Path::new(home_dir), app_data.as_deref(), extension_id)
+            {
                 push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, root);
             }
         }
@@ -2296,6 +2288,7 @@ pub fn scan_all_clients(home_dir: &str, clients: &[String]) -> ScanResult {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::collections::BTreeSet;
     use std::fs::{self, File};
     use std::io::Write;
     use tempfile::TempDir;
@@ -6411,12 +6404,13 @@ mod tests {
         }
     }
 
-    /// An `excluded_scan_paths` entry under a new macOS root removes its files
-    /// in the source-context scanner (and the env-strategy one). Exclusions
-    /// are not applied where roots are derived: they prune the walk
-    /// (`run_scan_tasks` -> `scan_directory_path(.., exclusions.for_client)`)
-    /// and are re-checked on the whole result (`exclusions.sweep`). The
-    /// unexcluded `.vscode-server` task is the control.
+    /// `excluded_scan_paths` applies to the new macOS root in the source-context
+    /// scanner (and the env-strategy one), both when the entry is the root
+    /// itself and when it is a task directory below it. Exclusions are not
+    /// applied where roots are derived: they prune the walk (`run_scan_tasks`
+    /// -> `scan_directory_path(.., exclusions.for_client)`) and are re-checked
+    /// on the whole result (`exclusions.sweep`). The unexcluded
+    /// `.vscode-server` task is the control.
     #[test]
     #[serial]
     fn test_excluded_scan_paths_apply_to_the_new_vscode_roots() {
@@ -6425,46 +6419,56 @@ mod tests {
         for (client_id, extension_id) in VSCODE_TASK_EXTENSIONS {
             let dir = TempDir::new().unwrap();
             let home = dir.path();
-            let macos = vscode_task_file(
-                home,
-                "Library/Application Support/Code",
-                extension_id,
-                "task-macos",
-            );
+            let code_root = "Library/Application Support/Code";
+            let macos = vscode_task_file(home, code_root, extension_id, "task-macos");
+            let nested = vscode_task_file(home, code_root, extension_id, "task-nested");
             let server = vscode_task_file(home, ".vscode-server/data", extension_id, "task-server");
             let macos_tasks = macos.parent().unwrap().parent().unwrap();
             assert!(macos_tasks.ends_with("tasks"));
+            let nested_dir = nested.parent().unwrap();
 
-            for (entry, result) in
-                scan_both_entries(home, client_id.as_str(), false, &ScannerSettings::default())
+            let scan = |excluded: &[&Path]| -> Vec<BTreeSet<PathBuf>> {
+                let settings = ScannerSettings {
+                    excluded_scan_paths: exclude(client_id.as_str(), excluded),
+                    ..Default::default()
+                };
+                scan_both_entries(home, client_id.as_str(), false, &settings)
                     .iter()
-                    .enumerate()
-            {
-                assert_eq!(
-                    result.get(client_id).len(),
-                    2,
-                    "{client_id:?} entry {entry}: the fixture is inert"
-                );
-            }
-
-            let settings = ScannerSettings {
-                excluded_scan_paths: exclude(client_id.as_str(), &[macos_tasks]),
-                ..Default::default()
+                    .map(|result| {
+                        result
+                            .get(client_id)
+                            .iter()
+                            .map(|file| fs::canonicalize(file).unwrap())
+                            .collect()
+                    })
+                    .collect()
             };
-            for (entry, result) in scan_both_entries(home, client_id.as_str(), false, &settings)
-                .iter()
-                .enumerate()
-            {
-                let files: Vec<PathBuf> = result
-                    .get(client_id)
+            let canon = |paths: &[&Path]| -> BTreeSet<PathBuf> {
+                paths
                     .iter()
-                    .map(|file| fs::canonicalize(file).unwrap())
-                    .collect();
-                assert_eq!(
-                    files,
-                    vec![fs::canonicalize(&server).unwrap()],
-                    "{client_id:?} entry {entry} (0 = env strategy, 1 = source context)"
-                );
+                    .map(|path| fs::canonicalize(path).unwrap())
+                    .collect()
+            };
+
+            for (excluded, expected, what) in [
+                (
+                    vec![],
+                    canon(&[&macos, &nested, &server]),
+                    "no exclusion (the fixture is inert if this fails)",
+                ),
+                (vec![macos_tasks], canon(&[&server]), "the root itself"),
+                (
+                    vec![nested_dir],
+                    canon(&[&macos, &server]),
+                    "a task directory below the root",
+                ),
+            ] {
+                for (entry, found) in scan(&excluded).iter().enumerate() {
+                    assert_eq!(
+                        *found, expected,
+                        "{client_id:?} excluding {what}, entry {entry} (0 = env strategy, 1 = source context)"
+                    );
+                }
             }
         }
     }
