@@ -4940,22 +4940,42 @@ mod tests {
         let source_home = TempDir::new().unwrap();
         let chats = source_home.path().join(".qwen/projects/demo/chats");
         std::fs::create_dir_all(&chats).unwrap();
-        let path = chats.join("session1.jsonl");
+        let written = chats.join("session1.jsonl");
         std::fs::write(
-            &path,
+            &written,
             br#"{"type": "assistant", "model": "qwen3.5-plus", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 10000, "candidatesTokenCount": 300, "totalTokenCount": 10300, "cachedContentTokenCount": 9000, "thoughtsTokenCount": 120}}
 "#,
         )
         .unwrap();
         let home = source_home.path().to_str().unwrap();
         let clients = ["qwen".to_string()];
+        // Cache keys preserve the scanner-returned path spelling. On Windows the
+        // explicit-home resolver joins with `/` (`<home>/.qwen/projects\demo\..`)
+        // while `TempDir::join` produces `\`, which hashes to a different shard,
+        // so the seeded shard and the shard the lanes rewrite would not be the
+        // same file. Seed and read back under the production scanner spelling.
+        let scanned = crate::scanner::scan_all_clients_with_scanner_settings(
+            home,
+            &clients,
+            false,
+            &crate::scanner::ScannerSettings::default(),
+        );
+        let scanned = scanned.get(ClientId::Qwen);
+        assert_eq!(scanned.len(), 1, "the scanner must find the written file");
+        assert_eq!(
+            std::fs::canonicalize(&scanned[0]).unwrap(),
+            std::fs::canonicalize(&written).unwrap()
+        );
+        let path = scanned[0].clone();
 
         let current = CacheIdentity::for_client(ClientId::Qwen);
         let stale = CacheIdentity {
             namespace: current.namespace,
             parser_version: 1,
         };
-        let fingerprint = SourceFingerprint::from_path(&path).unwrap();
+        // The lanes fingerprint with `from_path_samples_only`; seed the same one so
+        // only the version gate separates the v1 entry from a cache hit.
+        let fingerprint = SourceFingerprint::from_path_samples_only(&path).unwrap();
         let stale_path = shard_path(
             &cache_shard_dir().unwrap(),
             &CacheKey::new(current, &path).shard(),
@@ -5003,7 +5023,10 @@ mod tests {
                 matches!(read_shard(&stale_path, current), ShardReadStatus::Stale),
                 "a version-1 shard must be Stale to the current parser"
             );
-            assert_eq!(SourceFingerprint::from_path(&path).unwrap(), fingerprint);
+            assert_eq!(
+                SourceFingerprint::from_path_samples_only(&path).unwrap(),
+                fingerprint
+            );
         };
         let assert_rebuilt = |messages: &[UnifiedMessage], lane: &str| {
             assert_eq!(messages.len(), 1, "{lane}");
