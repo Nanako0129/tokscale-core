@@ -22,6 +22,9 @@
 //!
 //! - `gen_metadata.#1`            → chatModel message
 //!   - `#19` (string)            → responseModel (e.g. `gemini-3-flash-a`)
+//!   - `#20` (repeated `{#1: key, #2: value}` map entries) → `model_enum`
+//!     (`MODEL_PLACEHOLDER_M318`), the service-side identity of the model that
+//!     served the turn; sibling keys are `trajectory_id`, `last_step_index`, …
 //!   - `#9.#4` = `{#1: seconds, #2: nanos}` → per-generation wall-clock time
 //!     (agy <= 1.1.17; 1.1.18+ dropped it, see `read_step_timestamps`)
 //!   - `#4`                      → usage message
@@ -168,12 +171,20 @@ fn parse_gen_metadata(
         }
     }
 
-    let model_raw = string_field(chat_model, 19)
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or("unknown");
-    let model_id = pricing::aliases::resolve_alias(model_raw)
-        .unwrap_or(model_raw)
-        .to_string();
+    // A responseModel *name* decides the identity whenever the row has one. A
+    // row with no name still carries `#20`'s `model_enum`, which names the model
+    // the service actually served; a *known* enum is used so those rows keep a
+    // real model identity instead of collapsing into `unknown`. An enum with no
+    // alias is never guessed at: the row stays `unknown`, as it always did.
+    let model_name = string_field(chat_model, 19).filter(|text| !text.trim().is_empty());
+    let model_id = match model_name {
+        Some(name) => pricing::aliases::resolve_alias(name).unwrap_or(name),
+        None => map_string_field(chat_model, 20, "model_enum")
+            .filter(|text| !text.trim().is_empty())
+            .and_then(pricing::aliases::resolve_alias)
+            .unwrap_or("unknown"),
+    }
+    .to_string();
     let provider_id = provider_identity::inferred_provider_from_model(&model_id)
         .unwrap_or("antigravity")
         .to_string();
@@ -498,6 +509,30 @@ fn string_field(buf: &[u8], field: u64) -> Option<&str> {
     message_field(buf, field).and_then(|bytes| std::str::from_utf8(bytes).ok())
 }
 
+/// Value of one key in a repeated protobuf map field.
+///
+/// `chatModel.#20` is a list of `{#1: key, #2: value}` entries (`model_enum`,
+/// `trajectory_id`, `last_step_index`, …), so [`message_field`] — which returns
+/// the *first* entry of a field — would answer with whichever key the service
+/// wrote first. Scan every entry and match on the key instead.
+fn map_string_field<'a>(buf: &'a [u8], field: u64, key: &str) -> Option<&'a str> {
+    let mut reader = ProtoReader::new(buf);
+    while let Some((found, wire)) = reader.next_field() {
+        if found != field {
+            continue;
+        }
+        let Wire::Len(entry) = wire else {
+            continue;
+        };
+        if string_field(entry, 1) == Some(key) {
+            if let Some(value) = string_field(entry, 2) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +601,39 @@ mod tests {
         }
         chat_model.extend(enc_len(19, model.as_bytes()));
 
+        enc_len(1, &chat_model)
+    }
+
+    /// `name`/`model_enum` are written as `chatModel.#19` and, when present, as
+    /// the `model_enum` entry of the `#20` map, preceded by a decoy
+    /// `last_step_index` entry so a first-match reader would return the wrong
+    /// value (real databases carry several `#20` entries).
+    fn build_gen_metadata_with_name_and_enum(
+        name: Option<&str>,
+        model_enum: Option<&str>,
+    ) -> Vec<u8> {
+        let mut usage = Vec::new();
+        usage.extend(enc_varint(1, 1132));
+        usage.extend(enc_varint(2, 500));
+        usage.extend(enc_varint(9, 300));
+        usage.extend(enc_len(11, b"resp-1"));
+
+        let mut chat_model = Vec::new();
+        chat_model.extend(enc_len(4, &usage));
+        if let Some(name) = name {
+            chat_model.extend(enc_len(19, name.as_bytes()));
+        }
+        if let Some(model_enum) = model_enum {
+            let mut decoy = Vec::new();
+            decoy.extend(enc_len(1, b"last_step_index"));
+            decoy.extend(enc_len(2, b"0"));
+            chat_model.extend(enc_len(20, &decoy));
+
+            let mut entry = Vec::new();
+            entry.extend(enc_len(1, b"model_enum"));
+            entry.extend(enc_len(2, model_enum.as_bytes()));
+            chat_model.extend(enc_len(20, &entry));
+        }
         enc_len(1, &chat_model)
     }
 
@@ -871,6 +939,71 @@ mod tests {
                 assert_eq!(msg.provider_id, "google", "name: {name}");
             }
         }
+    }
+
+    fn parsed_model(name: Option<&str>, model_enum: Option<&str>) -> UnifiedMessage {
+        let blob = build_gen_metadata_with_name_and_enum(name, model_enum);
+        let mut seen = HashSet::new();
+        parse_gen_metadata_default(&blob, "s", 1_000, &StepTimestamps::default(), &mut seen)
+            .expect("parses")
+    }
+
+    #[test]
+    fn model_enum_identifies_a_row_that_has_no_response_model() {
+        let cases = [
+            (Some("MODEL_PLACEHOLDER_M318"), "gemini-3.8-flash", "google"),
+            (Some("MODEL_PLACEHOLDER_M322"), "gemini-3.8-flash", "google"),
+            (
+                Some("MODEL_PLACEHOLDER_M35"),
+                "claude-sonnet-4-6",
+                "anthropic",
+            ),
+            (
+                Some("MODEL_PLACEHOLDER_M26"),
+                "claude-opus-4-6",
+                "anthropic",
+            ),
+            // An enum nobody mapped is never guessed at.
+            (Some("MODEL_PLACEHOLDER_M999"), "unknown", "antigravity"),
+            (None, "unknown", "antigravity"),
+        ];
+        for (model_enum, expected, provider) in cases {
+            let msg = parsed_model(None, model_enum);
+            assert_eq!(msg.model_id, expected, "enum: {model_enum:?}");
+            assert_eq!(msg.provider_id, provider, "enum: {model_enum:?}");
+        }
+    }
+
+    #[test]
+    fn a_response_model_name_wins_over_the_model_enum() {
+        // Even a name no alias knows beats a mapped enum: the name is what the
+        // service reported for this turn.
+        let msg = parsed_model(Some("gemini-3.8-live"), Some("MODEL_PLACEHOLDER_M318"));
+        assert_eq!(msg.model_id, "gemini-3.8-live");
+        let msg = parsed_model(
+            Some("gemini-3.8-flash-control"),
+            Some("MODEL_PLACEHOLDER_M322"),
+        );
+        assert_eq!(msg.model_id, "gemini-3.8-flash");
+        // A blank name counts as no name.
+        let msg = parsed_model(Some("  "), Some("MODEL_PLACEHOLDER_M318"));
+        assert_eq!(msg.model_id, "gemini-3.8-flash");
+    }
+
+    #[test]
+    fn model_enum_is_matched_by_key_not_by_position() {
+        // The decoy `last_step_index` entry precedes `model_enum` in the blob.
+        let blob = build_gen_metadata_with_name_and_enum(None, Some("MODEL_PLACEHOLDER_M318"));
+        let chat_model = message_field(&blob, 1).unwrap();
+        assert_eq!(
+            map_string_field(chat_model, 20, "model_enum"),
+            Some("MODEL_PLACEHOLDER_M318")
+        );
+        assert_eq!(
+            map_string_field(chat_model, 20, "last_step_index"),
+            Some("0")
+        );
+        assert_eq!(map_string_field(chat_model, 20, "absent"), None);
     }
 
     #[test]

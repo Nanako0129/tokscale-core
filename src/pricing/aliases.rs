@@ -75,6 +75,12 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("gemini-3.8-flash-high", "gemini-3.8-flash");
     m.insert("gemini-3.8-flash-low", "gemini-3.8-flash");
     m.insert("gemini-3.8-flash-tiered", "gemini-3.8-flash");
+    // Rows with no responseModel name carry `chatModel.#20`'s `model_enum`.
+    // Nanako0129/tokscale-core#34 reported M318 on the plain, `-control` and
+    // `-high` rows and M322 on the tiered rows; both are Gemini 3.8 Flash. Not
+    // re-measured here: the 2026-11-03 local run moved no row via these enums.
+    m.insert("model_placeholder_m318", "gemini-3.8-flash");
+    m.insert("model_placeholder_m322", "gemini-3.8-flash");
     m.insert("gemini-pro-default", "gemini-3.1-pro");
     m.insert("gemini-pro-agent", "gemini-3.1-pro");
     m.insert("gemini-3-flash-agent", "gemini-3.5-flash-high");
@@ -174,6 +180,8 @@ mod tests {
             ("model_placeholder_m133", "gemini-3.5-flash-high"),
             ("model_placeholder_m187", "gemini-3.5-flash-extra-low"),
             ("model_placeholder_m20", "gemini-3.5-flash-medium"),
+            ("MODEL_PLACEHOLDER_M318", "gemini-3.8-flash"),
+            ("model_placeholder_m322", "gemini-3.8-flash"),
             ("gemini-pro-default", "gemini-3.1-pro"),
             ("gemini-pro-agent", "gemini-3.1-pro"),
             ("gemini-3-flash-agent", "gemini-3.5-flash-high"),
