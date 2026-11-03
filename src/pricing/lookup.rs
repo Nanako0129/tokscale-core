@@ -2637,16 +2637,29 @@ fn select_best_match(
             // billed for a `zai` hint that Z.ai itself publishes at
             // `zai/glm-4.6`, $0.60/$2.20.
             //
-            // A row that spells the vendor exactly as the hint does comes
-            // next, in preference to one that only matches after folding.
+            // Then comes a row that spells the vendor exactly as the hint does,
+            // in preference to one that only matches after folding. That row is
+            // taken even when it starts with a reseller prefix, because the
+            // property that matters is the spelling, not the publisher: the
+            // pre-fold match for a `deepseek-ai` hint on `deepseek-r1` is
+            // `together_ai/deepseek-ai/DeepSeek-R1` at $3.00/$7.00, and
+            // discarding it for being a reseller just hands the lookup to
+            // `vercel_ai_gateway/deepseek/deepseek-r1` at $0.55/$2.19 — another
+            // reseller, chosen for being spelled the other way and having a
+            // longer key. Among equally spelled rows a non-reseller still wins.
             let by_root = candidates
                 .iter()
                 .find(|k| key_root_matches_hint(k, &hint_tags));
             let by_spelling = provider_id.and_then(|hint| {
-                candidates.iter().find(|k| {
-                    !is_reseller_provider(k)
-                        && provider_identity::matches_provider_spelling(k, hint)
-                })
+                let spelled: Vec<&&String> = candidates
+                    .iter()
+                    .filter(|k| provider_identity::matches_provider_spelling(k, hint))
+                    .collect();
+                spelled
+                    .iter()
+                    .copied()
+                    .find(|k| !is_reseller_provider(k))
+                    .or_else(|| spelled.first().copied())
             });
             candidates
                 .iter()
@@ -7808,5 +7821,71 @@ mod tests {
             "Z.ai's own row must win over a gateway that nests `zai` in a longer key"
         );
         assert_eq!(result.pricing.output_cost_per_token, Some(0.0000022));
+    }
+
+    /// The spelling preference exists to keep a hinted vendor on the row that
+    /// spells the vendor its way, so it must not throw that row away for
+    /// starting with a reseller prefix. Before the fold, a `deepseek-ai` hint
+    /// matched only `together_ai/deepseek-ai/DeepSeek-R1` ($3.00/$7.00 per
+    /// MTok); folding `deepseek-ai` into `deepseek` pulled
+    /// `vercel_ai_gateway/deepseek/deepseek-r1` ($0.55/$2.19) into the same
+    /// pool, and it wins on key length alone. That is the fold moving usage
+    /// between two resellers, which is precisely what the preference is for.
+    // CONTROL in this fork: passes without the change (`deepseek-ai` does not fold
+    // into `deepseek` here, so the Vercel row never joins the pool); see
+    // `fork_exact_vendor_spelling_wins_even_when_that_row_is_a_reseller`.
+    #[test]
+    fn exact_vendor_spelling_wins_even_when_that_row_is_a_reseller() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "together_ai/deepseek-ai/DeepSeek-R1".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000007),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "vercel_ai_gateway/deepseek/deepseek-r1".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000055),
+                output_cost_per_token: Some(0.00000219),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("deepseek-r1", Some("deepseek-ai"))
+            .expect("deepseek-ai-hinted deepseek-r1 must price");
+        assert_eq!(
+            result.matched_key, "together_ai/deepseek-ai/DeepSeek-R1",
+            "the row spelling the vendor the hint's way must win even though it is a reseller"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.000007));
+    }
+
+    /// Red before a3ec6a17: the hint-spelled row starts with a listed reseller
+    /// prefix, so the spelling preference threw it away and the lookup fell to
+    /// the longer `vercel_ai_gateway/mistralai/...` row, which this tree does
+    /// not list as a reseller. Uses the `mistral` -> `mistralai` fold this tree
+    /// has.
+    #[test]
+    fn fork_exact_vendor_spelling_wins_even_when_that_row_is_a_reseller() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "together_ai/mistral/model-r".to_string(),
+            spelling_fixture_price(0.000004),
+        );
+        litellm.insert(
+            "vercel_ai_gateway/mistralai/model-r".to_string(),
+            spelling_fixture_price(0.000002),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("model-r", Some("mistral"))
+            .expect("mistral-hinted model-r must price");
+        assert_eq!(result.matched_key, "together_ai/mistral/model-r");
     }
 }
