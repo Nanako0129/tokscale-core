@@ -8090,4 +8090,53 @@ mod tests {
             .expect("together-hinted model-x must price");
         assert_eq!(result.matched_key, "together_ai/model-x");
     }
+
+    /// The real key shapes for a Google model under a `google` hint, all four
+    /// at once: LiteLLM lists `perplexity/google/<model>` (a longer key, and
+    /// `perplexity/` is an original-provider prefix), `gemini/<model>` (Google's
+    /// own AI Studio namespace) and the bare id, OpenRouter lists
+    /// `google/<model>`. The answer is `gemini/<model>`, which needs two things:
+    /// the provider-root tier picks it inside LiteLLM over the longer
+    /// Perplexity row, and `gemini/` being an original-provider prefix lets it
+    /// beat OpenRouter's `google/` row across sources. Each is killed by its
+    /// own mutation (see the commit message).
+    #[test]
+    fn google_hint_with_the_real_litellm_shape_resolves_to_the_gemini_namespace() {
+        let mut litellm = HashMap::new();
+        for key in [
+            "perplexity/google/gemini-3.8-flash",
+            "gemini/gemini-3.8-flash",
+            "gemini-3.8-flash",
+        ] {
+            litellm.insert(key.to_string(), priced(7.5e-7, 3.75e-6));
+        }
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "google/gemini-3.8-flash".to_string(),
+            priced(8.25e-7, 4.125e-6),
+        );
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("gemini-3.8-flash", Some("google"))
+            .unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "gemini/gemini-3.8-flash");
+        assert_eq!(result.pricing.input_cost_per_token, Some(7.5e-7));
+
+        // Inside LiteLLM alone the same row is chosen over the longer
+        // Perplexity key.
+        let mut litellm_only = HashMap::new();
+        for key in [
+            "perplexity/google/gemini-3.8-flash",
+            "gemini/gemini-3.8-flash",
+        ] {
+            litellm_only.insert(key.to_string(), priced(7.5e-7, 3.75e-6));
+        }
+        let lookup = PricingLookup::new(litellm_only, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup_with_provider("gemini-3.8-flash", Some("google"))
+            .unwrap();
+        assert_eq!(result.matched_key, "gemini/gemini-3.8-flash");
+    }
 }
