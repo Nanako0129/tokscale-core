@@ -208,9 +208,11 @@ const CACHE_INSIDE_INPUT_PROVIDERS: &[&str] = &[
 /// Return `(input, cache_read)` with cached tokens taken out of input when the
 /// provider's adapter counts them inside it.
 ///
-/// Fork-only: upstream adds `cached_tokens` on top of `input_tokens`. On a real
-/// 89-row `openai` ledger (2026-10-02) that over-counted by 200,233 tokens
-/// (51%). The row's `total_tokens` cannot tell the shapes apart, because
+/// Upstream fixed the same double count in #1393 (`fa54514c`); this branch
+/// predates it. Before that fix, upstream added `cached_tokens` on top of
+/// `input_tokens`. On a real 89-row `openai` ledger (2026-10-02) that
+/// over-counted by 200,233 tokens (51%). The row's `total_tokens` cannot tell
+/// the shapes apart, because
 /// Hindsight computes it as `input + output` (`llm_trace.py:553`), so the
 /// provider decides. A cache larger than input cannot be a subset of it and
 /// keeps upstream's reading.
