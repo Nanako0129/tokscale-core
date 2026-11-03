@@ -2625,18 +2625,24 @@ fn select_best_match(
             // `cloudflare/@cf/deepseek-ai/...` at $0.497/$4.881 — a 16x output
             // rate on the same weights.
             //
-            // So prefer a row that spells the vendor exactly as the hint does
-            // over one that only matches after folding. Two rows outrank it and
-            // must not be displaced: a first-party row (handled by
-            // `is_original_provider` below) and the hinted provider's own
-            // top-level row. Without the second guard a `novita` hint on
-            // `kimi-k2.6` would leave Novita's own `novita-ai/moonshotai/...`
-            // at $0.80/$3.40 for `poe/novita/...` at $0.96/$4.04, which spells
-            // `novita` in a nested segment only because Poe is reselling it.
-            let has_root_match = candidates
+            // So the pool is ranked explicitly instead of leaning on key
+            // order. A first-party row wins outright. Next comes the hinted
+            // vendor's own top-level row: `novita-ai/moonshotai/kimi-k2.6` at
+            // $0.80/$3.40 is Novita's own, while `poe/novita/kimi-k2.6` at
+            // $0.96/$4.04 spells `novita` in a nested segment only because Poe
+            // is reselling it. Ranking that row rather than merely detecting it
+            // matters, because candidates are ordered longest key first and the
+            // vendor's own row is usually the shorter one:
+            // `vercel_ai_gateway/zai/glm-4.6` at $0.45/$1.80 would otherwise be
+            // billed for a `zai` hint that Z.ai itself publishes at
+            // `zai/glm-4.6`, $0.60/$2.20.
+            //
+            // A row that spells the vendor exactly as the hint does comes
+            // next, in preference to one that only matches after folding.
+            let by_root = candidates
                 .iter()
-                .any(|k| key_root_matches_hint(k, &hint_tags));
-            let by_spelling = provider_id.filter(|_| !has_root_match).and_then(|hint| {
+                .find(|k| key_root_matches_hint(k, &hint_tags));
+            let by_spelling = provider_id.and_then(|hint| {
                 candidates.iter().find(|k| {
                     !is_reseller_provider(k)
                         && provider_identity::matches_provider_spelling(k, hint)
@@ -2645,6 +2651,7 @@ fn select_best_match(
             candidates
                 .iter()
                 .find(|k| is_original_provider(k))
+                .or(by_root)
                 .or(by_spelling)
                 .or_else(|| candidates.iter().find(|k| !is_reseller_provider(k)))
                 .or_else(|| candidates.first())
@@ -7761,5 +7768,45 @@ mod tests {
             .lookup_with_provider("model-q", Some("minimax"))
             .expect("minimax-hinted model-q must price");
         assert_eq!(result.matched_key, "minimaxai/some-path/model-q");
+    }
+
+    /// `key_root_matches_hint` recognises the hinted vendor's own top-level
+    /// row, and that row has to be *selected*, not merely used to switch the
+    /// spelling preference off. Z.ai publishes `zai/glm-4.6` at $0.60/$2.20 per
+    /// MTok and Vercel's gateway resells it at $0.45/$1.80 under
+    /// `vercel_ai_gateway/zai/glm-4.6`; neither key is in
+    /// `ORIGINAL_PROVIDER_PREFIXES` (Z.ai's first-party spelling there is
+    /// `z-ai/`) nor in `RESELLER_PROVIDER_PREFIXES`, and candidates are ordered
+    /// longest key first, so a `zai` hint must not be billed at the gateway's
+    /// sheet just because its key is longer.
+    #[test]
+    fn hinted_vendor_own_row_wins_over_a_longer_row_that_only_nests_the_vendor() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "zai/glm-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000006),
+                output_cost_per_token: Some(0.0000022),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "vercel_ai_gateway/zai/glm-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000045),
+                output_cost_per_token: Some(0.0000018),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("glm-4.6", Some("zai"))
+            .expect("zai-hinted glm-4.6 must price");
+        assert_eq!(
+            result.matched_key, "zai/glm-4.6",
+            "Z.ai's own row must win over a gateway that nests `zai` in a longer key"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.0000022));
     }
 }
