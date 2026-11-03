@@ -985,6 +985,17 @@ fn additional_vscode_task_roots(
     roots
 }
 
+/// `<roaming>/Block/goose/data/sessions/sessions.db` joined one component at a
+/// time, so on Windows every separator is native (upstream #1476).
+fn goose_windows_db(roaming: &Path) -> PathBuf {
+    roaming
+        .join("Block")
+        .join("goose")
+        .join("data")
+        .join("sessions")
+        .join("sessions.db")
+}
+
 fn supports_extra_dir_scanning(client_id: ClientId) -> bool {
     // Kilo CLI currently loads a single SQLite DB via `scan_result.kilo_db`
     // Roo/KiloCode require local + remote and server task roots, and Crush
@@ -1613,6 +1624,17 @@ fn scan_all_clients_resolved_inner(
                 candidates.push(root.join("data/sessions/sessions.db"));
             }
         }
+        // Goose on Windows (upstream #1458): `%APPDATA%\Block\goose\data\sessions`,
+        // ranked before XDG and the legacy candidates so a stale leftover cannot
+        // mask live usage. Chained `.join`s, not one `/`-literal, so the path has
+        // native separators (#1476). The fork keeps trimming `GOOSE_PATH_ROOT`
+        // above, so upstream's absolute-only, authoritative rule is not taken.
+        if cfg!(target_os = "windows") && use_env_roots {
+            if let Some(roaming) = context.source_env_path("APPDATA") {
+                candidates.push(goose_windows_db(roaming));
+            }
+        }
+        candidates.push(goose_windows_db(&home_dir.join("AppData").join("Roaming")));
         candidates.extend([
             context.resolve_client_path(ClientId::Goose)?,
             home_dir.join("Library/Application Support/goose/sessions/sessions.db"),
@@ -2069,6 +2091,23 @@ fn scan_all_clients_with_env_strategy_inner(
                     }
                 }
             }
+        }
+        // Windows roaming DB, ahead of XDG and the legacy candidates; see the
+        // context scanner for why and for the `GOOSE_PATH_ROOT` note.
+        if result.goose_db.is_none() {
+            let mut roots = Vec::new();
+            if cfg!(target_os = "windows") && use_env_roots {
+                roots.extend(
+                    std::env::var_os("APPDATA")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from),
+                );
+            }
+            roots.push(Path::new(home_dir).join("AppData").join("Roaming"));
+            result.goose_db = roots
+                .iter()
+                .map(|root| goose_windows_db(root))
+                .find(|db| exclusions.usable(ClientId::Goose, db));
         }
         if result.goose_db.is_none() {
             let xdg_path = ClientId::Goose
@@ -4049,6 +4088,95 @@ mod tests {
                     "{client}: no fallback"
                 );
             }
+        }
+    }
+
+    /// Upstream #1458: Goose on Windows keeps its database at
+    /// `<roaming>/Block/goose/data/sessions/sessions.db`. The home-derived
+    /// candidate has no `cfg`, so a fixture under `<home>/AppData/Roaming`
+    /// proves it on every platform: found, and ranked ahead of a stale XDG
+    /// copy, in both scanners and with environment roots on and off.
+    #[test]
+    #[serial]
+    fn test_goose_windows_roaming_db_is_found_and_ranked_first_by_both_entries() {
+        let mut env = EnvGuard::capture(&["GOOSE_PATH_ROOT", "XDG_DATA_HOME", "APPDATA"]);
+        env.remove("GOOSE_PATH_ROOT");
+        env.remove("XDG_DATA_HOME");
+        env.remove("APPDATA");
+        for use_env_roots in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let home = dir.path();
+            let native = home.join("AppData/Roaming/Block/goose/data/sessions/sessions.db");
+            touch(&native);
+            touch(&home.join(".local/share/goose/sessions/sessions.db"));
+            for (entry, result) in
+                scan_both_entries(home, "goose", use_env_roots, &ScannerSettings::default())
+                    .iter()
+                    .enumerate()
+            {
+                assert_eq!(
+                    result.goose_db,
+                    Some(native.clone()),
+                    "env roots {use_env_roots}, entry {entry} (0 = env strategy, 1 = source context)"
+                );
+            }
+        }
+    }
+
+    /// An exclusion on the roaming database falls through to the next
+    /// candidate rather than hiding Goose altogether.
+    #[test]
+    #[serial]
+    fn test_goose_windows_roaming_db_honors_exclusions() {
+        let mut env = EnvGuard::capture(&["GOOSE_PATH_ROOT", "XDG_DATA_HOME", "APPDATA"]);
+        env.remove("GOOSE_PATH_ROOT");
+        env.remove("XDG_DATA_HOME");
+        env.remove("APPDATA");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let native = home.join("AppData/Roaming/Block/goose/data/sessions/sessions.db");
+        let xdg = home.join(".local/share/goose/sessions/sessions.db");
+        touch(&native);
+        touch(&xdg);
+        for result in scan_both_entries(home, "goose", false, &ScannerSettings::default()) {
+            assert_eq!(result.goose_db, Some(native.clone()), "inert");
+        }
+        let settings = ScannerSettings {
+            excluded_scan_paths: exclude("goose", &[native.parent().unwrap()]),
+            ..Default::default()
+        };
+        for result in scan_both_entries(home, "goose", false, &settings) {
+            assert_eq!(result.goose_db, Some(xdg.clone()), "no fallback");
+        }
+    }
+
+    /// Windows only (CI `windows-latest`): `%APPDATA%` outside the home wins,
+    /// and the discovered path carries no `/`, since `Path::join` leaves a
+    /// `/`-joined literal untouched on Windows (upstream #1476).
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[serial]
+    fn test_goose_windows_appdata_db_uses_native_separators() {
+        let mut env = EnvGuard::capture(&["GOOSE_PATH_ROOT", "XDG_DATA_HOME", "APPDATA"]);
+        env.remove("GOOSE_PATH_ROOT");
+        env.remove("XDG_DATA_HOME");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let roaming = dir.path().join("roaming");
+        let native = goose_windows_db(roaming);
+        touch(&native);
+        touch(&goose_windows_db(&home.join("AppData").join("Roaming")));
+        env.set("APPDATA", &roaming);
+        for result in scan_both_entries(&home, "goose", true, &ScannerSettings::default()) {
+            let found = result.goose_db.unwrap();
+            assert_eq!(found, native, "APPDATA beats the home-derived root");
+            assert!(!found.to_string_lossy().contains('/'), "{found:?}");
+        }
+        // The home-derived candidate is native too.
+        env.remove("APPDATA");
+        for result in scan_both_entries(&home, "goose", false, &ScannerSettings::default()) {
+            let found = result.goose_db.unwrap();
+            assert!(!found.to_string_lossy().contains('/'), "{found:?}");
         }
     }
 
