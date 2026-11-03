@@ -180,7 +180,8 @@ fn parse_gen_metadata(
     let model_id = match model_name {
         Some(name) => pricing::aliases::resolve_alias(name).unwrap_or(name),
         None => map_string_field(chat_model, 20, "model_enum")
-            .filter(|text| !text.trim().is_empty())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
             .and_then(pricing::aliases::resolve_alias)
             .unwrap_or("unknown"),
     }
@@ -973,6 +974,17 @@ mod tests {
             assert_eq!(msg.model_id, expected, "enum: {model_enum:?}");
             assert_eq!(msg.provider_id, provider, "enum: {model_enum:?}");
         }
+    }
+
+    #[test]
+    fn model_enum_is_trimmed_before_alias_resolution() {
+        // `resolve_alias` lowercases but does not trim, so an enum carrying
+        // surrounding whitespace used to miss its alias and fall to `unknown`.
+        let msg = parsed_model(None, Some("  MODEL_PLACEHOLDER_M318\n"));
+        assert_eq!(msg.model_id, "gemini-3.8-flash");
+        // A whitespace-only enum is no enum.
+        let msg = parsed_model(None, Some(" \t "));
+        assert_eq!(msg.model_id, "unknown");
     }
 
     #[test]
