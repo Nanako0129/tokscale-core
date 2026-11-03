@@ -7464,4 +7464,28 @@ mod tests {
         let chosen = choose_best_source_result(l, o, None).unwrap();
         assert_eq!(chosen.source, "LiteLLM");
     }
+
+    // The Antigravity route labels resolve to the base model's pricing, and a
+    // suffix nobody listed is not folded by the alias table (it still prices by
+    // the generic unknown-suffix rule, which is existing behavior).
+    #[test]
+    fn gemini_flash_route_labels_price_as_the_base_model() {
+        let lookup = gemini_flash_lookup();
+        let base = lookup
+            .lookup_with_provider("gemini-3.8-flash", Some("google"))
+            .unwrap();
+        for label in ["control", "high", "low", "tiered"] {
+            let id = format!("gemini-3.8-flash-{label}");
+            let result = lookup.lookup_with_provider(&id, Some("google")).unwrap();
+            assert_eq!(result.matched_key, base.matched_key, "label: {label}");
+            assert_eq!(
+                result.pricing.input_cost_per_token, base.pricing.input_cost_per_token,
+                "label: {label}"
+            );
+            assert_eq!(
+                result.pricing.output_cost_per_token, base.pricing.output_cost_per_token,
+                "label: {label}"
+            );
+        }
+    }
 }

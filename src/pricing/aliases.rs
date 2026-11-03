@@ -67,6 +67,14 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("model_placeholder_m133", "gemini-3.5-flash-high");
     m.insert("model_placeholder_m187", "gemini-3.5-flash-extra-low");
     m.insert("model_placeholder_m20", "gemini-3.5-flash-medium");
+    // Antigravity CLI route labels: the service reports one model, Gemini 3.8
+    // Flash, under several responseModel names. Each label observed in real
+    // sessions is listed on its own; an unlisted suffix is deliberately NOT
+    // folded, because a new label may be a different model.
+    m.insert("gemini-3.8-flash-control", "gemini-3.8-flash");
+    m.insert("gemini-3.8-flash-high", "gemini-3.8-flash");
+    m.insert("gemini-3.8-flash-low", "gemini-3.8-flash");
+    m.insert("gemini-3.8-flash-tiered", "gemini-3.8-flash");
     m.insert("gemini-pro-default", "gemini-3.1-pro");
     m.insert("gemini-pro-agent", "gemini-3.1-pro");
     m.insert("gemini-3-flash-agent", "gemini-3.5-flash-high");
@@ -453,5 +461,26 @@ mod tests {
         assert_eq!(medium, "gemini-3.5-flash-medium");
         assert_ne!(low, medium);
         assert_eq!(cli_medium, medium);
+    }
+
+    #[test]
+    fn folds_only_the_observed_gemini_flash_route_labels() {
+        for label in ["control", "high", "low", "tiered"] {
+            assert_eq!(
+                resolve_alias(&format!("gemini-3.8-flash-{label}")),
+                Some("gemini-3.8-flash"),
+                "label: {label}"
+            );
+        }
+        // Not folded: an unobserved suffix may be a different model, and the
+        // base id and the live-model family are not aliases at all.
+        for id in [
+            "gemini-3.8-flash-foo",
+            "gemini-3.8-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.8-live",
+        ] {
+            assert_eq!(resolve_alias(id), None, "id: {id}");
+        }
     }
 }

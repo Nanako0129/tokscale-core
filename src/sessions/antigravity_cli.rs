@@ -844,6 +844,36 @@ mod tests {
     }
 
     #[test]
+    fn flash_route_labels_fold_onto_the_base_model_and_unknown_ones_do_not() {
+        let cases = [
+            ("gemini-3.8-flash", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-control", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-high", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-low", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-tiered", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-foo", "gemini-3.8-flash-foo"),
+            ("gemini-3.8-live", "gemini-3.8-live"),
+        ];
+        for (name, expected) in cases {
+            let blob = build_gen_metadata_with_model(name);
+            let mut seen = HashSet::new();
+            let msg = parse_gen_metadata_default(
+                &blob,
+                "s",
+                1_000,
+                &StepTimestamps::default(),
+                &mut seen,
+            )
+            .expect("parses");
+            assert_eq!(msg.model_id, expected, "name: {name}");
+            // The provider hint is derived from the folded id and stays google.
+            if name.starts_with("gemini-3.8-flash") {
+                assert_eq!(msg.provider_id, "google", "name: {name}");
+            }
+        }
+    }
+
+    #[test]
     fn emitted_model_string_resolves_to_priced_alias() {
         // The parser emits the raw `#19` responseModel (`gemini-3-flash-a`) and
         // relies on the alias table to map it onto a priced model. Without the
