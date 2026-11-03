@@ -178,7 +178,9 @@ const REMOTE_DOMAIN: &[u8] = b"tokenbar-remote-source-context-v1";
 /// 3: the `pi` client no longer derives `~/.omp/agent/sessions` as a scan
 ///    root; that tree belongs to the new `omp` client (upstream #1161).
 /// 4: Roo/Kilo/Cline VS Code roots (upstream #1406).
-const RESOLVER_CONTRACT_VERSION: u32 = 4;
+/// 5: Goose's Windows roaming database, `<roaming>/Block/goose/data/sessions`
+///    (upstream #1458).
+const RESOLVER_CONTRACT_VERSION: u32 = 5;
 
 const ENV_HOME: &str = "HOME";
 const ENV_XDG_DATA_HOME: &str = "XDG_DATA_HOME";
@@ -2813,15 +2815,22 @@ mod tests {
         // reproduced the previous Linux value above at version 3. It was then
         // measured by CI's ubuntu-latest leg (tokscale-core PR #82, run
         // 41516068307), which passed this assertion.
+        //
+        // `RESOLVER_CONTRACT_VERSION` 4 -> 5 (Goose's Windows roaming database,
+        // upstream #1458) moved it again, only through that field. The macOS
+        // value was measured on Apple hardware under Rust 1.96.1. The Linux
+        // value was computed on a Mac with `target_os` branches switched (the
+        // method reproduced the version-4 Linux golden above); confirmed by CI
+        // run 41651616031 (ubuntu-latest, PR #87 head 7f01c269).
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
-            "sc1:360fd836c99bf9f0a5e03995ad85204979ce2720351feee2eb832c522f269c6d"
+            "sc1:2193b08dd1540bf5f470c716141443141add1c9fb94bf8138dee2ce4eb14e0d3"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             identity,
-            "sc1:96762ac9b6eb2bd11f19882997979658269cd6a44fbd092de6c803f152f78591"
+            "sc1:ce8c601157ef014b3f8ce3dfe9d62635bdf6d5cc9a15fc4474bc90d8ebf4f3f4"
         );
 
         // The raw-byte path encoding, unlike the identity, is genuinely
