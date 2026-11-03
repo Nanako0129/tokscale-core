@@ -23,9 +23,6 @@ const ORIGINAL_PROVIDER_PREFIXES: &[&str] = &[
     "anthropic/",
     "openai/",
     "google/",
-    // LiteLLM's namespace for Google's own AI Studio API; OpenRouter spells
-    // the same vendor `google/`.
-    "gemini/",
     "meta-llama/",
     "mistralai/",
     "minimax/",
@@ -36,6 +33,15 @@ const ORIGINAL_PROVIDER_PREFIXES: &[&str] = &[
     "perplexity/",
     "moonshotai/",
 ];
+
+/// LiteLLM's namespace for Google's own AI Studio API (OpenRouter spells the same
+/// vendor `google/`). It is an original-provider prefix for ranking
+/// (`is_original_provider`) but is deliberately NOT in
+/// `ORIGINAL_PROVIDER_PREFIXES`: that list also feeds `has_known_provider_prefix`
+/// (routing), and a raw `gemini/<model>` id must keep taking the unknown-router
+/// path, whose terminal fallback finds the bare exact model. Upstream has no
+/// `has_known_provider_prefix`, so this split is fork-only.
+const LITELLM_GEMINI_NAMESPACE: &str = "gemini/";
 
 const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
     "azure/",
@@ -2528,6 +2534,7 @@ fn is_original_provider(key: &str) -> bool {
     let lower = key.to_lowercase();
     ORIGINAL_PROVIDER_PREFIXES
         .iter()
+        .chain(std::iter::once(&LITELLM_GEMINI_NAMESPACE))
         .any(|prefix| lower.starts_with(prefix))
 }
 
@@ -7500,26 +7507,24 @@ mod tests {
         assert_eq!(result.matched_key, "google/gemini-only-or-1");
     }
 
-    // Side effect (a): `has_known_provider_prefix` now knows `gemini/`, so a raw
-    // `gemini/<model>` id is no longer an "unknown router path". That is an
-    // ordering change: the full-path passes (prefix, fuzzy, suffix-strip) on the
-    // whole id now run before the terminal fallback that strips the prefix.
-    // Pinned by a fixture where the two orders disagree: the raw id
-    // `gemini/gemini-x-1` has a prefix match `gemini/gemini-x-1-preview` and an
-    // exact bare terminal `gemini-x-1`. Without `gemini/` in the list the
-    // terminal fallback answered `gemini-x-1`; with it the full-path prefix pass
-    // answers `gemini/gemini-x-1-preview`.
+    // Routing guard: `gemini/` is an original-provider prefix for ranking only.
+    // If `has_known_provider_prefix` saw it, a raw `gemini/<model>` id would stop
+    // taking the unknown-router path and the full-path passes would run before
+    // the terminal fallback: with `gemini/gemini-x-1-preview` and a bare
+    // `gemini-x-1` in LiteLLM, the raw id `gemini/gemini-x-1` would answer the
+    // preview sibling instead of the exact bare model. It must keep answering
+    // the exact bare model. (Upstream has no `has_known_provider_prefix`.)
     #[test]
-    fn raw_gemini_namespace_id_takes_the_full_path_passes_before_the_terminal_fallback() {
+    fn raw_gemini_namespace_id_keeps_resolving_to_the_exact_bare_model() {
         let mut litellm = HashMap::new();
         litellm.insert("gemini/gemini-x-1-preview".into(), priced(1e-6, 2e-6));
         litellm.insert("gemini-x-1".into(), priced(3e-6, 6e-6));
         let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
         let hit = lookup.lookup("gemini/gemini-x-1").unwrap();
-        assert_eq!(hit.matched_key, "gemini/gemini-x-1-preview");
+        assert_eq!(hit.matched_key, "gemini-x-1");
     }
 
-    // Control (passes without `gemini/` in the list): an exact raw id still
+    // Control (passes with or without the `gemini/` namespace): an exact raw id still
     // resolves, and an id in neither dataset stays unpriced rather than being
     // fuzzily matched to a different model.
     #[test]
