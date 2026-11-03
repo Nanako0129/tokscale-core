@@ -2821,7 +2821,7 @@ mod tests {
         // value was measured on Apple hardware under Rust 1.96.1. The Linux
         // value was computed on a Mac with `target_os` branches switched (the
         // method reproduced the version-4 Linux golden above); confirmed by CI
-        // run <ID>.
+        // run 41651616031 (ubuntu-latest, PR #87 head 7f01c269).
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,

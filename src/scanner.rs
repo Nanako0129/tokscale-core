@@ -4246,13 +4246,13 @@ mod tests {
             ..Default::default()
         };
         for result in scan_both_entries(&home, "goose", true, &settings) {
-            assert_eq!(result.goose_db, Some(legacy.clone()), "no fallthrough");
+            assert_eq!(result.goose_db, Some(legacy.clone()), "excluding the APPDATA DB falls through to the legacy copy");
         }
         // With APPDATA set, a missing database there is not replaced by the
         // home-derived one.
         fs::remove_file(&appdata_db).unwrap();
         for result in scan_both_entries(&home, "goose", true, &env_roots) {
-            assert_eq!(result.goose_db, Some(legacy.clone()), "home root probed");
+            assert_eq!(result.goose_db, Some(legacy.clone()), "a missing APPDATA DB is not replaced by the home-derived root");
         }
     }
 
@@ -4277,8 +4277,11 @@ mod tests {
                 scan_both_entries(&home, "goose", true, &ScannerSettings::default());
             assert_eq!(from_env.goose_db, Some(home_db.clone()), "{appdata:?}");
             assert_eq!(from_context.goose_db, from_env.goose_db, "{appdata:?}");
-            let found = from_context.goose_db.unwrap();
-            assert!(!found.to_string_lossy().contains('/'), "{found:?}");
+            // PathBuf == compares by component on Windows, so `/` and `\\` would
+            // compare equal; check each scanner's spelling directly.
+            for found in [from_env.goose_db.unwrap(), from_context.goose_db.unwrap()] {
+                assert!(!found.to_string_lossy().contains('/'), "{appdata:?} {found:?}");
+            }
         }
     }
 
