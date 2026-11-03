@@ -2647,9 +2647,12 @@ fn select_best_match(
             // `vercel_ai_gateway/deepseek/deepseek-r1` at $0.55/$2.19 — another
             // reseller, chosen for being spelled the other way and having a
             // longer key. Among equally spelled rows a non-reseller still wins.
-            let by_root = candidates
-                .iter()
-                .find(|k| key_root_matches_hint(k, &hint_tags));
+            let by_root = candidates.iter().find(|k| {
+                // Some reseller aliases canonicalize to the hosted vendor
+                // (`vertex_ai` -> `anthropic`). They remain reseller roots,
+                // not the hinted vendor's own top-level row.
+                !is_reseller_provider(k) && key_root_matches_hint(k, &hint_tags)
+            });
             let by_spelling = provider_id.and_then(|hint| {
                 let spelled: Vec<&&String> = candidates
                     .iter()
@@ -7887,5 +7890,39 @@ mod tests {
             .lookup_with_provider("model-r", Some("mistral"))
             .expect("mistral-hinted model-r must price");
         assert_eq!(result.matched_key, "together_ai/mistral/model-r");
+    }
+
+    /// Vertex canonicalizes to Anthropic so an Anthropic hint can find Vertex's
+    /// hosted Claude rows. That alias must not make the reseller's root look
+    /// like Anthropic's own top-level row and outrank an exact-spelling row.
+    #[test]
+    fn reseller_alias_root_does_not_outrank_exact_vendor_spelling() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "vertex_ai/claude-sonnet-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "host/anthropic/claude-sonnet-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000004),
+                output_cost_per_token: Some(0.000020),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+            .expect("anthropic-hinted claude-sonnet-4 must price");
+        assert_eq!(
+            result.matched_key, "host/anthropic/claude-sonnet-4",
+            "a reseller alias root must not impersonate the hinted vendor's own row"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.000020));
     }
 }
