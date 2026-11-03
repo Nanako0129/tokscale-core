@@ -1,7 +1,7 @@
 use super::{aliases, litellm::ModelPricing};
 use crate::{provider_identity, strip_parenthesized_reasoning_tier, TokenBreakdown};
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 const PROVIDER_PREFIXES: &[&str] = &[
     "openai/",
@@ -115,11 +115,28 @@ const MAX_PREFIX_STRIP_SEGMENTS: usize = 2;
 /// Handles tier suffixes (-high, -low) and variant suffixes (-thinking, -codex, -codex-max-xhigh).
 const MAX_SUFFIX_STRIP_SEGMENTS: usize = 4;
 
-#[derive(Clone)]
+/// One resolved lookup, kept for the life of the `PricingLookup` that produced
+/// it. The tables are immutable once built and a refresh builds a new
+/// `PricingLookup`, so an entry can never outlive the table it was resolved from.
 struct CachedResult {
     pricing: ModelPricing,
     source: String,
     matched_key: String,
+    /// `uses_full_session_long_context_tier` of this row, decided once here
+    /// instead of re-derived (string normalisation) on every priced message.
+    full_session_long_context: bool,
+}
+
+impl CachedResult {
+    fn new(result: LookupResult) -> Self {
+        let full_session_long_context = uses_full_session_long_context_tier(&result);
+        Self {
+            pricing: result.pricing,
+            source: result.source,
+            matched_key: result.matched_key,
+            full_session_long_context,
+        }
+    }
 }
 
 struct KeyModelPart {
@@ -151,7 +168,7 @@ pub struct PricingLookup {
     openrouter_model_part: HashMap<String, String>,
     cursor_lower: HashMap<String, String>,
     sakana_lower: HashMap<String, String>,
-    lookup_cache: RwLock<HashMap<String, Option<CachedResult>>>,
+    lookup_cache: RwLock<HashMap<String, Option<Arc<CachedResult>>>>,
 }
 
 pub struct LookupResult {
@@ -276,9 +293,25 @@ impl PricingLookup {
         model_id: &str,
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
+        self.lookup_entry(model_id, provider_id)
+            .map(|c| LookupResult {
+                pricing: c.pricing.clone(),
+                source: c.source.clone(),
+                matched_key: c.matched_key.clone(),
+            })
+    }
+
+    /// The cached resolution for (provider hint, model id). A hint that was
+    /// given but normalises to nothing (blank, `unknown`) is resolved fresh on
+    /// every call and never cached.
+    fn lookup_entry(&self, model_id: &str, provider_id: Option<&str>) -> Option<Arc<CachedResult>> {
+        let resolve = || {
+            self.lookup_with_source_and_provider(model_id, None, provider_id)
+                .map(|r| Arc::new(CachedResult::new(r)))
+        };
         let normalized_provider_id = normalize_provider_hint(provider_id);
         if provider_id.is_some() && normalized_provider_id.is_none() {
-            return self.lookup_with_source_and_provider(model_id, None, provider_id);
+            return resolve();
         }
         let cache_key = build_lookup_cache_key(model_id, normalized_provider_id);
         if let Some(cached) = self
@@ -287,14 +320,10 @@ impl PricingLookup {
             .ok()
             .and_then(|c| c.get(&cache_key).cloned())
         {
-            return cached.map(|c| LookupResult {
-                pricing: c.pricing,
-                source: c.source,
-                matched_key: c.matched_key,
-            });
+            return cached;
         }
 
-        let result = self.lookup_with_source_and_provider(model_id, None, provider_id);
+        let entry = resolve();
 
         if let Ok(mut cache) = self.lookup_cache.write() {
             if cache.len() >= MAX_LOOKUP_CACHE_ENTRIES {
@@ -307,17 +336,10 @@ impl PricingLookup {
                     cache.remove(&key);
                 }
             }
-            cache.insert(
-                cache_key,
-                result.as_ref().map(|r| CachedResult {
-                    pricing: r.pricing.clone(),
-                    source: r.source.clone(),
-                    matched_key: r.matched_key.clone(),
-                }),
-            );
+            cache.insert(cache_key, entry.clone());
         }
 
-        result
+        entry
     }
 
     pub fn lookup_with_source(
@@ -1358,8 +1380,12 @@ impl PricingLookup {
         provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> Option<CostEstimate> {
-        let result = self.lookup_with_provider(model_id, provider_id)?;
-        Some(compute_cost_and_coverage_for_lookup_result(&result, usage))
+        let entry = self.lookup_entry(model_id, provider_id)?;
+        Some(compute_cost_and_coverage(
+            &entry.pricing,
+            entry.full_session_long_context,
+            usage,
+        ))
     }
 
     pub fn calculate_cost_with_provider(
@@ -1377,9 +1403,21 @@ pub(crate) fn compute_cost_and_coverage_for_lookup_result(
     result: &LookupResult,
     usage: &TokenBreakdown,
 ) -> CostEstimate {
-    let cost = if uses_full_session_long_context_tier(result) {
+    compute_cost_and_coverage(
+        &result.pricing,
+        uses_full_session_long_context_tier(result),
+        usage,
+    )
+}
+
+fn compute_cost_and_coverage(
+    pricing: &ModelPricing,
+    full_session_long_context: bool,
+    usage: &TokenBreakdown,
+) -> CostEstimate {
+    let cost = if full_session_long_context {
         compute_full_session_long_context_cost(
-            &result.pricing,
+            pricing,
             usage.input,
             usage.output,
             usage.cache_read,
@@ -1389,7 +1427,7 @@ pub(crate) fn compute_cost_and_coverage_for_lookup_result(
         )
     } else {
         compute_cost(
-            &result.pricing,
+            pricing,
             usage.input,
             usage.output,
             usage.cache_read,
@@ -1401,7 +1439,7 @@ pub(crate) fn compute_cost_and_coverage_for_lookup_result(
 
     CostEstimate {
         cost,
-        coverage: coverage_for_lookup_result(result, usage),
+        coverage: coverage_for_pricing(pricing, full_session_long_context, usage),
     }
 }
 
@@ -1517,7 +1555,11 @@ fn selected_long_context_bucket_coverage(
     })
 }
 
-fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> EstimateCoverage {
+fn coverage_for_pricing(
+    pricing: &ModelPricing,
+    full_session_long_context: bool,
+    usage: &TokenBreakdown,
+) -> EstimateCoverage {
     let input_clamped = usage.input.max(0) as f64;
     let output_clamped = usage.output.max(0).saturating_add(usage.reasoning.max(0)) as f64;
     let cache_read_clamped = usage.cache_read.max(0) as f64;
@@ -1526,83 +1568,83 @@ fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> 
     let cache_write_5m_clamped = cache_write_clamped - cache_write_1h_clamped;
     let mut fold = CoverageFold::default();
 
-    if uses_full_session_long_context_tier(result) {
+    if full_session_long_context {
         let use_long_context_rates =
             input_clamped + cache_read_clamped > TIERED_PRICING_THRESHOLD_272K_TOKENS;
         fold.observe(selected_long_context_bucket_coverage(
             input_clamped,
-            result.pricing.input_cost_per_token,
-            result.pricing.input_cost_per_token_above_272k_tokens,
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_272k_tokens,
             use_long_context_rates,
         ));
         fold.observe(selected_long_context_bucket_coverage(
             output_clamped,
-            result.pricing.output_cost_per_token,
-            result.pricing.output_cost_per_token_above_272k_tokens,
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_272k_tokens,
             use_long_context_rates,
         ));
         fold.observe(selected_long_context_bucket_coverage(
             cache_read_clamped,
-            result.pricing.cache_read_input_token_cost,
-            result.pricing.cache_read_input_token_cost_above_272k_tokens,
+            pricing.cache_read_input_token_cost,
+            pricing.cache_read_input_token_cost_above_272k_tokens,
             use_long_context_rates,
         ));
     } else {
         fold.observe(ordinary_bucket_coverage(
             input_clamped,
-            result.pricing.input_cost_per_token,
+            pricing.input_cost_per_token,
             &[
                 (
                     TIERED_PRICING_THRESHOLD_128K_TOKENS,
-                    result.pricing.input_cost_per_token_above_128k_tokens,
+                    pricing.input_cost_per_token_above_128k_tokens,
                 ),
                 (
                     TIERED_PRICING_THRESHOLD_200K_TOKENS,
-                    result.pricing.input_cost_per_token_above_200k_tokens,
+                    pricing.input_cost_per_token_above_200k_tokens,
                 ),
                 (
                     TIERED_PRICING_THRESHOLD_256K_TOKENS,
-                    result.pricing.input_cost_per_token_above_256k_tokens,
+                    pricing.input_cost_per_token_above_256k_tokens,
                 ),
                 (
                     TIERED_PRICING_THRESHOLD_272K_TOKENS,
-                    result.pricing.input_cost_per_token_above_272k_tokens,
+                    pricing.input_cost_per_token_above_272k_tokens,
                 ),
             ],
         ));
         fold.observe(ordinary_bucket_coverage(
             output_clamped,
-            result.pricing.output_cost_per_token,
+            pricing.output_cost_per_token,
             &[
                 (
                     TIERED_PRICING_THRESHOLD_128K_TOKENS,
-                    result.pricing.output_cost_per_token_above_128k_tokens,
+                    pricing.output_cost_per_token_above_128k_tokens,
                 ),
                 (
                     TIERED_PRICING_THRESHOLD_200K_TOKENS,
-                    result.pricing.output_cost_per_token_above_200k_tokens,
+                    pricing.output_cost_per_token_above_200k_tokens,
                 ),
                 (
                     TIERED_PRICING_THRESHOLD_256K_TOKENS,
-                    result.pricing.output_cost_per_token_above_256k_tokens,
+                    pricing.output_cost_per_token_above_256k_tokens,
                 ),
                 (
                     TIERED_PRICING_THRESHOLD_272K_TOKENS,
-                    result.pricing.output_cost_per_token_above_272k_tokens,
+                    pricing.output_cost_per_token_above_272k_tokens,
                 ),
             ],
         ));
         fold.observe(ordinary_bucket_coverage(
             cache_read_clamped,
-            result.pricing.cache_read_input_token_cost,
+            pricing.cache_read_input_token_cost,
             &[
                 (
                     TIERED_PRICING_THRESHOLD_200K_TOKENS,
-                    result.pricing.cache_read_input_token_cost_above_200k_tokens,
+                    pricing.cache_read_input_token_cost_above_200k_tokens,
                 ),
                 (
                     TIERED_PRICING_THRESHOLD_272K_TOKENS,
-                    result.pricing.cache_read_input_token_cost_above_272k_tokens,
+                    pricing.cache_read_input_token_cost_above_272k_tokens,
                 ),
             ],
         ));
@@ -1615,33 +1657,31 @@ fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> 
     // Complete while the 1h half silently cost zero.
     fold.observe(ordinary_bucket_coverage(
         cache_write_5m_clamped,
-        result.pricing.cache_creation_input_token_cost,
+        pricing.cache_creation_input_token_cost,
         &[(
             TIERED_PRICING_THRESHOLD_200K_TOKENS,
-            result
-                .pricing
-                .cache_creation_input_token_cost_above_200k_tokens,
+            pricing.cache_creation_input_token_cost_above_200k_tokens,
         )],
     ));
     fold.observe(ordinary_bucket_coverage(
         cache_write_1h_clamped,
-        result.pricing.input_cost_per_token,
+        pricing.input_cost_per_token,
         &[
             (
                 TIERED_PRICING_THRESHOLD_128K_TOKENS,
-                result.pricing.input_cost_per_token_above_128k_tokens,
+                pricing.input_cost_per_token_above_128k_tokens,
             ),
             (
                 TIERED_PRICING_THRESHOLD_200K_TOKENS,
-                result.pricing.input_cost_per_token_above_200k_tokens,
+                pricing.input_cost_per_token_above_200k_tokens,
             ),
             (
                 TIERED_PRICING_THRESHOLD_256K_TOKENS,
-                result.pricing.input_cost_per_token_above_256k_tokens,
+                pricing.input_cost_per_token_above_256k_tokens,
             ),
             (
                 TIERED_PRICING_THRESHOLD_272K_TOKENS,
-                result.pricing.input_cost_per_token_above_272k_tokens,
+                pricing.input_cost_per_token_above_272k_tokens,
             ),
         ],
     ));
@@ -5586,7 +5626,7 @@ mod tests {
             source: "LiteLLM".to_string(),
         };
         assert_ne!(
-            coverage_for_lookup_result(&result, &usage),
+            compute_cost_and_coverage_for_lookup_result(&result, &usage).coverage,
             EstimateCoverage::Complete,
             "an unpriced 1h half must not be reported as fully covered"
         );
@@ -5627,7 +5667,7 @@ mod tests {
             "every token is priced"
         );
         assert_eq!(
-            coverage_for_lookup_result(&result, &usage),
+            compute_cost_and_coverage_for_lookup_result(&result, &usage).coverage,
             EstimateCoverage::Complete,
             "an empty 5m bucket must not be observed against a missing rate"
         );
@@ -6859,6 +6899,151 @@ mod tests {
             r_unknown.matched_key, r_none.matched_key,
             "unknown hint via source_and_provider should behave like None"
         );
+    }
+
+    fn memo_table(foo_anthropic: f64, foo_openai: f64) -> PricingLookup {
+        let mut litellm = HashMap::new();
+        for (key, input) in [("anthropic/foo", foo_anthropic), ("openai/foo", foo_openai)] {
+            litellm.insert(
+                key.into(),
+                ModelPricing {
+                    input_cost_per_token: Some(input),
+                    output_cost_per_token: Some(input * 4.0),
+                    ..Default::default()
+                },
+            );
+        }
+        litellm.insert(
+            "gpt-5.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                input_cost_per_token_above_272k_tokens: Some(0.000010),
+                output_cost_per_token: Some(0.000030),
+                output_cost_per_token_above_272k_tokens: Some(0.000045),
+                ..Default::default()
+            },
+        );
+        PricingLookup::new(litellm, HashMap::new(), HashMap::new())
+    }
+
+    fn memo_key(estimate: Option<CostEstimate>) -> Option<(u64, EstimateCoverage)> {
+        estimate.map(|e| (e.cost.to_bits(), e.coverage))
+    }
+
+    /// The memoised estimate must equal a fresh, uncached resolution for every
+    /// (model, hint) pair, in any order and however often a pair repeats.
+    #[test]
+    fn test_estimate_memo_matches_uncached_resolution_per_hint() {
+        let usage = TokenBreakdown {
+            input: 300_000,
+            output: 1_000,
+            cache_read: 50,
+            ..Default::default()
+        };
+        let hints = [
+            None,
+            Some("anthropic"),
+            Some("openai"),
+            Some("Anthropic"),
+            Some(" openai "),
+            Some("unknown"),
+            Some(""),
+        ];
+        let table = memo_table(0.000001, 0.000002);
+
+        for _ in 0..3 {
+            for model in ["foo", "gpt-5.5", "missing"] {
+                for hint in hints {
+                    let want = table
+                        .lookup_with_source_and_provider(model, None, hint)
+                        .map(|r| compute_cost_and_coverage_for_lookup_result(&r, &usage));
+                    let got = table.estimate_cost_with_provider(model, hint, &usage);
+                    assert_eq!(memo_key(got), memo_key(want), "{model} / {hint:?}");
+                }
+            }
+        }
+
+        let cost = |hint| {
+            table
+                .estimate_cost_with_provider("foo", hint, &usage)
+                .unwrap()
+                .cost
+        };
+        assert_ne!(cost(Some("anthropic")), cost(Some("openai")));
+        // Control: the memo really stores. A repeat lookup returns the very
+        // same entry, and the blank and unknown hints stay out of the cache.
+        assert!(!table.lookup_cache.read().unwrap().is_empty());
+        let (first, again) = (
+            table.lookup_entry("foo", Some("anthropic")).unwrap(),
+            table.lookup_entry("foo", Some("anthropic")).unwrap(),
+        );
+        assert!(Arc::ptr_eq(&first, &again));
+        let fresh = memo_table(0.000001, 0.000002);
+        fresh.lookup_entry("foo", Some("unknown"));
+        fresh.lookup_entry("foo", Some(""));
+        assert!(fresh.lookup_cache.read().unwrap().is_empty());
+        // The request-wide tier flag is part of the memoised entry: 300K input
+        // crosses 272K, so the long-context rate applies to the whole request.
+        let gpt = table
+            .estimate_cost_with_provider("gpt-5.5", None, &usage)
+            .unwrap()
+            .cost;
+        assert!((gpt - (300_000.0 * 0.000010 + 1_000.0 * 0.000045)).abs() < 1e-9);
+    }
+
+    /// Past MAX_LOOKUP_CACHE_ENTRIES the cache evicts a quarter of its entries.
+    /// Every model has its own price, so an entry served for the wrong key, or
+    /// a stale one after eviction, shows up as a cost that differs from the
+    /// uncached resolution.
+    #[test]
+    fn test_estimate_memo_matches_uncached_resolution_across_eviction() {
+        let n = MAX_LOOKUP_CACHE_ENTRIES + 90;
+        let name = |i: usize| format!("memo-model-{i}");
+        let litellm: HashMap<String, ModelPricing> = (0..n)
+            .map(|i| {
+                (
+                    name(i),
+                    ModelPricing {
+                        input_cost_per_token: Some((i + 1) as f64 * 1e-9),
+                        output_cost_per_token: Some((i + 1) as f64 * 4e-9),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let table = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1_000,
+            output: 10,
+            ..Default::default()
+        };
+        let hint = Some("openai");
+
+        let cached = |i: usize| {
+            let key = build_lookup_cache_key(&name(i), normalize_provider_hint(hint));
+            table.lookup_cache.read().unwrap().contains_key(&key)
+        };
+
+        for round in 0..3 {
+            for i in 0..n {
+                let want = table
+                    .lookup_with_source_and_provider(&name(i), None, hint)
+                    .map(|r| compute_cost_and_coverage_for_lookup_result(&r, &usage));
+                let got = table.estimate_cost_with_provider(&name(i), hint, &usage);
+                assert_eq!(memo_key(got), memo_key(want), "round {round} model {i}");
+                let len = table.lookup_cache.read().unwrap().len();
+                assert!(len <= MAX_LOOKUP_CACHE_ENTRIES, "cache grew to {len}");
+            }
+            // Eviction happened rather than the cache refusing new entries:
+            // the newest key is in, some earlier key is out, and looking that
+            // one up again resolves it and inserts it.
+            assert!(cached(n - 1), "round {round}: newest entry not inserted");
+            let evicted = (0..n)
+                .find(|&i| !cached(i))
+                .unwrap_or_else(|| panic!("round {round}: nothing was evicted"));
+            table.estimate_cost_with_provider(&name(evicted), hint, &usage);
+            assert!(cached(evicted), "round {round}: re-lookup not inserted");
+        }
     }
 
     #[test]
