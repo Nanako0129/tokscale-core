@@ -2541,6 +2541,10 @@ fn is_original_provider(key: &str) -> bool {
 /// Whether the dataset key's leading segment *is* the hinted vendor, rather
 /// than a reseller that merely nests the vendor deeper in the key.
 ///
+/// Fork note: the `novita-ai` -> `novita` fold this example needs is upstream's
+/// (32706153, not ported here); the same shape holds for any fold this fork has,
+/// such as `minimaxai/` against a `minimax` hint.
+///
 /// `poe/novita/kimi-k2.6` and `novita-ai/moonshotai/kimi-k2.6` both carry the
 /// tag `novita`, but only the second is Novita's own row; the first is Poe
 /// reselling it at $0.96/$4.04 per MTok against Novita's $0.80/$3.40.
@@ -2647,6 +2651,13 @@ fn select_best_match(
                 .find(|k| is_reseller_provider(k))
                 .or_else(|| candidates.first())
         } else {
+            // Fork note: the `deepseek-ai`, `novita-ai` and Together/DeepSeek
+            // examples below are upstream's and rely on folds this fork does not
+            // have (32706153, not ported). Here the same tiers act through the
+            // folds it does have (`mistral`/`mistralai`, `minimax`/`minimaxai`,
+            // `zai`/`z-ai`, `vertex_ai`/`anthropic`, ...); see the
+            // `fork_vendor_spelling_*` tests.
+            //
             // The vendor-spelling fold (`deepseek-ai` -> `deepseek`) widens
             // this pool: a `deepseek` hint now matches both
             // `novita/deepseek/<model>` and `cloudflare/@cf/deepseek-ai/<model>`,
@@ -2843,8 +2854,16 @@ fn choose_best_source_result(
 }
 
 /// Returns true when the LiteLLM match should win over the OpenRouter one.
-/// Prefers the source whose key matches the provider hint, then original
-/// providers over resellers; LiteLLM breaks an otherwise exact tie.
+/// Tiers, in order: the source whose key matches the provider hint; then the
+/// source whose key is rooted at the hinted vendor (the provider-root step,
+/// upstream `643525bf`; it can only decide when exactly one side is rooted
+/// there); then original providers over resellers; LiteLLM breaks an otherwise
+/// exact tie.
+///
+/// Fuzzy arbitration passes through the root step too, as upstream's does: an
+/// id that matches no dataset key exactly but fuzzy-matches under an
+/// `openai`/`anthropic` hint can price as a different model when a
+/// vendor-rooted key wins (measured: `codex-auto-review`, see UPSTREAM.md).
 fn prefer_litellm_over_openrouter(
     l: &LookupResult,
     o: &LookupResult,
@@ -6136,23 +6155,18 @@ mod tests {
         /// `anthropic` hint the reseller LiteLLM entry won and priced cache
         /// writes at zero (#1329).
         ///
-        /// Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`) with
-        /// the assertions retargeted, because the two trees settle this
-        /// differently. Upstream has no cache backfill, so once the OpenRouter
-        /// entry reaches arbitration it wins outright and upstream asserts
-        /// `source == "OpenRouter"`. This tree has `backfill_cache_costs`
-        /// (local since `8bf52d4`, never adopted upstream), so the (Some, Some)
-        /// branch keeps the hint-matching LiteLLM key as the winner and grafts
-        /// the missing rate onto it. Different mechanism, same outcome for the
-        /// user: the cache-write rate stops being zero.
-        ///
-        /// Since the provider-root port (upstream `643525bf`) the root step
-        /// elects OpenRouter's own `anthropic/` row over LiteLLM's
-        /// `perplexity/anthropic/` row before the backfill matters, so this
-        /// tree now asserts what upstream does, `source == "OpenRouter"`; the
-        /// cache rate comes from that row itself. Measured: the test passes
-        /// with the fuzzy normalized retry deleted (the exact normalization
-        /// pass already finds the dotted key), so it does not guard that retry;
+        /// Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`). The
+        /// assertion on the winner has changed twice. Before the provider-root
+        /// port this tree asserted LiteLLM `perplexity/anthropic/...` as the
+        /// winner with OpenRouter as the backfill donor (this tree has
+        /// `backfill_cache_costs`, never adopted upstream). Since the port
+        /// (upstream `643525bf`) the root step elects OpenRouter's own
+        /// `anthropic/claude-haiku-4.5` row over LiteLLM's `perplexity/anthropic/`
+        /// row, so the test asserts what upstream does: `source == "OpenRouter"`,
+        /// with the cache-write rate coming from that row itself (no backfill
+        /// involved). Measured: the test passes with the fuzzy normalized retry
+        /// deleted (the exact normalization pass already finds the dotted key),
+        /// so it does not guard that retry;
         /// `..._normalized_retry_reaches_a_suffixed_key` does.
     #[test]
     fn test_fuzzy_openrouter_crosses_version_separator_difference() {
@@ -7602,6 +7616,11 @@ mod tests {
         assert_eq!(chosen.source, "LiteLLM");
     }
 
+    // CONTROL: passes without the route-label aliases, because the generic
+    // unknown-suffix rule already priced each label as the base model (measured
+    // by removing the aliases). It documents that the aliases change grouping,
+    // not pricing; the alias and parser tests are the red ones.
+    //
     // The Antigravity route labels resolve to the base model's pricing, and a
     // suffix nobody listed is not folded by the alias table (it still prices by
     // the generic unknown-suffix rule, which is existing behavior).
@@ -7753,6 +7772,11 @@ mod tests {
         );
     }
 
+    /// CONTROL in this fork: passes without the vendor-spelling preference (the
+    /// unhinted path has no vendor spelling to prefer, and the `deepseek-ai`
+    /// fold that would put the cloudflare row in the pool is not in this tree;
+    /// measured by disabling the preference).
+    ///
     /// Kimi, Warp, Kiro, Codebuff and Tencent Buddy report the literal string
     /// `unknown` when they cannot name a provider, and `normalize_provider_hint`
     /// drops it, so the unhinted path is reached in production. It has no
@@ -7828,11 +7852,12 @@ mod tests {
         assert_eq!(result.matched_key, "h/mistral/model-q");
     }
 
-    /// Pins the `has_root_match` guard: the hinted vendor's own top-level row
-    /// (`minimaxai/` folds to `minimax`) is the longer key here, so it is what
-    /// key order picks; the spelling preference alone would move the lookup
-    /// onto the shorter nested `gw/minimax/...` row. Fails only when the guard
-    /// is removed, not before the preference exists.
+    /// Pins the `by_root` tier (which replaced the `has_root_match` guard in
+    /// upstream 6e16ff6b): the hinted vendor's own top-level row (`minimaxai/`
+    /// folds to `minimax`) is the longer key here, so key order picks it, while
+    /// the spelling preference alone would move the lookup onto the shorter
+    /// nested `gw/minimax/...` row. Passes before the preference exists; fails
+    /// when `by_root` is disabled (verified).
     #[test]
     fn fork_vendor_spelling_preference_yields_to_the_hinted_vendors_own_row() {
         let mut litellm = HashMap::new();

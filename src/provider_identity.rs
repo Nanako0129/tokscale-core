@@ -116,6 +116,12 @@ fn raw_provider_segments(value: &str) -> Vec<String> {
 
 /// Whether `dataset_key` spells a vendor exactly the way `provider_id` does.
 ///
+/// Fork note: the `deepseek-ai` -> `deepseek` example below is upstream's. This
+/// fork does not have that fold (junhoyeo/tokscale 32706153, not ported); the
+/// folds it does have are the ones in `canonicalize_provider_segment` (for
+/// example `mistral`/`mistralai`, `minimax`/`minimaxai`, `zai`/`z-ai`,
+/// `vertex_ai`/`anthropic`).
+///
 /// `canonicalize_provider_segment` folds spelling variants of one vendor
 /// together (`deepseek-ai` -> `deepseek`) so a hint can reach rows that spell
 /// the vendor the other way. That fold also widens the candidate pool: a

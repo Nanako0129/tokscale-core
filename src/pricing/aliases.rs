@@ -67,10 +67,12 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("model_placeholder_m133", "gemini-3.5-flash-high");
     m.insert("model_placeholder_m187", "gemini-3.5-flash-extra-low");
     m.insert("model_placeholder_m20", "gemini-3.5-flash-medium");
-    // Antigravity CLI route labels: the service reports one model, Gemini 3.8
-    // Flash, under several responseModel names. Each label observed in real
-    // sessions is listed on its own; an unlisted suffix is deliberately NOT
-    // folded, because a new label may be a different model.
+    // Antigravity CLI route labels onto Gemini 3.8 Flash. Only `-n` (below) is
+    // observed on the maintainer's data. `-control`, `-high`, `-low` and
+    // `-tiered` are taken from Nanako0129/tokscale-core#34 and are unmeasured
+    // here, so that they are routes onto one model rather than different models
+    // is #34's claim. Each label is listed on its own; an unlisted suffix is
+    // deliberately NOT folded, because a new label may be a different model.
     m.insert("gemini-3.8-flash-control", "gemini-3.8-flash");
     m.insert("gemini-3.8-flash-high", "gemini-3.8-flash");
     m.insert("gemini-3.8-flash-low", "gemini-3.8-flash");
