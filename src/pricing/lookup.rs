@@ -7501,22 +7501,40 @@ mod tests {
     }
 
     // Side effect (a): `has_known_provider_prefix` now knows `gemini/`, so a raw
-    // `gemini/<model>` id is no longer an "unknown router path" restricted to a
-    // full-key exact lookup; it takes the full `lookup_auto` path.
+    // `gemini/<model>` id is no longer an "unknown router path". That is an
+    // ordering change: the full-path passes (prefix, fuzzy, suffix-strip) on the
+    // whole id now run before the terminal fallback that strips the prefix.
+    // Pinned by a fixture where the two orders disagree: the raw id
+    // `gemini/gemini-x-1` has a prefix match `gemini/gemini-x-1-preview` and an
+    // exact bare terminal `gemini-x-1`. Without `gemini/` in the list the
+    // terminal fallback answered `gemini-x-1`; with it the full-path prefix pass
+    // answers `gemini/gemini-x-1-preview`.
     #[test]
-    fn raw_gemini_namespace_id_resolves_and_unknown_one_stays_unpriced() {
+    fn raw_gemini_namespace_id_takes_the_full_path_passes_before_the_terminal_fallback() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gemini/gemini-x-1-preview".into(), priced(1e-6, 2e-6));
+        litellm.insert("gemini-x-1".into(), priced(3e-6, 6e-6));
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let hit = lookup.lookup("gemini/gemini-x-1").unwrap();
+        assert_eq!(hit.matched_key, "gemini/gemini-x-1-preview");
+    }
+
+    // Control (passes without `gemini/` in the list): an exact raw id still
+    // resolves, and an id in neither dataset stays unpriced rather than being
+    // fuzzily matched to a different model.
+    #[test]
+    fn raw_gemini_namespace_id_control_exact_hit_and_unknown_id() {
         let lookup = gemini_flash_lookup();
         let hit = lookup.lookup("gemini/gemini-3.8-flash").unwrap();
         assert_eq!(hit.source, "LiteLLM");
         assert_eq!(hit.matched_key, "gemini/gemini-3.8-flash");
-
-        // Not in either dataset and not a variant of a priced model: must not
-        // be fuzzily matched to a different model.
         assert!(lookup.lookup("gemini/not-a-real-model-7").is_none());
     }
 
-    // Side effect (b): `select_best_match` ranks a `gemini/` key above the first
-    // non-reseller key under any hint, including none.
+    // Side effect (b): in `select_best_match` a `gemini/` key now counts as
+    // original, so it outranks the first non-reseller key when no hint is given.
+    // (A reseller hint takes the `prefer_reseller` branch instead, and a longer
+    // original key can still come first.)
     #[test]
     fn select_best_match_prefers_gemini_namespace_key_without_a_hint() {
         let mut dataset = HashMap::new();

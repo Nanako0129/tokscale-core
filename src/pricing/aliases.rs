@@ -82,9 +82,11 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     // may be a different model.
     m.insert("gemini-3.8-flash-n", "gemini-3.8-flash");
     // Rows with no responseModel name carry `chatModel.#20`'s `model_enum`.
-    // Nanako0129/tokscale-core#34 reported M318 on the plain, `-control` and
-    // `-high` rows and M322 on the tiered rows; both are Gemini 3.8 Flash. Not
-    // re-measured here: the 2026-11-03 local run moved no row via these enums.
+    // Measured on the maintainer's data (2026-11-03): plain `gemini-3.8-flash`
+    // rows carry M318 (612 of 612 antigravity-cli rows), and so do 99 of the 101
+    // `gemini-3.8-flash-n` rows. Taken from Nanako0129/tokscale-core#34 and NOT
+    // measured here (no such rows exist locally): M322 on the tiered rows and
+    // M318 on the `-control` and `-high` rows.
     m.insert("model_placeholder_m318", "gemini-3.8-flash");
     m.insert("model_placeholder_m322", "gemini-3.8-flash");
     m.insert("gemini-pro-default", "gemini-3.1-pro");
