@@ -75,6 +75,12 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("gemini-3.8-flash-high", "gemini-3.8-flash");
     m.insert("gemini-3.8-flash-low", "gemini-3.8-flash");
     m.insert("gemini-3.8-flash-tiered", "gemini-3.8-flash");
+    // `-n` is the label actually present in the maintainer's data. 99 of its 101
+    // antigravity-cli rows carry M318, the same model_enum as plain
+    // `gemini-3.8-flash`; the remaining rows carry M319 or M320, which are
+    // unmapped. Folded on that majority evidence, accepting that those few rows
+    // may be a different model.
+    m.insert("gemini-3.8-flash-n", "gemini-3.8-flash");
     // Rows with no responseModel name carry `chatModel.#20`'s `model_enum`.
     // Nanako0129/tokscale-core#34 reported M318 on the plain, `-control` and
     // `-high` rows and M322 on the tiered rows; both are Gemini 3.8 Flash. Not
@@ -473,7 +479,7 @@ mod tests {
 
     #[test]
     fn folds_only_the_observed_gemini_flash_route_labels() {
-        for label in ["control", "high", "low", "tiered"] {
+        for label in ["control", "high", "low", "tiered", "n"] {
             assert_eq!(
                 resolve_alias(&format!("gemini-3.8-flash-{label}")),
                 Some("gemini-3.8-flash"),

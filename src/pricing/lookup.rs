@@ -7474,7 +7474,7 @@ mod tests {
         let base = lookup
             .lookup_with_provider("gemini-3.8-flash", Some("google"))
             .unwrap();
-        for label in ["control", "high", "low", "tiered"] {
+        for label in ["control", "high", "low", "tiered", "n"] {
             let id = format!("gemini-3.8-flash-{label}");
             let result = lookup.lookup_with_provider(&id, Some("google")).unwrap();
             assert_eq!(result.matched_key, base.matched_key, "label: {label}");
