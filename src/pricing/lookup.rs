@@ -2546,9 +2546,9 @@ fn key_root_matches_hint(key: &str, hint_tags: &[String]) -> bool {
         .any(|tag| hint_tags.iter().any(|hint| hint == tag))
 }
 
-/// Whether provider matching aliases a hosting platform's root to a different
-/// hinted vendor. Such aliases make the hosted row reachable, but do not make
-/// it the hinted vendor's own top-level row.
+/// Whether provider-tag folding makes the key root and hint match despite
+/// naming different billing endpoints. The alias keeps fallback rows reachable,
+/// but neither endpoint's root is the other endpoint's own top-level row.
 fn key_root_is_cross_provider_alias(key: &str, provider_id: &str) -> bool {
     let normalize_root = |value: &str| {
         value
@@ -2565,8 +2565,13 @@ fn key_root_is_cross_provider_alias(key: &str, provider_id: &str) -> bool {
 
     matches!(
         (root.as_str(), hint.as_str()),
-        ("vertex" | "vertex_ai", "anthropic")
+        ("vertex" | "vertex_ai", "anthropic") | ("anthropic", "vertex" | "vertex_ai")
     )
+}
+
+fn key_root_matches_provider_hint(key: &str, provider_id: &str) -> bool {
+    let hint_tags = provider_identity::provider_tags(provider_id);
+    key_root_matches_hint(key, &hint_tags) && !key_root_is_cross_provider_alias(key, provider_id)
 }
 
 fn is_reseller_provider(key: &str) -> bool {
@@ -2649,16 +2654,18 @@ fn select_best_match(
             // rate on the same weights.
             //
             // So the pool is ranked explicitly instead of leaning on key
-            // order. A first-party row wins outright. Next comes the hinted
-            // vendor's own top-level row: `novita-ai/moonshotai/kimi-k2.6` at
-            // $0.80/$3.40 is Novita's own, while `poe/novita/kimi-k2.6` at
-            // $0.96/$4.04 spells `novita` in a nested segment only because Poe
-            // is reselling it. Ranking that row rather than merely detecting it
-            // matters, because candidates are ordered longest key first and the
-            // vendor's own row is usually the shorter one:
-            // `vercel_ai_gateway/zai/glm-4.6` at $0.45/$1.80 would otherwise be
-            // billed for a `zai` hint that Z.ai itself publishes at
-            // `zai/glm-4.6`, $0.60/$2.20.
+            // order. The hinted vendor's own top-level row wins first:
+            // `novita-ai/moonshotai/kimi-k2.6` at $0.80/$3.40 is Novita's own,
+            // while `poe/novita/kimi-k2.6` at $0.96/$4.04 spells `novita` in a
+            // nested segment only because Poe is reselling it. Ranking that row
+            // rather than merely detecting it matters, because candidates are
+            // ordered longest key first and the vendor's own row is usually the
+            // shorter one: `vercel_ai_gateway/zai/glm-4.6` at $0.45/$1.80 would
+            // otherwise be billed for a `zai` hint that Z.ai itself publishes
+            // at `zai/glm-4.6`, $0.60/$2.20. A raw Vertex hint similarly keeps
+            // Vertex's hosted row ahead of Anthropic's row, while an Anthropic
+            // hint excludes that cross-provider root alias. A first-party row
+            // is the next tier.
             //
             // Then comes a row that spells the vendor exactly as the hint does,
             // in preference to one that only matches after folding. That row is
@@ -2685,10 +2692,8 @@ fn select_best_match(
                     .find(|k| !is_reseller_provider(k))
                     .or_else(|| spelled.first().copied())
             });
-            candidates
-                .iter()
-                .find(|k| is_original_provider(k))
-                .or(by_root)
+            by_root
+                .or_else(|| candidates.iter().find(|k| is_original_provider(k)))
                 .or(by_spelling)
                 .or_else(|| candidates.iter().find(|k| !is_reseller_provider(k)))
                 .or_else(|| candidates.first())
@@ -2845,6 +2850,17 @@ fn prefer_litellm_over_openrouter(
         return true;
     }
     if o_matches_provider && !l_matches_provider {
+        return false;
+    }
+
+    let l_matches_root =
+        provider_id.is_some_and(|hint| key_root_matches_provider_hint(&l.matched_key, hint));
+    let o_matches_root =
+        provider_id.is_some_and(|hint| key_root_matches_provider_hint(&o.matched_key, hint));
+    if l_matches_root && !o_matches_root {
+        return true;
+    }
+    if o_matches_root && !l_matches_root {
         return false;
     }
 
@@ -6122,6 +6138,15 @@ mod tests {
         /// branch keeps the hint-matching LiteLLM key as the winner and grafts
         /// the missing rate onto it. Different mechanism, same outcome for the
         /// user: the cache-write rate stops being zero.
+        ///
+        /// Since the provider-root port (upstream `643525bf`) the root step
+        /// elects OpenRouter's own `anthropic/` row over LiteLLM's
+        /// `perplexity/anthropic/` row before the backfill matters, so this
+        /// tree now asserts what upstream does, `source == "OpenRouter"`; the
+        /// cache rate comes from that row itself. Measured: the test passes
+        /// with the fuzzy normalized retry deleted (the exact normalization
+        /// pass already finds the dotted key), so it does not guard that retry;
+        /// `..._normalized_retry_reaches_a_suffixed_key` does.
     #[test]
     fn test_fuzzy_openrouter_crosses_version_separator_difference() {
         let mut litellm = HashMap::new();
@@ -6150,13 +6175,12 @@ mod tests {
         let result = lookup
             .lookup_with_provider("claude-haiku-4-5", Some("anthropic"))
             .expect("normalized OpenRouter entry should participate in arbitration");
-        assert_eq!(result.source, "LiteLLM");
-        assert_eq!(result.matched_key, "perplexity/anthropic/claude-haiku-4-5");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
         assert_eq!(
             result.pricing.cache_creation_input_token_cost,
             Some(0.00000125),
-            "the OpenRouter donor has to reach the backfill; without the \
-             normalized retry it never enters arbitration and this stays None"
+            "OpenRouter's own row carries the cache-write rate"
         );
 
         let usage = |cache_write: i64| TokenBreakdown {
@@ -7954,6 +7978,86 @@ mod tests {
                 vertex.matched_key, hosted_key,
                 "a Vertex hint must still select Vertex's hosted row"
             );
+        }
+    }
+
+    /// Direct Vertex hints must keep Vertex's hosted pricing even when an
+    /// Anthropic first-party row is also available. The canonical provider tag
+    /// makes both candidates reachable; the raw hint decides which root owns
+    /// the usage.
+    #[test]
+    fn direct_vertex_hint_outranks_anthropic_first_party_alias() {
+        for vertex_root in ["vertex", "vertex_ai"] {
+            let hosted_key = format!("{vertex_root}/claude-sonnet-4");
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                hosted_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            litellm.insert(
+                "anthropic/claude-sonnet-4".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+            let vertex = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(vertex_root))
+                .unwrap_or_else(|| panic!("{vertex_root}-hinted claude-sonnet-4 must price"));
+            assert_eq!(vertex.matched_key, hosted_key);
+
+            let anthropic = lookup
+                .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+                .expect("anthropic-hinted claude-sonnet-4 must price");
+            assert_eq!(anthropic.matched_key, "anthropic/claude-sonnet-4");
+        }
+    }
+
+    /// The same explicit-root preference must survive source arbitration;
+    /// otherwise each dataset selects correctly and the later cross-source
+    /// first-party tier silently changes the winner back to Anthropic.
+    #[test]
+    fn direct_vertex_hint_outranks_cross_source_anthropic_alias() {
+        for vertex_root in ["vertex", "vertex_ai"] {
+            let hosted_key = format!("{vertex_root}/claude-sonnet-4");
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                hosted_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            let mut openrouter = HashMap::new();
+            openrouter.insert(
+                "anthropic/claude-sonnet-4".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+            let vertex = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(vertex_root))
+                .unwrap_or_else(|| panic!("{vertex_root}-hinted claude-sonnet-4 must price"));
+            assert_eq!(vertex.matched_key, hosted_key);
+            assert_eq!(vertex.source, "LiteLLM");
+
+            let anthropic = lookup
+                .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+                .expect("anthropic-hinted claude-sonnet-4 must price");
+            assert_eq!(anthropic.matched_key, "anthropic/claude-sonnet-4");
+            assert_eq!(anthropic.source, "OpenRouter");
         }
     }
 
