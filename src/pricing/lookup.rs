@@ -34,6 +34,15 @@ const ORIGINAL_PROVIDER_PREFIXES: &[&str] = &[
     "moonshotai/",
 ];
 
+/// LiteLLM's namespace for Google's own AI Studio API (OpenRouter spells the same
+/// vendor `google/`). It is an original-provider prefix for ranking
+/// (`is_original_provider`) but is deliberately NOT in
+/// `ORIGINAL_PROVIDER_PREFIXES`: that list also feeds `has_known_provider_prefix`
+/// (routing), and a raw `gemini/<model>` id must keep taking the unknown-router
+/// path, whose terminal fallback finds the bare exact model. Upstream has no
+/// `has_known_provider_prefix`, so this split is fork-only.
+const LITELLM_GEMINI_NAMESPACE: &str = "gemini/";
+
 const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
     "azure/",
     "azure_ai/",
@@ -2525,7 +2534,55 @@ fn is_original_provider(key: &str) -> bool {
     let lower = key.to_lowercase();
     ORIGINAL_PROVIDER_PREFIXES
         .iter()
+        .chain(std::iter::once(&LITELLM_GEMINI_NAMESPACE))
         .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Whether the dataset key's leading segment *is* the hinted vendor, rather
+/// than a reseller that merely nests the vendor deeper in the key.
+///
+/// Fork note: the `novita-ai` -> `novita` fold this example needs is upstream's
+/// (32706153, not ported here); the same shape holds for any fold this fork has,
+/// such as `minimaxai/` against a `minimax` hint.
+///
+/// `poe/novita/kimi-k2.6` and `novita-ai/moonshotai/kimi-k2.6` both carry the
+/// tag `novita`, but only the second is Novita's own row; the first is Poe
+/// reselling it at $0.96/$4.04 per MTok against Novita's $0.80/$3.40.
+fn key_root_matches_hint(key: &str, hint_tags: &[String]) -> bool {
+    let Some(root) = key.split('/').next() else {
+        return false;
+    };
+    provider_identity::provider_tags(root)
+        .iter()
+        .any(|tag| hint_tags.iter().any(|hint| hint == tag))
+}
+
+/// Whether provider-tag folding makes the key root and hint match despite
+/// naming different billing endpoints. The alias keeps fallback rows reachable,
+/// but neither endpoint's root is the other endpoint's own top-level row.
+fn key_root_is_cross_provider_alias(key: &str, provider_id: &str) -> bool {
+    let normalize_root = |value: &str| {
+        value
+            .trim()
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_lowercase()
+            .replace('-', "_")
+    };
+    let root = normalize_root(key);
+    let hint = normalize_root(provider_id);
+
+    matches!(
+        (root.as_str(), hint.as_str()),
+        ("vertex" | "vertex_ai", "anthropic") | ("anthropic", "vertex" | "vertex_ai")
+    )
+}
+
+fn key_root_matches_provider_hint(key: &str, provider_id: &str) -> bool {
+    let hint_tags = provider_identity::provider_tags(provider_id);
+    key_root_matches_hint(key, &hint_tags) && !key_root_is_cross_provider_alias(key, provider_id)
 }
 
 fn is_reseller_provider(key: &str) -> bool {
@@ -2594,9 +2651,68 @@ fn select_best_match(
                 .find(|k| is_reseller_provider(k))
                 .or_else(|| candidates.first())
         } else {
-            candidates
-                .iter()
-                .find(|k| is_original_provider(k))
+            // Fork note: the `deepseek-ai`, `novita-ai` and Together/DeepSeek
+            // examples below are upstream's and rely on folds this fork does not
+            // have (32706153, not ported). Here the same tiers act through the
+            // folds it does have (`mistral`/`mistralai`, `minimax`/`minimaxai`,
+            // `zai`/`z-ai`, `vertex_ai`/`anthropic`, ...); see the
+            // `fork_vendor_spelling_*` tests.
+            //
+            // The vendor-spelling fold (`deepseek-ai` -> `deepseek`) widens
+            // this pool: a `deepseek` hint now matches both
+            // `novita/deepseek/<model>` and `cloudflare/@cf/deepseek-ai/<model>`,
+            // two resellers with different price sheets for the same weights.
+            // Nothing below tells them apart, so the winner falls out of key
+            // ordering — which is length-descending over a HashMap's key
+            // iteration, and therefore not even stable between processes for
+            // equal-length keys. `deepseek-r1-distill-qwen-32b` with the
+            // `deepseek` hint that `inferred_provider_from_model` synthesizes
+            // moved off `novita/deepseek/...` at $0.30/$0.30 per MTok onto
+            // `cloudflare/@cf/deepseek-ai/...` at $0.497/$4.881 — a 16x output
+            // rate on the same weights.
+            //
+            // So the pool is ranked explicitly instead of leaning on key
+            // order. The hinted vendor's own top-level row wins first:
+            // `novita-ai/moonshotai/kimi-k2.6` at $0.80/$3.40 is Novita's own,
+            // while `poe/novita/kimi-k2.6` at $0.96/$4.04 spells `novita` in a
+            // nested segment only because Poe is reselling it. Ranking that row
+            // rather than merely detecting it matters, because candidates are
+            // ordered longest key first and the vendor's own row is usually the
+            // shorter one: `vercel_ai_gateway/zai/glm-4.6` at $0.45/$1.80 would
+            // otherwise be billed for a `zai` hint that Z.ai itself publishes
+            // at `zai/glm-4.6`, $0.60/$2.20. A raw Vertex hint similarly keeps
+            // Vertex's hosted row ahead of Anthropic's row, while an Anthropic
+            // hint excludes that cross-provider root alias. A first-party row
+            // is the next tier.
+            //
+            // Then comes a row that spells the vendor exactly as the hint does,
+            // in preference to one that only matches after folding. That row is
+            // taken even when it starts with a reseller prefix, because the
+            // property that matters is the spelling, not the publisher: the
+            // pre-fold match for a `deepseek-ai` hint on `deepseek-r1` is
+            // `together_ai/deepseek-ai/DeepSeek-R1` at $3.00/$7.00, and
+            // discarding it for being a reseller just hands the lookup to
+            // `vercel_ai_gateway/deepseek/deepseek-r1` at $0.55/$2.19 — another
+            // reseller, chosen for being spelled the other way and having a
+            // longer key. Among equally spelled rows a non-reseller still wins.
+            let by_root = candidates.iter().find(|k| {
+                key_root_matches_hint(k, &hint_tags)
+                    && !provider_id.is_some_and(|hint| key_root_is_cross_provider_alias(k, hint))
+            });
+            let by_spelling = provider_id.and_then(|hint| {
+                let spelled: Vec<&&String> = candidates
+                    .iter()
+                    .filter(|k| provider_identity::matches_provider_spelling(k, hint))
+                    .collect();
+                spelled
+                    .iter()
+                    .copied()
+                    .find(|k| !is_reseller_provider(k))
+                    .or_else(|| spelled.first().copied())
+            });
+            by_root
+                .or_else(|| candidates.iter().find(|k| is_original_provider(k)))
+                .or(by_spelling)
                 .or_else(|| candidates.iter().find(|k| !is_reseller_provider(k)))
                 .or_else(|| candidates.first())
         };
@@ -2738,8 +2854,16 @@ fn choose_best_source_result(
 }
 
 /// Returns true when the LiteLLM match should win over the OpenRouter one.
-/// Prefers the source whose key matches the provider hint, then original
-/// providers over resellers; LiteLLM breaks an otherwise exact tie.
+/// Tiers, in order: the source whose key matches the provider hint; then the
+/// source whose key is rooted at the hinted vendor (the provider-root step,
+/// upstream `643525bf`; it can only decide when exactly one side is rooted
+/// there); then original providers over resellers; LiteLLM breaks an otherwise
+/// exact tie.
+///
+/// Fuzzy arbitration passes through the root step too, as upstream's does: an
+/// id that matches no dataset key exactly but fuzzy-matches under an
+/// `openai`/`anthropic` hint can price as a different model when a
+/// vendor-rooted key wins (measured: `codex-auto-review`, see UPSTREAM.md).
 fn prefer_litellm_over_openrouter(
     l: &LookupResult,
     o: &LookupResult,
@@ -2752,6 +2876,17 @@ fn prefer_litellm_over_openrouter(
         return true;
     }
     if o_matches_provider && !l_matches_provider {
+        return false;
+    }
+
+    let l_matches_root =
+        provider_id.is_some_and(|hint| key_root_matches_provider_hint(&l.matched_key, hint));
+    let o_matches_root =
+        provider_id.is_some_and(|hint| key_root_matches_provider_hint(&o.matched_key, hint));
+    if l_matches_root && !o_matches_root {
+        return true;
+    }
+    if o_matches_root && !l_matches_root {
         return false;
     }
 
@@ -6020,15 +6155,19 @@ mod tests {
         /// `anthropic` hint the reseller LiteLLM entry won and priced cache
         /// writes at zero (#1329).
         ///
-        /// Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`) with
-        /// the assertions retargeted, because the two trees settle this
-        /// differently. Upstream has no cache backfill, so once the OpenRouter
-        /// entry reaches arbitration it wins outright and upstream asserts
-        /// `source == "OpenRouter"`. This tree has `backfill_cache_costs`
-        /// (local since `8bf52d4`, never adopted upstream), so the (Some, Some)
-        /// branch keeps the hint-matching LiteLLM key as the winner and grafts
-        /// the missing rate onto it. Different mechanism, same outcome for the
-        /// user: the cache-write rate stops being zero.
+        /// Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`). The
+        /// assertion on the winner has changed twice. Before the provider-root
+        /// port this tree asserted LiteLLM `perplexity/anthropic/...` as the
+        /// winner with OpenRouter as the backfill donor (this tree has
+        /// `backfill_cache_costs`, never adopted upstream). Since the port
+        /// (upstream `643525bf`) the root step elects OpenRouter's own
+        /// `anthropic/claude-haiku-4.5` row over LiteLLM's `perplexity/anthropic/`
+        /// row, so the test asserts what upstream does: `source == "OpenRouter"`,
+        /// with the cache-write rate coming from that row itself (no backfill
+        /// involved). Measured: the test passes with the fuzzy normalized retry
+        /// deleted (the exact normalization pass already finds the dotted key),
+        /// so it does not guard that retry;
+        /// `..._normalized_retry_reaches_a_suffixed_key` does.
     #[test]
     fn test_fuzzy_openrouter_crosses_version_separator_difference() {
         let mut litellm = HashMap::new();
@@ -6057,13 +6196,12 @@ mod tests {
         let result = lookup
             .lookup_with_provider("claude-haiku-4-5", Some("anthropic"))
             .expect("normalized OpenRouter entry should participate in arbitration");
-        assert_eq!(result.source, "LiteLLM");
-        assert_eq!(result.matched_key, "perplexity/anthropic/claude-haiku-4-5");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
         assert_eq!(
             result.pricing.cache_creation_input_token_cost,
             Some(0.00000125),
-            "the OpenRouter donor has to reach the backfill; without the \
-             normalized retry it never enters arbitration and this stays None"
+            "OpenRouter's own row carries the cache-write rate"
         );
 
         let usage = |cache_write: i64| TokenBreakdown {
@@ -7311,5 +7449,740 @@ mod tests {
                 |_| mismatched(),
             )
             .is_none());
+    }
+
+    // --- Google AI Studio namespace (`gemini/`) is the original vendor -------
+    //
+    // LiteLLM keys Google's own AI Studio API as `gemini/<model>`; OpenRouter
+    // keys the same model `google/<model>`. Both match a `google` hint, so the
+    // original-provider tie-break decides. These tests use the real key shapes.
+
+    fn priced(input: f64, output: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            ..Default::default()
+        }
+    }
+
+    fn gemini_flash_lookup() -> PricingLookup {
+        let mut litellm = HashMap::new();
+        litellm.insert("gemini/gemini-3.8-flash".into(), priced(7.5e-7, 3.75e-6));
+        litellm.insert("gemini-3.8-flash".into(), priced(7.5e-7, 3.75e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("google/gemini-3.8-flash".into(), priced(8.25e-7, 4.125e-6));
+        PricingLookup::new(litellm, openrouter, HashMap::new())
+    }
+
+    #[test]
+    fn google_hint_prices_from_litellm_gemini_namespace_not_openrouter_google() {
+        let lookup = gemini_flash_lookup();
+        let result = lookup
+            .lookup_with_provider("gemini-3.8-flash", Some("google"))
+            .unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "gemini/gemini-3.8-flash");
+        assert_eq!(result.pricing.input_cost_per_token, Some(7.5e-7));
+    }
+
+    #[test]
+    fn original_provider_prefixes_cover_the_litellm_gemini_namespace() {
+        assert!(is_original_provider("gemini/gemini-3.8-flash"));
+        assert!(!is_reseller_provider("gemini/gemini-3.8-flash"));
+        // `gemini` alone (no slash) is a model-name prefix, not a namespace.
+        assert!(!is_original_provider("gemini-3.8-flash"));
+    }
+
+    // Controls: the change must not move any other vendor, and a Google model
+    // only OpenRouter knows must still price from OpenRouter.
+    #[test]
+    fn gemini_namespace_leaves_other_vendors_and_openrouter_only_models_alone() {
+        for (hint, bare, prefixed) in [
+            ("anthropic", "claude-x-9", "anthropic/claude-x-9"),
+            ("openai", "gpt-x-9", "openai/gpt-x-9"),
+        ] {
+            let mut litellm = HashMap::new();
+            litellm.insert(bare.into(), priced(1e-6, 2e-6));
+            let mut openrouter = HashMap::new();
+            openrouter.insert(prefixed.into(), priced(2e-6, 4e-6));
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+            let result = lookup.lookup_with_provider(bare, Some(hint)).unwrap();
+            assert_eq!(result.source, "OpenRouter", "hint {hint}");
+            assert_eq!(result.matched_key, prefixed, "hint {hint}");
+        }
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert("google/gemini-only-or-1".into(), priced(3e-6, 6e-6));
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+        let result = lookup
+            .lookup_with_provider("gemini-only-or-1", Some("google"))
+            .unwrap();
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "google/gemini-only-or-1");
+    }
+
+    // Routing guard: `gemini/` is an original-provider prefix for ranking only.
+    // If `has_known_provider_prefix` saw it, a raw `gemini/<model>` id would stop
+    // taking the unknown-router path and the full-path passes would run before
+    // the terminal fallback: with `gemini/gemini-x-1-preview` and a bare
+    // `gemini-x-1` in LiteLLM, the raw id `gemini/gemini-x-1` would answer the
+    // preview sibling instead of the exact bare model. It must keep answering
+    // the exact bare model. (Upstream has no `has_known_provider_prefix`.)
+    #[test]
+    fn raw_gemini_namespace_id_keeps_resolving_to_the_exact_bare_model() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gemini/gemini-x-1-preview".into(), priced(1e-6, 2e-6));
+        litellm.insert("gemini-x-1".into(), priced(3e-6, 6e-6));
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let hit = lookup.lookup("gemini/gemini-x-1").unwrap();
+        assert_eq!(hit.matched_key, "gemini-x-1");
+    }
+
+    // Control (passes with or without the `gemini/` namespace): an exact raw id still
+    // resolves, and an id in neither dataset stays unpriced rather than being
+    // fuzzily matched to a different model.
+    #[test]
+    fn raw_gemini_namespace_id_control_exact_hit_and_unknown_id() {
+        let lookup = gemini_flash_lookup();
+        let hit = lookup.lookup("gemini/gemini-3.8-flash").unwrap();
+        assert_eq!(hit.source, "LiteLLM");
+        assert_eq!(hit.matched_key, "gemini/gemini-3.8-flash");
+        assert!(lookup.lookup("gemini/not-a-real-model-7").is_none());
+    }
+
+    // Side effect (b): in `select_best_match` a `gemini/` key now counts as
+    // original, so it outranks the first non-reseller key when no hint is given.
+    // (A reseller hint takes the `prefer_reseller` branch instead, and a longer
+    // original key can still come first.)
+    #[test]
+    fn select_best_match_prefers_gemini_namespace_key_without_a_hint() {
+        let mut dataset = HashMap::new();
+        dataset.insert("gemini-3.8-flash-001".to_string(), priced(9e-7, 9e-6));
+        dataset.insert(
+            "gemini/gemini-3.8-flash-001".to_string(),
+            priced(7.5e-7, 3.75e-6),
+        );
+        let bare = "gemini-3.8-flash-001".to_string();
+        let namespaced = "gemini/gemini-3.8-flash-001".to_string();
+        // The bare key is listed first, as the first-non-reseller fallback would
+        // take it.
+        let result = select_best_match(&[&bare, &namespaced], &dataset, "LiteLLM", None).unwrap();
+        assert_eq!(result.matched_key, "gemini/gemini-3.8-flash-001");
+        assert_eq!(result.pricing.input_cost_per_token, Some(7.5e-7));
+    }
+
+    // Side effect (c): with no hint, LiteLLM `gemini/x` vs OpenRouter `google/x`
+    // are both original vendors, so LiteLLM wins the tie.
+    #[test]
+    fn unhinted_arbitration_prefers_litellm_gemini_over_openrouter_google() {
+        let l = lookup_result(
+            "gemini/gemini-3.8-flash",
+            "LiteLLM",
+            priced(7.5e-7, 3.75e-6),
+        );
+        let o = lookup_result(
+            "google/gemini-3.8-flash",
+            "OpenRouter",
+            priced(8.25e-7, 4.125e-6),
+        );
+        let chosen = choose_best_source_result(Some(l), Some(o), None).unwrap();
+        assert_eq!(chosen.source, "LiteLLM");
+        assert_eq!(chosen.matched_key, "gemini/gemini-3.8-flash");
+
+        // The fuzzy arbitration at the end of `lookup_auto`, with no hint: both
+        // sources fuzzy-match, and the vendor-original tie-break decides.
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gemini/gemini-3.8-flash-001".into(),
+            priced(7.5e-7, 3.75e-6),
+        );
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "google/gemini-3.8-flash-001".into(),
+            priced(8.25e-7, 4.125e-6),
+        );
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let l = lookup.fuzzy_match_litellm("gemini-3.8-flash", None);
+        let o = lookup.fuzzy_match_openrouter("gemini-3.8-flash", None);
+        assert_eq!(
+            l.as_ref().unwrap().matched_key,
+            "gemini/gemini-3.8-flash-001"
+        );
+        assert_eq!(
+            o.as_ref().unwrap().matched_key,
+            "google/gemini-3.8-flash-001"
+        );
+        let chosen = choose_best_source_result(l, o, None).unwrap();
+        assert_eq!(chosen.source, "LiteLLM");
+    }
+
+    // CONTROL: passes without the route-label aliases, because the generic
+    // unknown-suffix rule already priced each label as the base model (measured
+    // by removing the aliases). It documents that the aliases change grouping,
+    // not pricing; the alias and parser tests are the red ones.
+    //
+    // The Antigravity route labels resolve to the base model's pricing, and a
+    // suffix nobody listed is not folded by the alias table (it still prices by
+    // the generic unknown-suffix rule, which is existing behavior).
+    #[test]
+    fn gemini_flash_route_labels_price_as_the_base_model() {
+        let lookup = gemini_flash_lookup();
+        let base = lookup
+            .lookup_with_provider("gemini-3.8-flash", Some("google"))
+            .unwrap();
+        for label in ["control", "high", "low", "tiered", "n"] {
+            let id = format!("gemini-3.8-flash-{label}");
+            let result = lookup.lookup_with_provider(&id, Some("google")).unwrap();
+            assert_eq!(result.matched_key, base.matched_key, "label: {label}");
+            assert_eq!(
+                result.pricing.input_cost_per_token, base.pricing.input_cost_per_token,
+                "label: {label}"
+            );
+            assert_eq!(
+                result.pricing.output_cost_per_token, base.pricing.output_cost_per_token,
+                "label: {label}"
+            );
+        }
+    }
+
+    /// Folding `deepseek-ai` into `deepseek` widens the provider-hint
+    /// candidate pool, and `deepseek` is exactly the hint
+    /// `inferred_provider_from_model` synthesizes for every model named
+    /// `deepseek-*` whose client reports no provider. Both rows below then
+    /// match the hint, they disagree by 16x on output, and nothing else in
+    /// `select_best_match` tells them apart — the winner would fall out of key
+    /// ordering, which is length-descending over a HashMap's key iteration and
+    /// so not stable between processes for equal-length keys. The row spelling
+    /// the vendor the way the hint does has to win.
+    // CONTROL in this fork: passes without the port (`deepseek-ai` does not fold into `deepseek` in this tree, so the cloudflare row never matches the hint); see the
+    // `fork_vendor_spelling_*` fixtures for the red-before pins.
+    #[test]
+    fn vendor_spelling_fold_does_not_move_pricing_onto_another_reseller() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "novita/deepseek/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000003),
+                output_cost_per_token: Some(0.0000003),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000000497),
+                output_cost_per_token: Some(0.000004881),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("deepseek-r1-distill-qwen-32b", Some("deepseek"))
+            .expect("deepseek-hinted distill must price");
+        assert_eq!(
+            result.matched_key, "novita/deepseek/deepseek-r1-distill-qwen-32b",
+            "a `deepseek` hint must not cross onto the `deepseek-ai`-spelled reseller row"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.0000003));
+    }
+
+    /// The other direction of the same fold, which the spelling preference must
+    /// not break: a `deepseek-ai` hint exists so it can reach rows spelled
+    /// `deepseek`, and DeepSeek's own first-party row is the whole point. A
+    /// reseller row that happens to spell the vendor the hint's way must not
+    /// displace it.
+    // CONTROL in this fork: passes without the port (only the `deepseek` hint reaches the first-party row here (no `deepseek-ai` fold)); see the
+    // `fork_vendor_spelling_*` fixtures for the red-before pins.
+    #[test]
+    fn vendor_spelling_preference_never_displaces_the_first_party_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "deepseek/deepseek-v3".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000027),
+                output_cost_per_token: Some(0.0000011),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "hyperbolic/deepseek-ai/DeepSeek-V3".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000002),
+                output_cost_per_token: Some(0.0000002),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // Fork adaptation: upstream also loops over `deepseek-ai`, `deepseek_ai`
+        // and `DeepSeek-AI`, which only reach `deepseek/deepseek-v3` through the
+        // `deepseek-ai` -> `deepseek` fold (junhoyeo/tokscale 32706153) that this
+        // tree does not have. Without the fold those hints match only the
+        // `hyperbolic/deepseek-ai/...` row, as they did before this change.
+        let result = lookup
+            .lookup_with_provider("deepseek-v3", Some("deepseek"))
+            .expect("deepseek-hinted deepseek-v3 must price");
+        assert_eq!(
+            result.matched_key, "deepseek/deepseek-v3",
+            "deepseek must still reach DeepSeek's own row"
+        );
+    }
+
+    /// The spelling preference is a tiebreak among rows that merely nest the
+    /// vendor, so it must yield to the hinted provider's own top-level row.
+    /// `poe/novita/kimi-k2.6` spells `novita` only because Poe is reselling
+    /// Novita's endpoint, and it charges $0.96/$4.04 per MTok against Novita's
+    /// own $0.80/$3.40.
+    // CONTROL in this fork: passes without the port (`novita-ai` does not fold into `novita` in this tree); see the
+    // `fork_vendor_spelling_*` fixtures for the red-before pins.
+    #[test]
+    fn hinted_provider_own_row_outranks_a_nested_spelling_match() {
+        let mut litellm = HashMap::new();
+        // Fork adaptation: upstream names Novita's own row `novita-ai/...`,
+        // which only matches a `novita` hint through the `novita-ai` -> `novita`
+        // fold (junhoyeo/tokscale 32706153) that this tree does not have. The
+        // own row is spelled `novita/` here, so with the fork's tags both rows
+        // spell the vendor the hint's way and this test is a control, not a
+        // red-before pin.
+        litellm.insert(
+            "novita/moonshotai/kimi-k2.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000008),
+                output_cost_per_token: Some(0.0000034),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "poe/novita/kimi-k2.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000096),
+                output_cost_per_token: Some(0.00000404),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("kimi-k2.6", Some("novita"))
+            .expect("novita-hinted kimi-k2.6 must price");
+        assert_eq!(
+            result.matched_key, "novita/moonshotai/kimi-k2.6",
+            "Novita's own row must win over Poe reselling it"
+        );
+    }
+
+    /// CONTROL in this fork: passes without the vendor-spelling preference (the
+    /// unhinted path has no vendor spelling to prefer, and the `deepseek-ai`
+    /// fold that would put the cloudflare row in the pool is not in this tree;
+    /// measured by disabling the preference).
+    ///
+    /// Kimi, Warp, Kiro, Codebuff and Tencent Buddy report the literal string
+    /// `unknown` when they cannot name a provider, and `normalize_provider_hint`
+    /// drops it, so the unhinted path is reached in production. It has no
+    /// vendor spelling to prefer and must resolve exactly as a missing hint
+    /// does.
+    #[test]
+    fn unhinted_lookup_is_unchanged_by_the_vendor_spelling_preference() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "novita/deepseek/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000003),
+                output_cost_per_token: Some(0.0000003),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000000497),
+                output_cost_per_token: Some(0.000004881),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let bare = lookup.lookup_with_provider("deepseek-r1-distill-qwen-32b", None);
+        for hint in [Some("unknown"), Some("UNKNOWN"), Some(""), Some("  ")] {
+            let hinted = lookup.lookup_with_provider("deepseek-r1-distill-qwen-32b", hint);
+            assert_eq!(
+                hinted.map(|r| r.matched_key),
+                bare.as_ref().map(|r| r.matched_key.clone()),
+                "{hint:?} is dropped by normalize_provider_hint and must match the unhinted result"
+            );
+        }
+    }
+
+    // --- Fork fixtures for the vendor-spelling preference -------------------
+    //
+    // The upstream tests above are written around the `deepseek-ai` and
+    // `novita-ai` folds, which this tree does not have (junhoyeo/tokscale
+    // 32706153), so three of them pass without the preference and pin nothing
+    // here. These use folds this tree does have (`mistral` -> `mistralai`,
+    // `minimax` <- `minimaxai`) and fail without it.
+
+    fn spelling_fixture_price(output: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(output / 2.0),
+            output_cost_per_token: Some(output),
+            ..Default::default()
+        }
+    }
+
+    /// Red before the preference: both rows match a `mistral` hint (the tag
+    /// folds to `mistralai`), neither is first-party or a listed reseller, and
+    /// the `mistralai`-spelled row has the longer key, so key order picked it.
+    #[test]
+    fn fork_vendor_spelling_preference_selects_the_hint_spelled_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "host-a/mistralai/model-q".to_string(),
+            spelling_fixture_price(0.000004),
+        );
+        litellm.insert(
+            "h/mistral/model-q".to_string(),
+            spelling_fixture_price(0.000002),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("model-q", Some("mistral"))
+            .expect("mistral-hinted model-q must price");
+        assert_eq!(result.matched_key, "h/mistral/model-q");
+    }
+
+    /// Pins the `by_root` tier (which replaced the `has_root_match` guard in
+    /// upstream 6e16ff6b): the hinted vendor's own top-level row (`minimaxai/`
+    /// folds to `minimax`) is the longer key here, so key order picks it, while
+    /// the spelling preference alone would move the lookup onto the shorter
+    /// nested `gw/minimax/...` row. Passes before the preference exists; fails
+    /// when `by_root` is disabled (verified).
+    #[test]
+    fn fork_vendor_spelling_preference_yields_to_the_hinted_vendors_own_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "minimaxai/some-path/model-q".to_string(),
+            spelling_fixture_price(0.000004),
+        );
+        litellm.insert(
+            "gw/minimax/model-q".to_string(),
+            spelling_fixture_price(0.000002),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("model-q", Some("minimax"))
+            .expect("minimax-hinted model-q must price");
+        assert_eq!(result.matched_key, "minimaxai/some-path/model-q");
+    }
+
+    /// `key_root_matches_hint` recognises the hinted vendor's own top-level
+    /// row, and that row has to be *selected*, not merely used to switch the
+    /// spelling preference off. Z.ai publishes `zai/glm-4.6` at $0.60/$2.20 per
+    /// MTok and Vercel's gateway resells it at $0.45/$1.80 under
+    /// `vercel_ai_gateway/zai/glm-4.6`; neither key is in
+    /// `ORIGINAL_PROVIDER_PREFIXES` (Z.ai's first-party spelling there is
+    /// `z-ai/`) nor in `RESELLER_PROVIDER_PREFIXES`, and candidates are ordered
+    /// longest key first, so a `zai` hint must not be billed at the gateway's
+    /// sheet just because its key is longer.
+    #[test]
+    fn hinted_vendor_own_row_wins_over_a_longer_row_that_only_nests_the_vendor() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "zai/glm-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000006),
+                output_cost_per_token: Some(0.0000022),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "vercel_ai_gateway/zai/glm-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000045),
+                output_cost_per_token: Some(0.0000018),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("glm-4.6", Some("zai"))
+            .expect("zai-hinted glm-4.6 must price");
+        assert_eq!(
+            result.matched_key, "zai/glm-4.6",
+            "Z.ai's own row must win over a gateway that nests `zai` in a longer key"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.0000022));
+    }
+
+    /// The spelling preference exists to keep a hinted vendor on the row that
+    /// spells the vendor its way, so it must not throw that row away for
+    /// starting with a reseller prefix. Before the fold, a `deepseek-ai` hint
+    /// matched only `together_ai/deepseek-ai/DeepSeek-R1` ($3.00/$7.00 per
+    /// MTok); folding `deepseek-ai` into `deepseek` pulled
+    /// `vercel_ai_gateway/deepseek/deepseek-r1` ($0.55/$2.19) into the same
+    /// pool, and it wins on key length alone. That is the fold moving usage
+    /// between two resellers, which is precisely what the preference is for.
+    // CONTROL in this fork: passes without the change (`deepseek-ai` does not fold
+    // into `deepseek` here, so the Vercel row never joins the pool); see
+    // `fork_exact_vendor_spelling_wins_even_when_that_row_is_a_reseller`.
+    #[test]
+    fn exact_vendor_spelling_wins_even_when_that_row_is_a_reseller() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "together_ai/deepseek-ai/DeepSeek-R1".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000007),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "vercel_ai_gateway/deepseek/deepseek-r1".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000055),
+                output_cost_per_token: Some(0.00000219),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("deepseek-r1", Some("deepseek-ai"))
+            .expect("deepseek-ai-hinted deepseek-r1 must price");
+        assert_eq!(
+            result.matched_key, "together_ai/deepseek-ai/DeepSeek-R1",
+            "the row spelling the vendor the hint's way must win even though it is a reseller"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.000007));
+    }
+
+    /// Red before a3ec6a17: the hint-spelled row starts with a listed reseller
+    /// prefix, so the spelling preference threw it away and the lookup fell to
+    /// the longer `vercel_ai_gateway/mistralai/...` row, which this tree does
+    /// not list as a reseller. Uses the `mistral` -> `mistralai` fold this tree
+    /// has.
+    #[test]
+    fn fork_exact_vendor_spelling_wins_even_when_that_row_is_a_reseller() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "together_ai/mistral/model-r".to_string(),
+            spelling_fixture_price(0.000004),
+        );
+        litellm.insert(
+            "vercel_ai_gateway/mistralai/model-r".to_string(),
+            spelling_fixture_price(0.000002),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("model-r", Some("mistral"))
+            .expect("mistral-hinted model-r must price");
+        assert_eq!(result.matched_key, "together_ai/mistral/model-r");
+    }
+
+    /// Vertex canonicalizes to Anthropic so an Anthropic hint can find Vertex's
+    /// hosted Claude rows. That alias must not make the hosting platform's root
+    /// look like Anthropic's own top-level row and outrank an exact-spelling row.
+    #[test]
+    fn reseller_alias_root_does_not_outrank_exact_vendor_spelling() {
+        for vertex_root in ["vertex", "vertex_ai"] {
+            let hosted_key = format!("{vertex_root}/claude-sonnet-4");
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                hosted_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            litellm.insert(
+                "host/anthropic/claude-sonnet-4".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+            let anthropic = lookup
+                .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+                .expect("anthropic-hinted claude-sonnet-4 must price");
+            assert_eq!(
+                anthropic.matched_key, "host/anthropic/claude-sonnet-4",
+                "{vertex_root} must not impersonate Anthropic's own root"
+            );
+
+            let vertex = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(vertex_root))
+                .unwrap_or_else(|| panic!("{vertex_root}-hinted claude-sonnet-4 must price"));
+            assert_eq!(
+                vertex.matched_key, hosted_key,
+                "a Vertex hint must still select Vertex's hosted row"
+            );
+        }
+    }
+
+    /// Direct Vertex hints must keep Vertex's hosted pricing even when an
+    /// Anthropic first-party row is also available. The canonical provider tag
+    /// makes both candidates reachable; the raw hint decides which root owns
+    /// the usage.
+    #[test]
+    fn direct_vertex_hint_outranks_anthropic_first_party_alias() {
+        for vertex_root in ["vertex", "vertex_ai"] {
+            let hosted_key = format!("{vertex_root}/claude-sonnet-4");
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                hosted_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            litellm.insert(
+                "anthropic/claude-sonnet-4".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+            let vertex = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(vertex_root))
+                .unwrap_or_else(|| panic!("{vertex_root}-hinted claude-sonnet-4 must price"));
+            assert_eq!(vertex.matched_key, hosted_key);
+
+            let anthropic = lookup
+                .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+                .expect("anthropic-hinted claude-sonnet-4 must price");
+            assert_eq!(anthropic.matched_key, "anthropic/claude-sonnet-4");
+        }
+    }
+
+    /// The same explicit-root preference must survive source arbitration;
+    /// otherwise each dataset selects correctly and the later cross-source
+    /// first-party tier silently changes the winner back to Anthropic.
+    #[test]
+    fn direct_vertex_hint_outranks_cross_source_anthropic_alias() {
+        for vertex_root in ["vertex", "vertex_ai"] {
+            let hosted_key = format!("{vertex_root}/claude-sonnet-4");
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                hosted_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            let mut openrouter = HashMap::new();
+            openrouter.insert(
+                "anthropic/claude-sonnet-4".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+            let vertex = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(vertex_root))
+                .unwrap_or_else(|| panic!("{vertex_root}-hinted claude-sonnet-4 must price"));
+            assert_eq!(vertex.matched_key, hosted_key);
+            assert_eq!(vertex.source, "LiteLLM");
+
+            let anthropic = lookup
+                .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+                .expect("anthropic-hinted claude-sonnet-4 must price");
+            assert_eq!(anthropic.matched_key, "anthropic/claude-sonnet-4");
+            assert_eq!(anthropic.source, "OpenRouter");
+        }
+    }
+
+    /// A root globally classified as a reseller can still be the hinted
+    /// provider's own top-level row. Together's row must retain the root tier
+    /// over a longer host that merely nests the Together spelling.
+    #[test]
+    fn reseller_classification_does_not_hide_hinted_provider_own_root() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "together_ai/model-x".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "long-host/together/model-x".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000004),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("model-x", Some("together"))
+            .expect("together-hinted model-x must price");
+        assert_eq!(result.matched_key, "together_ai/model-x");
+    }
+
+    /// The real key shapes for a Google model under a `google` hint, all four
+    /// at once: LiteLLM lists `perplexity/google/<model>` (a longer key, and
+    /// `perplexity/` is an original-provider prefix), `gemini/<model>` (Google's
+    /// own AI Studio namespace) and the bare id, OpenRouter lists
+    /// `google/<model>`. The answer is `gemini/<model>`, which needs two things:
+    /// the provider-root tier picks it inside LiteLLM over the longer
+    /// Perplexity row, and `gemini/` being an original-provider prefix lets it
+    /// beat OpenRouter's `google/` row across sources. Each is killed by its
+    /// own mutation (see the commit message).
+    #[test]
+    fn google_hint_with_the_real_litellm_shape_resolves_to_the_gemini_namespace() {
+        let mut litellm = HashMap::new();
+        for key in [
+            "perplexity/google/gemini-3.8-flash",
+            "gemini/gemini-3.8-flash",
+            "gemini-3.8-flash",
+        ] {
+            litellm.insert(key.to_string(), priced(7.5e-7, 3.75e-6));
+        }
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "google/gemini-3.8-flash".to_string(),
+            priced(8.25e-7, 4.125e-6),
+        );
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("gemini-3.8-flash", Some("google"))
+            .unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "gemini/gemini-3.8-flash");
+        assert_eq!(result.pricing.input_cost_per_token, Some(7.5e-7));
+
+        // Inside LiteLLM alone the same row is chosen over the longer
+        // Perplexity key.
+        let mut litellm_only = HashMap::new();
+        for key in [
+            "perplexity/google/gemini-3.8-flash",
+            "gemini/gemini-3.8-flash",
+        ] {
+            litellm_only.insert(key.to_string(), priced(7.5e-7, 3.75e-6));
+        }
+        let lookup = PricingLookup::new(litellm_only, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup_with_provider("gemini-3.8-flash", Some("google"))
+            .unwrap();
+        assert_eq!(result.matched_key, "gemini/gemini-3.8-flash");
     }
 }

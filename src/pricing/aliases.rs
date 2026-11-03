@@ -67,6 +67,30 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("model_placeholder_m133", "gemini-3.5-flash-high");
     m.insert("model_placeholder_m187", "gemini-3.5-flash-extra-low");
     m.insert("model_placeholder_m20", "gemini-3.5-flash-medium");
+    // Antigravity CLI route labels onto Gemini 3.8 Flash. Only `-n` (below) is
+    // observed on the maintainer's data. `-control`, `-high`, `-low` and
+    // `-tiered` are taken from Nanako0129/tokscale-core#34 and are unmeasured
+    // here, so that they are routes onto one model rather than different models
+    // is #34's claim. Each label is listed on its own; an unlisted suffix is
+    // deliberately NOT folded, because a new label may be a different model.
+    m.insert("gemini-3.8-flash-control", "gemini-3.8-flash");
+    m.insert("gemini-3.8-flash-high", "gemini-3.8-flash");
+    m.insert("gemini-3.8-flash-low", "gemini-3.8-flash");
+    m.insert("gemini-3.8-flash-tiered", "gemini-3.8-flash");
+    // `-n` is the label actually present in the maintainer's data. 99 of its 101
+    // antigravity-cli rows carry M318, the same model_enum as plain
+    // `gemini-3.8-flash`; the remaining rows carry M319 or M320, which are
+    // unmapped. Folded on that majority evidence, accepting that those few rows
+    // may be a different model.
+    m.insert("gemini-3.8-flash-n", "gemini-3.8-flash");
+    // Rows with no responseModel name carry `chatModel.#20`'s `model_enum`.
+    // Measured on the maintainer's data (2026-11-03): plain `gemini-3.8-flash`
+    // rows carry M318 (612 of 612 antigravity-cli rows), and so do 99 of the 101
+    // `gemini-3.8-flash-n` rows. Taken from Nanako0129/tokscale-core#34 and NOT
+    // measured here (no such rows exist locally): M322 on the tiered rows and
+    // M318 on the `-control` and `-high` rows.
+    m.insert("model_placeholder_m318", "gemini-3.8-flash");
+    m.insert("model_placeholder_m322", "gemini-3.8-flash");
     m.insert("gemini-pro-default", "gemini-3.1-pro");
     m.insert("gemini-pro-agent", "gemini-3.1-pro");
     m.insert("gemini-3-flash-agent", "gemini-3.5-flash-high");
@@ -166,6 +190,8 @@ mod tests {
             ("model_placeholder_m133", "gemini-3.5-flash-high"),
             ("model_placeholder_m187", "gemini-3.5-flash-extra-low"),
             ("model_placeholder_m20", "gemini-3.5-flash-medium"),
+            ("MODEL_PLACEHOLDER_M318", "gemini-3.8-flash"),
+            ("model_placeholder_m322", "gemini-3.8-flash"),
             ("gemini-pro-default", "gemini-3.1-pro"),
             ("gemini-pro-agent", "gemini-3.1-pro"),
             ("gemini-3-flash-agent", "gemini-3.5-flash-high"),
@@ -453,5 +479,26 @@ mod tests {
         assert_eq!(medium, "gemini-3.5-flash-medium");
         assert_ne!(low, medium);
         assert_eq!(cli_medium, medium);
+    }
+
+    #[test]
+    fn folds_only_the_observed_gemini_flash_route_labels() {
+        for label in ["control", "high", "low", "tiered", "n"] {
+            assert_eq!(
+                resolve_alias(&format!("gemini-3.8-flash-{label}")),
+                Some("gemini-3.8-flash"),
+                "label: {label}"
+            );
+        }
+        // Not folded: an unobserved suffix may be a different model, and the
+        // base id and the live-model family are not aliases at all.
+        for id in [
+            "gemini-3.8-flash-foo",
+            "gemini-3.8-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.8-live",
+        ] {
+            assert_eq!(resolve_alias(id), None, "id: {id}");
+        }
     }
 }

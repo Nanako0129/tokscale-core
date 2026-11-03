@@ -84,6 +84,72 @@ pub fn key_provider_tags(dataset_key: &str) -> Vec<String> {
     tags
 }
 
+/// Provider segments a value names *verbatim*, with no alias folding.
+///
+/// Lowercased and underscore-normalized so `DeepSeek-AI`, `deepseek-ai` and
+/// `deepseek_ai` compare equal, but `deepseek` and `deepseek_ai` do not.
+fn raw_provider_segments(value: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut push = |segment: &str| {
+        let normalized = segment
+            .trim()
+            .trim_end_matches('/')
+            .to_lowercase()
+            .replace('-', "_");
+        if normalized.is_empty() || segments.iter().any(|existing| existing == &normalized) {
+            return;
+        }
+        segments.push(normalized);
+    };
+
+    for segment in value.trim().trim_end_matches('/').split('/') {
+        push(segment);
+        if segment.contains('.') {
+            for dotted in segment.split('.') {
+                push(dotted);
+            }
+        }
+    }
+
+    segments
+}
+
+/// Whether `dataset_key` spells a vendor exactly the way `provider_id` does.
+///
+/// Fork note: the `deepseek-ai` -> `deepseek` example below is upstream's. This
+/// fork does not have that fold (junhoyeo/tokscale 32706153, not ported); the
+/// folds it does have are the ones in `canonicalize_provider_segment` (for
+/// example `mistral`/`mistralai`, `minimax`/`minimaxai`, `zai`/`z-ai`,
+/// `vertex_ai`/`anthropic`).
+///
+/// `canonicalize_provider_segment` folds spelling variants of one vendor
+/// together (`deepseek-ai` -> `deepseek`) so a hint can reach rows that spell
+/// the vendor the other way. That fold also widens the candidate pool: a
+/// `deepseek` hint now matches both `novita/deepseek/<model>` and
+/// `cloudflare/@cf/deepseek-ai/<model>`, which are two resellers with
+/// different price sheets for the same weights. When the hinted vendor
+/// publishes no first-party row for the model, nothing else in
+/// `select_best_match` distinguishes those two, and the winner falls out of
+/// dataset key ordering. This predicate is the tiebreak that keeps the fold
+/// from re-rolling that choice: a row spelling the vendor exactly as the hint
+/// does wins over one that only matches after folding.
+pub(crate) fn matches_provider_spelling(dataset_key: &str, provider_id: &str) -> bool {
+    let hint_segments = raw_provider_segments(provider_id);
+    if hint_segments.is_empty() {
+        return false;
+    }
+
+    let key_parts: Vec<&str> = dataset_key.split('/').collect();
+    if key_parts.len() < 2 {
+        return false;
+    }
+
+    key_parts[..key_parts.len() - 1]
+        .iter()
+        .flat_map(|segment| raw_provider_segments(segment))
+        .any(|key_segment| hint_segments.iter().any(|hint| hint == &key_segment))
+}
+
 pub fn matches_provider_hint(dataset_key: &str, provider_id: Option<&str>) -> bool {
     let Some(provider_id) = provider_id else {
         return false;
@@ -519,5 +585,41 @@ mod tests {
                 "{model} is not a genuine family token"
             );
         }
+    }
+
+    #[test]
+    fn provider_spelling_match_is_exact_where_canonicalization_is_not() {
+        // Upstream asserts here that `canonical_provider` folds `deepseek-ai`
+        // into `deepseek`; this tree does not have that fold (junhoyeo/tokscale
+        // 32706153), so only the exact-spelling predicate is checked. It is
+        // exact by construction, so it does not depend on the fold.
+
+        assert!(matches_provider_spelling(
+            "novita/deepseek/deepseek-r1-distill-qwen-32b",
+            "deepseek"
+        ));
+        assert!(!matches_provider_spelling(
+            "cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+            "deepseek"
+        ));
+
+        // Case and `-`/`_` are spelling noise, not a different spelling.
+        for hint in ["deepseek-ai", "deepseek_ai", "DeepSeek-AI"] {
+            assert!(
+                matches_provider_spelling("hyperbolic/deepseek-ai/DeepSeek-V3", hint),
+                "{hint} spells the vendor the way this key does"
+            );
+            assert!(!matches_provider_spelling(
+                "novita/deepseek/deepseek-v3-0324",
+                hint
+            ));
+        }
+
+        // The last segment is the model name, never a vendor spelling.
+        assert!(!matches_provider_spelling("deepseek-ai", "deepseek-ai"));
+        assert!(!matches_provider_spelling(
+            "some-vendor/deepseek",
+            "deepseek"
+        ));
     }
 }
