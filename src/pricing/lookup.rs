@@ -2531,6 +2531,21 @@ fn is_original_provider(key: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
+/// Whether the dataset key's leading segment *is* the hinted vendor, rather
+/// than a reseller that merely nests the vendor deeper in the key.
+///
+/// `poe/novita/kimi-k2.6` and `novita-ai/moonshotai/kimi-k2.6` both carry the
+/// tag `novita`, but only the second is Novita's own row; the first is Poe
+/// reselling it at $0.96/$4.04 per MTok against Novita's $0.80/$3.40.
+fn key_root_matches_hint(key: &str, hint_tags: &[String]) -> bool {
+    let Some(root) = key.split('/').next() else {
+        return false;
+    };
+    provider_identity::provider_tags(root)
+        .iter()
+        .any(|tag| hint_tags.iter().any(|hint| hint == tag))
+}
+
 fn is_reseller_provider(key: &str) -> bool {
     let lower = key.to_lowercase();
     RESELLER_PROVIDER_PREFIXES
@@ -2597,9 +2612,40 @@ fn select_best_match(
                 .find(|k| is_reseller_provider(k))
                 .or_else(|| candidates.first())
         } else {
+            // The vendor-spelling fold (`deepseek-ai` -> `deepseek`) widens
+            // this pool: a `deepseek` hint now matches both
+            // `novita/deepseek/<model>` and `cloudflare/@cf/deepseek-ai/<model>`,
+            // two resellers with different price sheets for the same weights.
+            // Nothing below tells them apart, so the winner falls out of key
+            // ordering — which is length-descending over a HashMap's key
+            // iteration, and therefore not even stable between processes for
+            // equal-length keys. `deepseek-r1-distill-qwen-32b` with the
+            // `deepseek` hint that `inferred_provider_from_model` synthesizes
+            // moved off `novita/deepseek/...` at $0.30/$0.30 per MTok onto
+            // `cloudflare/@cf/deepseek-ai/...` at $0.497/$4.881 — a 16x output
+            // rate on the same weights.
+            //
+            // So prefer a row that spells the vendor exactly as the hint does
+            // over one that only matches after folding. Two rows outrank it and
+            // must not be displaced: a first-party row (handled by
+            // `is_original_provider` below) and the hinted provider's own
+            // top-level row. Without the second guard a `novita` hint on
+            // `kimi-k2.6` would leave Novita's own `novita-ai/moonshotai/...`
+            // at $0.80/$3.40 for `poe/novita/...` at $0.96/$4.04, which spells
+            // `novita` in a nested segment only because Poe is reselling it.
+            let has_root_match = candidates
+                .iter()
+                .any(|k| key_root_matches_hint(k, &hint_tags));
+            let by_spelling = provider_id.filter(|_| !has_root_match).and_then(|hint| {
+                candidates.iter().find(|k| {
+                    !is_reseller_provider(k)
+                        && provider_identity::matches_provider_spelling(k, hint)
+                })
+            });
             candidates
                 .iter()
                 .find(|k| is_original_provider(k))
+                .or(by_spelling)
                 .or_else(|| candidates.iter().find(|k| !is_reseller_provider(k)))
                 .or_else(|| candidates.first())
         };
@@ -7487,5 +7533,233 @@ mod tests {
                 "label: {label}"
             );
         }
+    }
+
+    /// Folding `deepseek-ai` into `deepseek` widens the provider-hint
+    /// candidate pool, and `deepseek` is exactly the hint
+    /// `inferred_provider_from_model` synthesizes for every model named
+    /// `deepseek-*` whose client reports no provider. Both rows below then
+    /// match the hint, they disagree by 16x on output, and nothing else in
+    /// `select_best_match` tells them apart — the winner would fall out of key
+    /// ordering, which is length-descending over a HashMap's key iteration and
+    /// so not stable between processes for equal-length keys. The row spelling
+    /// the vendor the way the hint does has to win.
+    // CONTROL in this fork: passes without the port (`deepseek-ai` does not fold into `deepseek` in this tree, so the cloudflare row never matches the hint); see the
+    // `fork_vendor_spelling_*` fixtures for the red-before pins.
+    #[test]
+    fn vendor_spelling_fold_does_not_move_pricing_onto_another_reseller() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "novita/deepseek/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000003),
+                output_cost_per_token: Some(0.0000003),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000000497),
+                output_cost_per_token: Some(0.000004881),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("deepseek-r1-distill-qwen-32b", Some("deepseek"))
+            .expect("deepseek-hinted distill must price");
+        assert_eq!(
+            result.matched_key, "novita/deepseek/deepseek-r1-distill-qwen-32b",
+            "a `deepseek` hint must not cross onto the `deepseek-ai`-spelled reseller row"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.0000003));
+    }
+
+    /// The other direction of the same fold, which the spelling preference must
+    /// not break: a `deepseek-ai` hint exists so it can reach rows spelled
+    /// `deepseek`, and DeepSeek's own first-party row is the whole point. A
+    /// reseller row that happens to spell the vendor the hint's way must not
+    /// displace it.
+    // CONTROL in this fork: passes without the port (only the `deepseek` hint reaches the first-party row here (no `deepseek-ai` fold)); see the
+    // `fork_vendor_spelling_*` fixtures for the red-before pins.
+    #[test]
+    fn vendor_spelling_preference_never_displaces_the_first_party_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "deepseek/deepseek-v3".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000027),
+                output_cost_per_token: Some(0.0000011),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "hyperbolic/deepseek-ai/DeepSeek-V3".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000002),
+                output_cost_per_token: Some(0.0000002),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // Fork adaptation: upstream also loops over `deepseek-ai`, `deepseek_ai`
+        // and `DeepSeek-AI`, which only reach `deepseek/deepseek-v3` through the
+        // `deepseek-ai` -> `deepseek` fold (junhoyeo/tokscale 32706153) that this
+        // tree does not have. Without the fold those hints match only the
+        // `hyperbolic/deepseek-ai/...` row, as they did before this change.
+        for hint in ["deepseek"] {
+            let result = lookup
+                .lookup_with_provider("deepseek-v3", Some(hint))
+                .unwrap_or_else(|| panic!("{hint}-hinted deepseek-v3 must price"));
+            assert_eq!(
+                result.matched_key, "deepseek/deepseek-v3",
+                "{hint} must still reach DeepSeek's own row"
+            );
+        }
+    }
+
+    /// The spelling preference is a tiebreak among rows that merely nest the
+    /// vendor, so it must yield to the hinted provider's own top-level row.
+    /// `poe/novita/kimi-k2.6` spells `novita` only because Poe is reselling
+    /// Novita's endpoint, and it charges $0.96/$4.04 per MTok against Novita's
+    /// own $0.80/$3.40.
+    // CONTROL in this fork: passes without the port (`novita-ai` does not fold into `novita` in this tree); see the
+    // `fork_vendor_spelling_*` fixtures for the red-before pins.
+    #[test]
+    fn hinted_provider_own_row_outranks_a_nested_spelling_match() {
+        let mut litellm = HashMap::new();
+        // Fork adaptation: upstream names Novita's own row `novita-ai/...`,
+        // which only matches a `novita` hint through the `novita-ai` -> `novita`
+        // fold (junhoyeo/tokscale 32706153) that this tree does not have. The
+        // own row is spelled `novita/` here, so with the fork's tags both rows
+        // spell the vendor the hint's way and this test is a control, not a
+        // red-before pin.
+        litellm.insert(
+            "novita/moonshotai/kimi-k2.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000008),
+                output_cost_per_token: Some(0.0000034),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "poe/novita/kimi-k2.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000096),
+                output_cost_per_token: Some(0.00000404),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("kimi-k2.6", Some("novita"))
+            .expect("novita-hinted kimi-k2.6 must price");
+        assert_eq!(
+            result.matched_key, "novita/moonshotai/kimi-k2.6",
+            "Novita's own row must win over Poe reselling it"
+        );
+    }
+
+    /// Kimi, Warp, Kiro, Codebuff and Tencent Buddy report the literal string
+    /// `unknown` when they cannot name a provider, and `normalize_provider_hint`
+    /// drops it, so the unhinted path is reached in production. It has no
+    /// vendor spelling to prefer and must resolve exactly as a missing hint
+    /// does.
+    #[test]
+    fn unhinted_lookup_is_unchanged_by_the_vendor_spelling_preference() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "novita/deepseek/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000003),
+                output_cost_per_token: Some(0.0000003),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000000497),
+                output_cost_per_token: Some(0.000004881),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let bare = lookup.lookup_with_provider("deepseek-r1-distill-qwen-32b", None);
+        for hint in [Some("unknown"), Some("UNKNOWN"), Some(""), Some("  ")] {
+            let hinted = lookup.lookup_with_provider("deepseek-r1-distill-qwen-32b", hint);
+            assert_eq!(
+                hinted.map(|r| r.matched_key),
+                bare.as_ref().map(|r| r.matched_key.clone()),
+                "{hint:?} is dropped by normalize_provider_hint and must match the unhinted result"
+            );
+        }
+    }
+
+    // --- Fork fixtures for the vendor-spelling preference -------------------
+    //
+    // The upstream tests above are written around the `deepseek-ai` and
+    // `novita-ai` folds, which this tree does not have (junhoyeo/tokscale
+    // 32706153), so three of them pass without the preference and pin nothing
+    // here. These use folds this tree does have (`mistral` -> `mistralai`,
+    // `minimax` <- `minimaxai`) and fail without it.
+
+    fn spelling_fixture_price(output: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(output / 2.0),
+            output_cost_per_token: Some(output),
+            ..Default::default()
+        }
+    }
+
+    /// Red before the preference: both rows match a `mistral` hint (the tag
+    /// folds to `mistralai`), neither is first-party or a listed reseller, and
+    /// the `mistralai`-spelled row has the longer key, so key order picked it.
+    #[test]
+    fn fork_vendor_spelling_preference_selects_the_hint_spelled_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "host-a/mistralai/model-q".to_string(),
+            spelling_fixture_price(0.000004),
+        );
+        litellm.insert(
+            "h/mistral/model-q".to_string(),
+            spelling_fixture_price(0.000002),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("model-q", Some("mistral"))
+            .expect("mistral-hinted model-q must price");
+        assert_eq!(result.matched_key, "h/mistral/model-q");
+    }
+
+    /// Pins the `has_root_match` guard: the hinted vendor's own top-level row
+    /// (`minimaxai/` folds to `minimax`) is the longer key here, so it is what
+    /// key order picks; the spelling preference alone would move the lookup
+    /// onto the shorter nested `gw/minimax/...` row. Fails only when the guard
+    /// is removed, not before the preference exists.
+    #[test]
+    fn fork_vendor_spelling_preference_yields_to_the_hinted_vendors_own_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "minimaxai/some-path/model-q".to_string(),
+            spelling_fixture_price(0.000004),
+        );
+        litellm.insert(
+            "gw/minimax/model-q".to_string(),
+            spelling_fixture_price(0.000002),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("model-q", Some("minimax"))
+            .expect("minimax-hinted model-q must price");
+        assert_eq!(result.matched_key, "minimaxai/some-path/model-q");
     }
 }
