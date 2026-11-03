@@ -18681,6 +18681,47 @@ mod tests {
         assert_eq!(msg.cost, 0.05);
     }
 
+    // The real LiteLLM/OpenRouter key shapes for Google's own models: LiteLLM
+    // keys AI Studio as `gemini/<model>` (plus a bare duplicate), OpenRouter as
+    // `google/<model>`. A google-hinted row prices from Google's published rate
+    // (LiteLLM), while `provider_id` — which feeds grouping — stays `google`.
+    #[test]
+    fn test_apply_pricing_if_available_prices_google_hint_from_litellm_gemini_namespace() {
+        let rate = |input: f64, output: f64| pricing::ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            ..Default::default()
+        };
+        let mut litellm = HashMap::new();
+        litellm.insert("gemini/gemini-3.8-flash".into(), rate(7.5e-7, 3.75e-6));
+        litellm.insert("gemini-3.8-flash".into(), rate(7.5e-7, 3.75e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("google/gemini-3.8-flash".into(), rate(8.25e-7, 4.125e-6));
+        let pricing = pricing::PricingService::new(litellm, openrouter);
+
+        let mut msg = UnifiedMessage::new(
+            "antigravity-cli",
+            "gemini-3.8-flash",
+            "google",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                cache_write_1h: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert!((msg.cost - (0.75 + 3.75)).abs() < 1e-9, "cost {}", msg.cost);
+        assert_eq!(msg.provider_id, "google");
+    }
+
     #[test]
     fn test_apply_pricing_if_available_normalizes_openai_codex_provider() {
         let mut litellm = HashMap::new();
