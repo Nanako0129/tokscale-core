@@ -7696,15 +7696,13 @@ mod tests {
         // `deepseek-ai` -> `deepseek` fold (junhoyeo/tokscale 32706153) that this
         // tree does not have. Without the fold those hints match only the
         // `hyperbolic/deepseek-ai/...` row, as they did before this change.
-        for hint in ["deepseek"] {
-            let result = lookup
-                .lookup_with_provider("deepseek-v3", Some(hint))
-                .unwrap_or_else(|| panic!("{hint}-hinted deepseek-v3 must price"));
-            assert_eq!(
-                result.matched_key, "deepseek/deepseek-v3",
-                "{hint} must still reach DeepSeek's own row"
-            );
-        }
+        let result = lookup
+            .lookup_with_provider("deepseek-v3", Some("deepseek"))
+            .expect("deepseek-hinted deepseek-v3 must price");
+        assert_eq!(
+            result.matched_key, "deepseek/deepseek-v3",
+            "deepseek must still reach DeepSeek's own row"
+        );
     }
 
     /// The spelling preference is a tiebreak among rows that merely nest the
