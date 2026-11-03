@@ -2819,9 +2819,9 @@ mod tests {
         // `RESOLVER_CONTRACT_VERSION` 4 -> 5 (Goose's Windows roaming database,
         // upstream #1458) moved it again, only through that field. The macOS
         // value was measured on Apple hardware under Rust 1.96.1. The Linux
-        // value was computed on a Mac by the same every-`target_os`-branch
-        // switch, which first reproduced the version-4 Linux value above on
-        // this tree; it has not yet been confirmed by CI's ubuntu-latest leg.
+        // value was computed on a Mac with `target_os` branches switched (the
+        // method reproduced the version-4 Linux golden above); confirmed by CI
+        // run <ID>.
         #[cfg(target_os = "macos")]
         assert_eq!(
             identity,
