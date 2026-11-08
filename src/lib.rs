@@ -106,9 +106,10 @@ pub fn canonical_model_id(model_id: &str) -> String {
 /// The alias fold is **presentation only** and must never reach the
 /// submit/upload/export/persist path (those use [`canonical_model_id`]), pricing
 /// (which resolves the raw message `model_id`), or the message-cache key space.
-/// With no aliases installed this is [`canonical_model_id`] plus the one
-/// built-in rule in [`model_alias`] (Grok Build `grok-<version>-build` →
-/// `grok-<version>`).
+/// With no aliases installed this is [`canonical_model_id`] plus the built-in
+/// rules in [`model_alias`] (Grok Build `grok-<version>-build` →
+/// `grok-<version>`, and an exact list of Gemini label variants → their bare
+/// model).
 pub fn normalize_model_for_grouping(model_id: &str) -> String {
     model_alias::apply_global(normalize_syntactic(model_id))
 }
@@ -12828,7 +12829,15 @@ mod tests {
 
         let mut rows: Vec<_> = entries
             .iter()
-            .map(|e| (e.client.as_str(), e.model.as_str(), e.input, e.message_count, e.cost))
+            .map(|e| {
+                (
+                    e.client.as_str(),
+                    e.model.as_str(),
+                    e.input,
+                    e.message_count,
+                    e.cost,
+                )
+            })
             .collect();
         rows.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         assert_eq!(
