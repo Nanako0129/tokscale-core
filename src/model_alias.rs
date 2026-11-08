@@ -28,10 +28,12 @@
 //! a concurrent reload cannot split one report across two alias maps.
 //! Message-cache schema stays 31 because aliases are report-time only.
 //!
-//! One built-in rule runs before the configured map, so grouping is not a pure
+//! Built-in rules run before the configured map, so grouping is not a pure
 //! identity when no aliases are installed: [`builtin_grouping`] folds Grok
 //! Build's `grok-<version>-build` usage key into the `grok-<version>` label the
-//! same sessions carry in their metadata (Syrtis #118). Same presentation-only
+//! same sessions carry in their metadata (Syrtis #118), and an exact list of
+//! Gemini label variants onto their bare model (`gemini-4-argon-{c,trial}`,
+//! `gemini-3.5-flash-{high,medium,low,extra-low}`). Same presentation-only
 //! seam, same guarantees: raw ids still reach pricing, the cache and graph keys.
 
 use serde::{Deserialize, Serialize};
@@ -152,7 +154,31 @@ impl ModelAliasResolver {
 /// dot-separated runs of ASCII digits (`4`, `4.6`, `4.6.1`; not `4.`, `.5` or
 /// `4..6`); everything else, including `grok-unknown` and other `-build`
 /// names, is returned unchanged. Idempotent.
+///
+/// Gemini labels that name one model under several suffixes fold onto the
+/// bare model, each label listed exactly (an unlisted suffix may be a
+/// different model and is left alone):
+/// - `gemini-4-argon-c` and `gemini-4-argon-trial`, which Antigravity and
+///   Claude Code (through a relay) record beside plain `gemini-4-argon`;
+///   Antigravity shows one Gemini 4 Argon quota for all three.
+/// - the thinking tiers `gemini-3.5-flash-{high,medium,low,extra-low}`
+///   (`pricing::aliases` derives high, medium and extra-low from Antigravity's
+///   placeholder ids; it maps the raw `-low` wire value to medium before
+///   grouping, so the `-low` arm only catches a client that records `-low`
+///   itself, and none is known), onto
+///   `gemini-3.5-flash`, the name other clients report.
+///
+/// Maintainer decision (2026-11-08). Like the Grok rule this is display
+/// grouping only: pricing still resolves each raw label.
 fn builtin_grouping(name: String) -> String {
+    match name.as_str() {
+        "gemini-4-argon-c" | "gemini-4-argon-trial" => return "gemini-4-argon".to_string(),
+        "gemini-3.5-flash-high"
+        | "gemini-3.5-flash-medium"
+        | "gemini-3.5-flash-low"
+        | "gemini-3.5-flash-extra-low" => return "gemini-3.5-flash".to_string(),
+        _ => {}
+    }
     let version = name
         .strip_prefix("grok-")
         .and_then(|rest| rest.strip_suffix("-build"))
@@ -343,10 +369,12 @@ mod tests {
         }
     }
 
-    /// Engine-local cases for the built-in rule. Syrtis keeps its own table
-    /// (`Tests/fixtures/model-grouping-cases.json`) and checks it against this
-    /// engine's `normalize_model_for_grouping` in its FFI test, so a change here
-    /// that its table does not follow fails there at the next pin advance.
+    /// Engine-local cases for the built-in rules. Syrtis keeps its own table
+    /// (`Tests/fixtures/model-grouping-cases.json`) and checks only the cases in
+    /// it against this engine's `normalize_model_for_grouping` in its FFI test:
+    /// a changed case fails there at the next pin advance, but a new fold is
+    /// not caught until its cases are added to that table (and to Syrtis's
+    /// `ModelGrouping.groupID`, which mirrors these rules for graph surfaces).
     const BUILTIN_CASES: &[(&str, &str)] = &[
         ("grok-4.6-build", "grok-4.6"),
         ("grok-4.7-build", "grok-4.7"),
@@ -365,6 +393,19 @@ mod tests {
         ("grok-unknown", "grok-unknown"),
         ("gpt-5.4", "gpt-5.4"),
         ("claude-fable-5-1", "claude-fable-5-1"),
+        ("gemini-4-argon-c", "gemini-4-argon"),
+        ("gemini-4-argon-trial", "gemini-4-argon"),
+        ("GEMINI-4-ARGON-TRIAL", "gemini-4-argon"),
+        ("gemini-4-argon", "gemini-4-argon"),
+        ("gemini-4-argon-x", "gemini-4-argon-x"),
+        ("gemini-4-argon-c-1", "gemini-4-argon-c-1"),
+        ("gemini-3.5-flash-high", "gemini-3.5-flash"),
+        ("gemini-3.5-flash-medium", "gemini-3.5-flash"),
+        ("gemini-3.5-flash-extra-low", "gemini-3.5-flash"),
+        ("gemini-3.5-flash", "gemini-3.5-flash"),
+        ("gemini-3.5-flash-low", "gemini-3.5-flash"),
+        ("gemini-3.5-flash-lite", "gemini-3.5-flash-lite"),
+        ("gemini-3.8-flash-high", "gemini-3.8-flash-high"),
     ];
 
     #[test]
