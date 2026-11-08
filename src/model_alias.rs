@@ -152,7 +152,30 @@ impl ModelAliasResolver {
 /// dot-separated runs of ASCII digits (`4`, `4.6`, `4.6.1`; not `4.`, `.5` or
 /// `4..6`); everything else, including `grok-unknown` and other `-build`
 /// names, is returned unchanged. Idempotent.
+///
+/// Gemini labels that name one model under several suffixes fold onto the
+/// bare model, each label listed exactly (an unlisted suffix may be a
+/// different model and is left alone):
+/// - `gemini-4-argon-c` and `gemini-4-argon-trial`, which Antigravity and
+///   Claude Code (through a relay) record beside plain `gemini-4-argon`;
+///   Antigravity shows one Gemini 4 Argon quota for all three.
+/// - the thinking tiers `gemini-3.5-flash-{high,medium,low,extra-low}`
+///   (`pricing::aliases` derives high, medium and extra-low from Antigravity's
+///   placeholder ids; `-low` is the raw wire value it maps to medium), onto
+///   `gemini-3.5-flash`, the name other clients report.
+/// Maintainer decision (2026-11-08). Like the Grok rule this is display
+/// grouping only: pricing still resolves each raw label.
 fn builtin_grouping(name: String) -> String {
+    match name.as_str() {
+        "gemini-4-argon-c" | "gemini-4-argon-trial" => return "gemini-4-argon".to_string(),
+        "gemini-3.5-flash-high"
+        | "gemini-3.5-flash-medium"
+        | "gemini-3.5-flash-low"
+        | "gemini-3.5-flash-extra-low" => {
+            return "gemini-3.5-flash".to_string()
+        }
+        _ => {}
+    }
     let version = name
         .strip_prefix("grok-")
         .and_then(|rest| rest.strip_suffix("-build"))
@@ -365,6 +388,19 @@ mod tests {
         ("grok-unknown", "grok-unknown"),
         ("gpt-5.4", "gpt-5.4"),
         ("claude-fable-5-1", "claude-fable-5-1"),
+        ("gemini-4-argon-c", "gemini-4-argon"),
+        ("gemini-4-argon-trial", "gemini-4-argon"),
+        ("GEMINI-4-ARGON-TRIAL", "gemini-4-argon"),
+        ("gemini-4-argon", "gemini-4-argon"),
+        ("gemini-4-argon-x", "gemini-4-argon-x"),
+        ("gemini-4-argon-c-1", "gemini-4-argon-c-1"),
+        ("gemini-3.5-flash-high", "gemini-3.5-flash"),
+        ("gemini-3.5-flash-medium", "gemini-3.5-flash"),
+        ("gemini-3.5-flash-extra-low", "gemini-3.5-flash"),
+        ("gemini-3.5-flash", "gemini-3.5-flash"),
+        ("gemini-3.5-flash-low", "gemini-3.5-flash"),
+        ("gemini-3.5-flash-lite", "gemini-3.5-flash-lite"),
+        ("gemini-3.8-flash-high", "gemini-3.8-flash-high"),
     ];
 
     #[test]

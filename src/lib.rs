@@ -12784,6 +12784,65 @@ mod tests {
         assert_eq!(canonical_model_id("grok-4.6-build"), "grok-4.6-build");
     }
 
+    /// With no aliases installed, `gemini-4-argon-{c,trial}` merge into the
+    /// `gemini-4-argon` row and the 3.5 Flash tiers into `gemini-3.5-flash`,
+    /// per client, with exact sums; the raw id and an unlisted suffix are
+    /// untouched.
+    #[test]
+    fn gemini_label_variants_group_under_the_bare_model_without_aliases() {
+        let _guard = crate::model_alias::lock_global_alias_tests();
+        clear_model_aliases();
+
+        let message = |client: &str, model: &str, input: i64, cost: f64| {
+            let mut m = UnifiedMessage::new(
+                client,
+                model,
+                "google",
+                "s1",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input,
+                    output: 1,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                    cache_write_1h: 0,
+                },
+                cost,
+            );
+            m.mark_estimated_cost();
+            m
+        };
+        let entries = aggregate_model_usage_entries(
+            vec![
+                message("claude", "gemini-4-argon", 100, 0.5),
+                message("claude", "gemini-4-argon-c", 20, 0.25),
+                message("claude", "gemini-4-argon-trial", 3, 0.125),
+                message("antigravity-cli", "gemini-4-argon-trial", 7, 0.0),
+                message("antigravity-cli", "gemini-3.5-flash-high", 40, 0.25),
+                message("antigravity-cli", "gemini-3.5-flash-extra-low", 2, 0.0),
+                message("antigravity-cli", "gemini-3.8-flash-foo", 5, 0.0),
+            ],
+            &GroupBy::ClientProviderModel,
+        );
+
+        let mut rows: Vec<_> = entries
+            .iter()
+            .map(|e| (e.client.as_str(), e.model.as_str(), e.input, e.message_count, e.cost))
+            .collect();
+        rows.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        assert_eq!(
+            rows,
+            vec![
+                ("antigravity-cli", "gemini-3.5-flash", 42, 2, 0.25),
+                ("antigravity-cli", "gemini-3.8-flash-foo", 5, 1, 0.0),
+                ("antigravity-cli", "gemini-4-argon", 7, 1, 0.0),
+                ("claude", "gemini-4-argon", 123, 3, 0.875),
+            ]
+        );
+        assert_eq!(canonical_model_id("gemini-4-argon-c"), "gemini-4-argon-c");
+    }
+
     #[test]
     fn model_aliases_fold_grouping_only_not_canonical_or_pricing() {
         let _guard = crate::model_alias::lock_global_alias_tests();
