@@ -34,8 +34,17 @@ the materialized compatibility lane, or the remote wire/report schema.
 
 The producer pre-filters the scan with the same client and timezone-aware date
 range the fold applies, so a client's history outside the requested interval
-never charges the fold's message cap or reaches its per-field validation. The
-fold keeps that gate as its own final authority.
+never reaches the fold's per-field validation. The fold keeps that gate as its
+own final authority.
+
+The streaming source lane folds with `RemoteUsageFold::new_streaming`, which
+does not charge `MAX_MESSAGES` or `MAX_LABEL_BYTES`: both would bound the device
+owner's own local history. It charges each map's key-string bytes when a key is
+first inserted instead, against `MAX_OUTPUT_STRING_BYTES` (the value `finish`
+checks), and keeps `MAX_RECORDS` and every per-message check. The pure API
+`aggregate_remote_usage_v1` uses `RemoteUsageFold::new` and keeps both input
+caps. Do not restore the input caps on the streaming lane when re-applying
+local patches.
 
 | Crate | Source | Original TokenBar vendor seed |
 |---|---|---|

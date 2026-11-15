@@ -294,8 +294,7 @@ impl RemoteUsageFold {
     /// The fold behind the streaming source lane. Its input is the device
     /// owner's own local history, so neither the accepted-message count nor
     /// the per-message label bytes are capped: both grow with that history
-    /// (one real machine: 451,195 messages, 17,245,681 label bytes in 370
-    /// days) while the output stays small.
+    /// while the output, one row per distinct key, does not.
     ///
     /// Memory bound. The *fold* state is bounded by a constant: four maps,
     /// each holding at most `MAX_RECORDS + 1` keys (the record cap is checked
@@ -740,12 +739,13 @@ fn entry_charging<'a, K: Ord, V: Default>(
         Entry::Occupied(entry) => Ok(entry.into_mut()),
         Entry::Vacant(entry) => {
             if let Some(total) = charged {
-                *total = total
+                // Checked before it is stored: a refused key leaves the total
+                // equal to the bytes of the keys the map holds.
+                let next = total
                     .checked_add(key_bytes)
+                    .filter(|next| *next <= MAX_OUTPUT_STRING_BYTES)
                     .ok_or(RemoteUsageError::LimitExceeded)?;
-                if *total > MAX_OUTPUT_STRING_BYTES {
-                    return Err(RemoteUsageError::LimitExceeded);
-                }
+                *total = next;
             }
             Ok(entry.insert(V::default()))
         }
@@ -1264,6 +1264,75 @@ mod tests {
             fold.push(&messages[fits]),
             Err(RemoteUsageError::LimitExceeded),
             "the key-string charge must fail at push, not at finish"
+        );
+        // The refused key was not charged: the total still counts held keys.
+        assert_eq!(fold.accumulator.key_string_bytes[0], fits * graph_key_bytes);
+    }
+
+    #[test]
+    fn streaming_charge_counts_model_provider_and_agent() {
+        let mut fold = RemoteUsageFold::new_streaming(&query()).unwrap();
+        let rows = [
+            ("model-a", "provider-a"),
+            ("model-b", ""),
+            ("", "provider-c"),
+        ];
+        for (model, provider) in rows {
+            let message = UnifiedMessage::new(
+                "claude",
+                model,
+                provider,
+                "session",
+                IN_RANGE_MS,
+                TokenBreakdown {
+                    input: 1,
+                    output: 1,
+                    ..Default::default()
+                },
+                0.0,
+            );
+            assert_eq!(fold.push(&message), Ok(()));
+        }
+        let charged = fold.accumulator.key_string_bytes;
+        let bundle = fold.finish().expect("streaming finish");
+        assert_eq!(bundle.models.len(), rows.len());
+        assert_eq!(
+            charged,
+            [
+                output_string_bytes_graph(&bundle.graph),
+                output_string_bytes_models(&bundle.models),
+                output_string_bytes_hourly(&bundle.hourly),
+                output_string_bytes_agents(&bundle.agents),
+            ]
+        );
+        // The model term is part of it: these keys differ only by model.
+        assert!(charged[1] > rows.len() * "claude".len());
+    }
+
+    #[test]
+    fn streaming_charge_accepts_exactly_the_cap() {
+        // Graph key bytes per distinct provider: date 10 + client 6 + 240.
+        let graph_key_bytes = 10 + 6 + 240;
+        assert_eq!(MAX_OUTPUT_STRING_BYTES % graph_key_bytes, 0);
+        let keys = MAX_OUTPUT_STRING_BYTES / graph_key_bytes;
+        let messages: Vec<_> = (0..=keys)
+            .map(|index| message(&format!("{index:0240}"), 1))
+            .collect();
+        let mut fold = RemoteUsageFold::new_streaming(&query()).unwrap();
+        push_all(&mut fold, &messages[..keys]);
+        assert_eq!(
+            fold.accumulator.key_string_bytes[0],
+            MAX_OUTPUT_STRING_BYTES
+        );
+        assert_eq!(
+            fold.push(&messages[keys]),
+            Err(RemoteUsageError::LimitExceeded)
+        );
+        let mut fold = RemoteUsageFold::new_streaming(&query()).unwrap();
+        push_all(&mut fold, &messages[..keys]);
+        assert!(
+            fold.finish().is_ok(),
+            "a total equal to the cap is accepted"
         );
     }
 }
