@@ -471,8 +471,11 @@ pub fn aggregate_remote_usage_from_source_v1(
     query: &RemoteUsageQueryV1,
     pricing_snapshot: &RemotePricingSnapshot,
 ) -> Result<RemoteUsageBundleV1, RemoteSourceUsageError> {
-    let mut fold =
-        remote_report::RemoteUsageFold::new(query).map_err(RemoteSourceUsageError::from)?;
+    // The streaming fold: the scan feeds the owner's whole local history, so
+    // accepted-message count and label bytes are not capped here; the fold's
+    // own state stays bounded (see `RemoteUsageFold::new_streaming`).
+    let mut fold = remote_report::RemoteUsageFold::new_streaming(query)
+        .map_err(RemoteSourceUsageError::from)?;
     // A separate gate rather than the fold's own: the accept callback and the
     // sink are handed to the scan together, so they cannot both borrow the
     // fold. Both are built from the same query.

@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashSet},
+    collections::{btree_map::Entry, BTreeMap, HashSet},
     fmt,
 };
 
@@ -218,10 +218,12 @@ pub fn aggregate_remote_usage_v1(
 ///
 /// The fold keeps a gate and re-applies it as its final authority. A streaming
 /// producer builds a second gate and pre-filters with it, because the fold
-/// charges `MAX_MESSAGES` and validates timestamps, buckets, clients, and
-/// numerators *before* it reaches its own range check: without a producer-side
-/// gate, an unbounded lifetime scan lets history outside the requested interval
-/// exhaust the cap or fail validation on a row that could never be emitted.
+/// validates timestamps, buckets, clients, and numerators *before* it reaches
+/// its own range check: without a producer-side gate, a lifetime scan would
+/// fail validation on a row outside the requested interval that could never be
+/// emitted. Only the bounded fold (the pure API) also charges `MAX_MESSAGES`
+/// before that check; the streaming fold has no message-count cap, so for it
+/// the gate is about validation alone.
 pub(crate) struct RemoteMessageGate {
     exact_clients: Option<HashSet<String>>,
     timezone: TimeZone,
@@ -280,10 +282,39 @@ pub(crate) struct RemoteUsageFold {
 }
 
 impl RemoteUsageFold {
+    /// The bounded fold behind the pure API: the caller hands over a message
+    /// set, so `MAX_MESSAGES` and `MAX_LABEL_BYTES` bound that input.
     pub(crate) fn new(query: &RemoteUsageQueryV1) -> Result<Self, RemoteUsageError> {
         Ok(Self {
             gate: RemoteMessageGate::new(query)?,
             accumulator: RemoteUsageAccumulator::default(),
+        })
+    }
+
+    /// The fold behind the streaming source lane. Its input is the device
+    /// owner's own local history, so neither the accepted-message count nor
+    /// the per-message label bytes are capped: both grow with that history
+    /// (one real machine: 451,195 messages, 17,245,681 label bytes in 370
+    /// days) while the output stays small.
+    ///
+    /// Memory bound. The *fold* state is bounded by a constant: four maps,
+    /// each holding at most `MAX_RECORDS + 1` keys (the record cap is checked
+    /// after each insert), every key string at most `MAX_TEXT_BYTES`; in
+    /// addition, each map's key-string bytes are charged when a key is first
+    /// inserted and fail with `LimitExceeded` once they exceed
+    /// `MAX_OUTPUT_STRING_BYTES`. That running total is exactly what `finish`
+    /// computes as `output_string_bytes_*`, so a successful bundle is byte for
+    /// byte the bounded fold's; only the failure arrives earlier. The *scan*
+    /// state that feeds this fold (dedup sets, source cache) grows with local
+    /// history and was never bounded by the two removed caps: the scan runs to
+    /// completion even after the sink has failed.
+    pub(crate) fn new_streaming(query: &RemoteUsageQueryV1) -> Result<Self, RemoteUsageError> {
+        Ok(Self {
+            gate: RemoteMessageGate::new(query)?,
+            accumulator: RemoteUsageAccumulator {
+                streaming: true,
+                ..RemoteUsageAccumulator::default()
+            },
         })
     }
 
@@ -298,8 +329,15 @@ impl RemoteUsageFold {
 
 #[derive(Default)]
 struct RemoteUsageAccumulator {
+    /// Streaming source lane: no message-count or label-byte cap; key-string
+    /// bytes are charged on insert instead (see `RemoteUsageFold::new_streaming`).
+    streaming: bool,
     messages: usize,
     label_bytes: usize,
+    /// Per-map key-string bytes, charged on insert in streaming mode only:
+    /// graph, models, hourly, agents. Each equals that page's
+    /// `output_string_bytes_*` at `finish`.
+    key_string_bytes: [usize; 4],
     graph: BTreeMap<GraphKey, CommonAccumulator>,
     models: BTreeMap<ModelKey, ModelAccumulator>,
     hourly: BTreeMap<HourlyKey, CommonAccumulator>,
@@ -314,12 +352,14 @@ impl RemoteUsageAccumulator {
         gate: &RemoteMessageGate,
     ) -> Result<(), RemoteUsageError> {
         let timezone = &gate.timezone;
-        self.messages = self
-            .messages
-            .checked_add(1)
-            .ok_or(RemoteUsageError::LimitExceeded)?;
-        if self.messages > MAX_MESSAGES {
-            return Err(RemoteUsageError::LimitExceeded);
+        if !self.streaming {
+            self.messages = self
+                .messages
+                .checked_add(1)
+                .ok_or(RemoteUsageError::LimitExceeded)?;
+            if self.messages > MAX_MESSAGES {
+                return Err(RemoteUsageError::LimitExceeded);
+            }
         }
         // Every supplied row is validated, including one this query excludes.
         // That is deliberate: the caller of this API hands over exactly the set
@@ -355,14 +395,16 @@ impl RemoteUsageAccumulator {
         let model = normalize_model(&message.model_id)?;
         let provider = normalize_provider(&message.provider_id)?;
         let agent = normalize_agent(&message.client, message.agent.as_deref())?;
-        add_label_bytes(&mut self.label_bytes, &client)?;
-        if let Some(model) = &model {
-            add_label_bytes(&mut self.label_bytes, model)?;
+        if !self.streaming {
+            add_label_bytes(&mut self.label_bytes, &client)?;
+            if let Some(model) = &model {
+                add_label_bytes(&mut self.label_bytes, model)?;
+            }
+            if let Some(provider) = &provider {
+                add_label_bytes(&mut self.label_bytes, provider)?;
+            }
+            add_label_bytes(&mut self.label_bytes, &agent)?;
         }
-        if let Some(provider) = &provider {
-            add_label_bytes(&mut self.label_bytes, provider)?;
-        }
-        add_label_bytes(&mut self.label_bytes, &agent)?;
 
         let prepared = PreparedMessage {
             date_text,
@@ -374,48 +416,65 @@ impl RemoteUsageAccumulator {
             utc_offset_seconds: offset,
             numerators,
         };
+        // Key-string bytes as `output_string_bytes_*` counts them per record.
+        let label_bytes = prepared.client.len()
+            + prepared.model.as_ref().map_or(0, String::len)
+            + prepared.provider.as_ref().map_or(0, String::len);
+        let streaming = self.streaming;
+        let [graph_bytes, models_bytes, hourly_bytes, agents_bytes] = &mut self.key_string_bytes;
         let token_total = token_total(&prepared.numerators, &mut self.saturated);
         add_common(
-            self.graph
-                .entry((
+            entry_charging(
+                &mut self.graph,
+                (
                     prepared.date_text.clone(),
                     prepared.client.clone(),
                     prepared.model.clone(),
                     prepared.provider.clone(),
-                ))
-                .or_default(),
+                ),
+                streaming.then_some(graph_bytes),
+                prepared.date_text.len() + label_bytes,
+            )?,
             &prepared.numerators,
             &mut self.saturated,
         );
         add_common(
-            self.hourly
-                .entry((
+            entry_charging(
+                &mut self.hourly,
+                (
                     prepared.bucket_start_unix_ms,
                     prepared.utc_offset_seconds,
                     prepared.client.clone(),
                     prepared.model.clone(),
                     prepared.provider.clone(),
-                ))
-                .or_default(),
+                ),
+                streaming.then_some(hourly_bytes),
+                label_bytes,
+            )?,
             &prepared.numerators,
             &mut self.saturated,
         );
         add_common(
-            self.agents
-                .entry((
+            entry_charging(
+                &mut self.agents,
+                (
                     prepared.agent.clone(),
                     prepared.client.clone(),
                     prepared.model.clone(),
                     prepared.provider.clone(),
-                ))
-                .or_default(),
+                ),
+                streaming.then_some(agents_bytes),
+                prepared.agent.len() + label_bytes,
+            )?,
             &prepared.numerators,
             &mut self.saturated,
         );
-        let model_accumulator = self
-            .models
-            .entry((prepared.client, prepared.model, prepared.provider))
-            .or_default();
+        let model_accumulator = entry_charging(
+            &mut self.models,
+            (prepared.client, prepared.model, prepared.provider),
+            streaming.then_some(models_bytes),
+            label_bytes,
+        )?;
         add_common(
             &mut model_accumulator.common,
             &prepared.numerators,
@@ -666,6 +725,31 @@ fn add_label_bytes(total: &mut usize, label: &str) -> Result<(), RemoteUsageErro
         return Err(RemoteUsageError::LimitExceeded);
     }
     Ok(())
+}
+
+/// `map.entry(key).or_default()`, except that with `charged` (streaming mode)
+/// a vacant key first adds its `key_bytes` to that map's running total and
+/// fails once the total exceeds `MAX_OUTPUT_STRING_BYTES`.
+fn entry_charging<'a, K: Ord, V: Default>(
+    map: &'a mut BTreeMap<K, V>,
+    key: K,
+    charged: Option<&mut usize>,
+    key_bytes: usize,
+) -> Result<&'a mut V, RemoteUsageError> {
+    match map.entry(key) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            if let Some(total) = charged {
+                *total = total
+                    .checked_add(key_bytes)
+                    .ok_or(RemoteUsageError::LimitExceeded)?;
+                if *total > MAX_OUTPUT_STRING_BYTES {
+                    return Err(RemoteUsageError::LimitExceeded);
+                }
+            }
+            Ok(entry.insert(V::default()))
+        }
+    }
 }
 
 fn bucket_start(
@@ -996,4 +1080,190 @@ fn output_string_bytes_agents(records: &[RemoteAgentsRecordV1]) -> usize {
                 + record.provider.as_ref().map_or(0, String::len)
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TokenBreakdown;
+
+    /// 2040-01-01T11:00:00Z, inside `query()`.
+    const IN_RANGE_MS: i64 = 2_209_028_400_000;
+
+    fn query() -> RemoteUsageQueryV1 {
+        RemoteUsageQueryV1 {
+            clients: Vec::new(),
+            start_date: "2040-01-01".to_owned(),
+            end_date_exclusive: "2040-01-02".to_owned(),
+            timezone: "UTC".to_owned(),
+            tzdb_revision: REMOTE_TZDB_REVISION.to_owned(),
+        }
+    }
+
+    /// Client `claude`, no model, agent `Main`: every key string is the
+    /// provider plus fixed bytes, so byte counts below are exact.
+    fn message(provider: &str, input: i64) -> UnifiedMessage {
+        UnifiedMessage::new(
+            "claude",
+            "",
+            provider,
+            "session",
+            IN_RANGE_MS,
+            TokenBreakdown {
+                input,
+                output: 1,
+                ..Default::default()
+            },
+            0.0,
+        )
+    }
+
+    fn push_all(fold: &mut RemoteUsageFold, messages: &[UnifiedMessage]) {
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(
+                fold.push(message),
+                Ok(()),
+                "streaming push {index} must be accepted"
+            );
+        }
+    }
+
+    /// Every page must carry the same totals as the input, row sums included.
+    fn assert_totals(bundle: &RemoteUsageBundleV1, messages: &[UnifiedMessage]) {
+        let input: u64 = messages.iter().map(|m| m.tokens.input as u64).sum();
+        let count = messages.len() as u64;
+        let graph: (u64, u64) = bundle
+            .graph
+            .iter()
+            .fold((0, 0), |a, r| (a.0 + r.input_tokens, a.1 + r.message_count));
+        let models: (u64, u64) = bundle
+            .models
+            .iter()
+            .fold((0, 0), |a, r| (a.0 + r.input_tokens, a.1 + r.message_count));
+        let hourly: (u64, u64) = bundle
+            .hourly
+            .iter()
+            .fold((0, 0), |a, r| (a.0 + r.input_tokens, a.1 + r.message_count));
+        let agents: (u64, u64) = bundle
+            .agents
+            .iter()
+            .fold((0, 0), |a, r| (a.0 + r.input_tokens, a.1 + r.message_count));
+        for (page, totals) in [
+            ("graph", graph),
+            ("models", models),
+            ("hourly", hourly),
+            ("agents", agents),
+        ] {
+            assert_eq!(totals, (input, count), "{page} totals");
+        }
+        assert!(!bundle.saturated);
+    }
+
+    #[test]
+    fn streaming_fold_accepts_more_than_max_messages() {
+        let messages: Vec<_> = (0..=MAX_MESSAGES)
+            .map(|index| message(["openai", "anthropic"][index % 2], (index % 7) as i64 + 1))
+            .collect();
+        let mut fold = RemoteUsageFold::new_streaming(&query()).unwrap();
+        push_all(&mut fold, &messages);
+        let bundle = fold.finish().expect("streaming finish");
+        assert_eq!(bundle.graph.len(), 2);
+        assert_totals(&bundle, &messages);
+
+        // The bounded fold keeps the cap, in the API and in its accumulator.
+        assert_eq!(
+            aggregate_remote_usage_v1(&messages, &query()),
+            Err(RemoteUsageError::LimitExceeded)
+        );
+        let mut bounded = RemoteUsageFold::new(&query()).unwrap();
+        push_all(&mut bounded, &messages[..MAX_MESSAGES]);
+        assert_eq!(
+            bounded.push(&messages[MAX_MESSAGES]),
+            Err(RemoteUsageError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn streaming_fold_accepts_label_bytes_beyond_the_bounded_cap() {
+        let provider = "p".repeat(250);
+        // client 6 + provider 250 + agent "Main" 4 per message.
+        let per_message = 6 + provider.len() + 4;
+        let count = MAX_LABEL_BYTES / per_message + 2;
+        assert!(count * per_message > MAX_LABEL_BYTES);
+        assert!(count <= MAX_MESSAGES, "the label cap, not the count cap");
+        let messages: Vec<_> = (0..count).map(|_| message(&provider, 3)).collect();
+        let mut fold = RemoteUsageFold::new_streaming(&query()).unwrap();
+        push_all(&mut fold, &messages);
+        let bundle = fold.finish().expect("streaming finish");
+        assert_eq!(bundle.graph.len(), 1);
+        assert_totals(&bundle, &messages);
+
+        assert_eq!(
+            aggregate_remote_usage_v1(&messages, &query()),
+            Err(RemoteUsageError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn streaming_fold_still_caps_distinct_keys_at_max_records() {
+        let messages: Vec<_> = (0..=MAX_RECORDS)
+            .map(|index| message(&format!("{index:x}"), 1))
+            .collect();
+        let mut fold = RemoteUsageFold::new_streaming(&query()).unwrap();
+        push_all(&mut fold, &messages[..MAX_RECORDS]);
+        // Short keys: each map's string-byte charge leaves room for one more
+        // key (at most 10 + 6 + 5 bytes), so the failure below can only come
+        // from `MAX_RECORDS`.
+        assert!(fold
+            .accumulator
+            .key_string_bytes
+            .iter()
+            .all(|bytes| *bytes + 64 < MAX_OUTPUT_STRING_BYTES));
+        assert_eq!(
+            fold.push(&messages[MAX_RECORDS]),
+            Err(RemoteUsageError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn streaming_fold_charges_new_key_bytes_at_push_and_matches_finish() {
+        // Graph key bytes per distinct provider: date 10 + client 6 + 250.
+        let graph_key_bytes = 10 + 6 + 250;
+        let fits = MAX_OUTPUT_STRING_BYTES / graph_key_bytes;
+        assert!(fits < MAX_RECORDS, "fewer keys than the record cap");
+        let messages: Vec<_> = (0..=fits)
+            .map(|index| message(&format!("{index:0250}"), 1))
+            .collect();
+
+        // At the largest count that fits, the streaming bundle is the bounded
+        // fold's, byte for byte, and each running total is what finish counts.
+        let mut fold = RemoteUsageFold::new_streaming(&query()).unwrap();
+        push_all(&mut fold, &messages[..fits]);
+        let charged = fold.accumulator.key_string_bytes;
+        assert_eq!(charged[0], fits * graph_key_bytes);
+        let streamed = fold.finish().expect("streaming finish");
+        assert_eq!(
+            charged,
+            [
+                output_string_bytes_graph(&streamed.graph),
+                output_string_bytes_models(&streamed.models),
+                output_string_bytes_hourly(&streamed.hourly),
+                output_string_bytes_agents(&streamed.agents),
+            ]
+        );
+        let pure = aggregate_remote_usage_v1(&messages[..fits], &query()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&streamed).unwrap(),
+            serde_json::to_vec(&pure).unwrap()
+        );
+
+        // One more distinct key crosses the cap, and the push itself fails.
+        let mut fold = RemoteUsageFold::new_streaming(&query()).unwrap();
+        push_all(&mut fold, &messages[..fits]);
+        assert_eq!(
+            fold.push(&messages[fits]),
+            Err(RemoteUsageError::LimitExceeded),
+            "the key-string charge must fail at push, not at finish"
+        );
+    }
 }
