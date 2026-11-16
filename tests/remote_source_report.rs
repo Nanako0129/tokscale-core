@@ -441,6 +441,166 @@ fn pricing_snapshot_absence_zeroes_cost_and_changes_nothing_else() {
     );
 }
 
+/// One pricing file whose `timestamp` is `offset_seconds` from now (negative
+/// is the past). `input: None` writes a parseable table with no models, so
+/// that half loads without diagnostic yet cannot price anything on its own.
+fn write_pricing_file(root: &Path, filename: &str, input: Option<f64>, offset_seconds: i64) {
+    fs::create_dir_all(root).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut data = std::collections::HashMap::new();
+    if let Some(input) = input {
+        data.insert(
+            "claude-3-5-sonnet".to_owned(),
+            ModelPricing {
+                input_cost_per_token: Some(input),
+                output_cost_per_token: Some(input),
+                ..Default::default()
+            },
+        );
+    }
+    fs::write(
+        root.join(filename),
+        serde_json::to_vec(&serde_json::json!({"timestamp": now + offset_seconds, "data": data}))
+            .unwrap(),
+    )
+    .unwrap();
+}
+
+/// Folds the cc-mirror fixture under the snapshot read from `pricing_root`,
+/// returning its diagnostic and the single graph row's cost.
+fn fold_cost(roots: &Path, pricing_root: &Path) -> (Option<RemotePricingDiagnostic>, u64) {
+    let home = roots.join("home");
+    if !home.exists() {
+        write_cc_mirror_fixture(&home);
+    }
+    let (context, _) = context(
+        &home,
+        &roots.join("config"),
+        &roots.join("data"),
+        &roots.join("source-cache"),
+        ScannerSettings::default(),
+    );
+    let query = query_for_clients(vec!["cc-mirror/kimi-code".to_owned()]);
+    let snapshot = RemotePricingSnapshot::from_cache_root(pricing_root);
+    let bundle = aggregate_remote_usage_from_source_v1(&context, &query, &snapshot).unwrap();
+    assert_eq!(bundle.graph.len(), 1);
+    (snapshot.diagnostic(), bundle.graph[0].cost_nano_usd)
+}
+
+const THIRTY_DAYS: i64 = 60 * 60 * 24 * 30;
+
+/// A half that prices nothing is reported in preference to a stale half,
+/// whichever file it is, and the stale half still prices.
+#[test]
+#[serial]
+fn an_unpriced_half_outranks_a_stale_half() {
+    let roots = TempDir::new().unwrap();
+    for (stale_file, other_file) in [
+        ("pricing-litellm.json", "pricing-openrouter.json"),
+        ("pricing-openrouter.json", "pricing-litellm.json"),
+    ] {
+        let missing_root = roots.path().join(format!("missing-beside-{stale_file}"));
+        write_pricing_file(&missing_root, stale_file, Some(0.000_01), -THIRTY_DAYS);
+        let (diagnostic, cost) = fold_cost(roots.path(), &missing_root);
+        assert_eq!(
+            diagnostic,
+            Some(RemotePricingDiagnostic::Missing),
+            "{stale_file}"
+        );
+        assert!(cost > 0, "the stale {stale_file} must still price");
+
+        let corrupt_root = roots.path().join(format!("corrupt-beside-{stale_file}"));
+        write_pricing_file(&corrupt_root, stale_file, Some(0.000_01), -THIRTY_DAYS);
+        fs::write(corrupt_root.join(other_file), b"not json").unwrap();
+        let (diagnostic, cost) = fold_cost(roots.path(), &corrupt_root);
+        assert_eq!(
+            diagnostic,
+            Some(RemotePricingDiagnostic::Corrupt),
+            "{stale_file}"
+        );
+        assert!(cost > 0, "the stale {stale_file} must still price");
+    }
+}
+
+/// DR-1d: a table older than an hour still prices the fold, and still says
+/// it is old. Before, the agent's copy aged past 3600 s every hour and every
+/// shared report carried cost 0 until the next copy.
+#[test]
+#[serial]
+fn stale_pricing_table_still_prices_the_fold() {
+    let roots = TempDir::new().unwrap();
+
+    let fresh_root = roots.path().join("fresh");
+    write_pricing(&fresh_root, 0.000_01, 0);
+    let (fresh_diagnostic, fresh_cost) = fold_cost(roots.path(), &fresh_root);
+    assert_eq!(fresh_diagnostic, None);
+    assert!(fresh_cost > 0, "the fresh table must price the fold");
+
+    let stale_root = roots.path().join("stale");
+    write_pricing(&stale_root, 0.000_01, THIRTY_DAYS as u64);
+    assert_eq!(
+        fold_cost(roots.path(), &stale_root),
+        (Some(RemotePricingDiagnostic::Stale), fresh_cost),
+        "a 30-day-old table prices exactly like the same table stamped now"
+    );
+
+    // One half stale, the other fresh: both load, and the stale half is the
+    // only one that knows the model, so a positive cost proves it was used.
+    for (stale_file, fresh_file) in [
+        ("pricing-litellm.json", "pricing-openrouter.json"),
+        ("pricing-openrouter.json", "pricing-litellm.json"),
+    ] {
+        let mixed_root = roots.path().join(format!("mixed-{stale_file}"));
+        write_pricing_file(&mixed_root, stale_file, Some(0.000_01), -THIRTY_DAYS);
+        write_pricing_file(&mixed_root, fresh_file, None, 0);
+        let (diagnostic, cost) = fold_cost(roots.path(), &mixed_root);
+        assert_eq!(
+            diagnostic,
+            Some(RemotePricingDiagnostic::Stale),
+            "{stale_file}"
+        );
+        assert!(
+            cost > 0,
+            "stale {stale_file} beside a fresh half must price"
+        );
+    }
+}
+
+/// DR-1d keeps these unpriced: no table, a table that does not parse, and a
+/// table claiming to come from the future.
+#[test]
+#[serial]
+fn missing_corrupt_and_future_pricing_stay_unpriced() {
+    let roots = TempDir::new().unwrap();
+
+    assert_eq!(
+        fold_cost(roots.path(), &roots.path().join("missing")),
+        (Some(RemotePricingDiagnostic::Missing), 0)
+    );
+
+    let corrupt_root = roots.path().join("corrupt");
+    fs::create_dir_all(&corrupt_root).unwrap();
+    fs::write(corrupt_root.join("pricing-litellm.json"), b"not json").unwrap();
+    fs::write(corrupt_root.join("pricing-openrouter.json"), b"not json").unwrap();
+    assert_eq!(
+        fold_cost(roots.path(), &corrupt_root),
+        (Some(RemotePricingDiagnostic::Corrupt), 0)
+    );
+
+    let future_root = roots.path().join("future");
+    for filename in ["pricing-litellm.json", "pricing-openrouter.json"] {
+        write_pricing_file(&future_root, filename, Some(0.000_01), 3600);
+    }
+    assert_eq!(
+        fold_cost(roots.path(), &future_root),
+        (Some(RemotePricingDiagnostic::Corrupt), 0),
+        "a future timestamp is corrupt and prices nothing"
+    );
+}
+
 #[test]
 #[serial]
 fn source_fold_uses_production_fixture_and_matches_pure_fold() {

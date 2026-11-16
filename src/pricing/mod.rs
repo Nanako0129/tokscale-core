@@ -22,12 +22,21 @@ use crate::TokenBreakdown;
 
 pub use litellm::ModelPricing;
 
+/// Age past which a remote pricing table is reported as `Stale`. It is a
+/// diagnostic threshold only: an older table is still used for pricing.
 const REMOTE_PRICING_TTL_SECS: u64 = 3600;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemotePricingDiagnostic {
+    /// A pricing file is absent; that half prices nothing.
     Missing,
+    /// Every pricing file loaded, and at least one was used for pricing with a
+    /// `timestamp` older than `REMOTE_PRICING_TTL_SECS`, so costs may lag the
+    /// current published rates. A file that prices nothing is reported in
+    /// preference to this: `Missing` and `Corrupt` outrank `Stale`.
     Stale,
+    /// A pricing file does not parse or carries a future `timestamp`; that
+    /// half prices nothing.
     Corrupt,
 }
 
@@ -72,6 +81,7 @@ impl RemotePricingSnapshot {
         }
         let mut datasets = Vec::with_capacity(files.len());
         let mut diagnostic = None;
+        let mut unpriced = None;
         for filename in files {
             let bytes = fs::read(root.join(filename));
             match &bytes {
@@ -89,23 +99,27 @@ impl RemotePricingSnapshot {
             }
             match bytes
                 .map_err(|_| DatasetError::Missing)
-                .and_then(|bytes| decode_fresh_dataset(&bytes))
+                .and_then(|bytes| decode_dataset(&bytes))
             {
-                Ok(data) => datasets.push(Some(data)),
-                Err(DatasetError::Missing) => {
-                    diagnostic.get_or_insert(RemotePricingDiagnostic::Missing);
-                    datasets.push(None);
+                Ok((data, stale)) => {
+                    if stale {
+                        diagnostic.get_or_insert(RemotePricingDiagnostic::Stale);
+                    }
+                    datasets.push(Some(data));
                 }
-                Err(DatasetError::Stale) => {
-                    diagnostic.get_or_insert(RemotePricingDiagnostic::Stale);
+                Err(DatasetError::Missing) => {
+                    unpriced.get_or_insert(RemotePricingDiagnostic::Missing);
                     datasets.push(None);
                 }
                 Err(DatasetError::Corrupt) => {
-                    diagnostic.get_or_insert(RemotePricingDiagnostic::Corrupt);
+                    unpriced.get_or_insert(RemotePricingDiagnostic::Corrupt);
                     datasets.push(None);
                 }
             }
         }
+        // A half that prices nothing outranks a half that priced with an old
+        // table; among unpriced halves the first in file order is reported.
+        let diagnostic = unpriced.or(diagnostic);
         let digest = Sha256::digest(descriptor).into();
         let service = PricingService::from_cached_datasets_with_custom(
             CustomPricing::default(),
@@ -136,11 +150,13 @@ impl RemotePricingSnapshot {
 #[derive(Debug)]
 enum DatasetError {
     Missing,
-    Stale,
     Corrupt,
 }
 
-fn decode_fresh_dataset(bytes: &[u8]) -> Result<HashMap<String, ModelPricing>, DatasetError> {
+/// Decodes one pricing file. A table older than `REMOTE_PRICING_TTL_SECS` is
+/// still returned, flagged `true` so the caller reports `Stale`; an old price
+/// beats a cost of zero. A future `timestamp` is `Corrupt`.
+fn decode_dataset(bytes: &[u8]) -> Result<(HashMap<String, ModelPricing>, bool), DatasetError> {
     #[derive(Deserialize)]
     struct Envelope<T> {
         timestamp: u64,
@@ -155,10 +171,8 @@ fn decode_fresh_dataset(bytes: &[u8]) -> Result<HashMap<String, ModelPricing>, D
     if envelope.timestamp > now {
         return Err(DatasetError::Corrupt);
     }
-    if now.saturating_sub(envelope.timestamp) > REMOTE_PRICING_TTL_SECS {
-        return Err(DatasetError::Stale);
-    }
-    Ok(envelope.data)
+    let stale = now.saturating_sub(envelope.timestamp) > REMOTE_PRICING_TTL_SECS;
+    Ok((envelope.data, stale))
 }
 
 /// In-memory pricing snapshot plus the instant it was fetched, so the process
