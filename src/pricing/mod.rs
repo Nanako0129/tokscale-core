@@ -30,8 +30,10 @@ const REMOTE_PRICING_TTL_SECS: u64 = 3600;
 pub enum RemotePricingDiagnostic {
     /// A pricing file is absent; that half prices nothing.
     Missing,
-    /// The table was used for pricing, and its own `timestamp` is more than
-    /// 3600 s old, so costs may lag the current published rates.
+    /// Every pricing file loaded, and at least one was used for pricing with a
+    /// `timestamp` older than `REMOTE_PRICING_TTL_SECS`, so costs may lag the
+    /// current published rates. A file that prices nothing is reported in
+    /// preference to this: `Missing` and `Corrupt` outrank `Stale`.
     Stale,
     /// A pricing file does not parse or carries a future `timestamp`; that
     /// half prices nothing.
@@ -79,6 +81,7 @@ impl RemotePricingSnapshot {
         }
         let mut datasets = Vec::with_capacity(files.len());
         let mut diagnostic = None;
+        let mut unpriced = None;
         for filename in files {
             let bytes = fs::read(root.join(filename));
             match &bytes {
@@ -105,15 +108,18 @@ impl RemotePricingSnapshot {
                     datasets.push(Some(data));
                 }
                 Err(DatasetError::Missing) => {
-                    diagnostic.get_or_insert(RemotePricingDiagnostic::Missing);
+                    unpriced.get_or_insert(RemotePricingDiagnostic::Missing);
                     datasets.push(None);
                 }
                 Err(DatasetError::Corrupt) => {
-                    diagnostic.get_or_insert(RemotePricingDiagnostic::Corrupt);
+                    unpriced.get_or_insert(RemotePricingDiagnostic::Corrupt);
                     datasets.push(None);
                 }
             }
         }
+        // A half that prices nothing outranks a half that priced with an old
+        // table; among unpriced halves the first in file order is reported.
+        let diagnostic = unpriced.or(diagnostic);
         let digest = Sha256::digest(descriptor).into();
         let service = PricingService::from_cached_datasets_with_custom(
             CustomPricing::default(),

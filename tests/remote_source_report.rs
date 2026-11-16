@@ -492,6 +492,39 @@ fn fold_cost(roots: &Path, pricing_root: &Path) -> (Option<RemotePricingDiagnost
 
 const THIRTY_DAYS: i64 = 60 * 60 * 24 * 30;
 
+/// A half that prices nothing is reported in preference to a stale half,
+/// whichever file it is, and the stale half still prices.
+#[test]
+#[serial]
+fn an_unpriced_half_outranks_a_stale_half() {
+    let roots = TempDir::new().unwrap();
+    for (stale_file, other_file) in [
+        ("pricing-litellm.json", "pricing-openrouter.json"),
+        ("pricing-openrouter.json", "pricing-litellm.json"),
+    ] {
+        let missing_root = roots.path().join(format!("missing-beside-{stale_file}"));
+        write_pricing_file(&missing_root, stale_file, Some(0.000_01), -THIRTY_DAYS);
+        let (diagnostic, cost) = fold_cost(roots.path(), &missing_root);
+        assert_eq!(
+            diagnostic,
+            Some(RemotePricingDiagnostic::Missing),
+            "{stale_file}"
+        );
+        assert!(cost > 0, "the stale {stale_file} must still price");
+
+        let corrupt_root = roots.path().join(format!("corrupt-beside-{stale_file}"));
+        write_pricing_file(&corrupt_root, stale_file, Some(0.000_01), -THIRTY_DAYS);
+        fs::write(corrupt_root.join(other_file), b"not json").unwrap();
+        let (diagnostic, cost) = fold_cost(roots.path(), &corrupt_root);
+        assert_eq!(
+            diagnostic,
+            Some(RemotePricingDiagnostic::Corrupt),
+            "{stale_file}"
+        );
+        assert!(cost > 0, "the stale {stale_file} must still price");
+    }
+}
+
 /// DR-1d: a table older than an hour still prices the fold, and still says
 /// it is old. Before, the agent's copy aged past 3600 s every hour and every
 /// shared report carried cost 0 until the next copy.
