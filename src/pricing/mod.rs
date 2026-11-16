@@ -22,12 +22,19 @@ use crate::TokenBreakdown;
 
 pub use litellm::ModelPricing;
 
+/// Age past which a remote pricing table is reported as `Stale`. It is a
+/// diagnostic threshold only: an older table is still used for pricing.
 const REMOTE_PRICING_TTL_SECS: u64 = 3600;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemotePricingDiagnostic {
+    /// A pricing file is absent; that half prices nothing.
     Missing,
+    /// The table was used for pricing, and its own `timestamp` is more than
+    /// 3600 s old, so costs may lag the current published rates.
     Stale,
+    /// A pricing file does not parse or carries a future `timestamp`; that
+    /// half prices nothing.
     Corrupt,
 }
 
@@ -89,15 +96,16 @@ impl RemotePricingSnapshot {
             }
             match bytes
                 .map_err(|_| DatasetError::Missing)
-                .and_then(|bytes| decode_fresh_dataset(&bytes))
+                .and_then(|bytes| decode_dataset(&bytes))
             {
-                Ok(data) => datasets.push(Some(data)),
+                Ok((data, stale)) => {
+                    if stale {
+                        diagnostic.get_or_insert(RemotePricingDiagnostic::Stale);
+                    }
+                    datasets.push(Some(data));
+                }
                 Err(DatasetError::Missing) => {
                     diagnostic.get_or_insert(RemotePricingDiagnostic::Missing);
-                    datasets.push(None);
-                }
-                Err(DatasetError::Stale) => {
-                    diagnostic.get_or_insert(RemotePricingDiagnostic::Stale);
                     datasets.push(None);
                 }
                 Err(DatasetError::Corrupt) => {
@@ -136,11 +144,13 @@ impl RemotePricingSnapshot {
 #[derive(Debug)]
 enum DatasetError {
     Missing,
-    Stale,
     Corrupt,
 }
 
-fn decode_fresh_dataset(bytes: &[u8]) -> Result<HashMap<String, ModelPricing>, DatasetError> {
+/// Decodes one pricing file. A table older than `REMOTE_PRICING_TTL_SECS` is
+/// still returned, flagged `true` so the caller reports `Stale`; an old price
+/// beats a cost of zero. A future `timestamp` is `Corrupt`.
+fn decode_dataset(bytes: &[u8]) -> Result<(HashMap<String, ModelPricing>, bool), DatasetError> {
     #[derive(Deserialize)]
     struct Envelope<T> {
         timestamp: u64,
@@ -155,10 +165,8 @@ fn decode_fresh_dataset(bytes: &[u8]) -> Result<HashMap<String, ModelPricing>, D
     if envelope.timestamp > now {
         return Err(DatasetError::Corrupt);
     }
-    if now.saturating_sub(envelope.timestamp) > REMOTE_PRICING_TTL_SECS {
-        return Err(DatasetError::Stale);
-    }
-    Ok(envelope.data)
+    let stale = now.saturating_sub(envelope.timestamp) > REMOTE_PRICING_TTL_SECS;
+    Ok((envelope.data, stale))
 }
 
 /// In-memory pricing snapshot plus the instant it was fetched, so the process
