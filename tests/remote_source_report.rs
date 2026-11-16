@@ -121,6 +121,23 @@ fn write_unrelated_claude_fixture(home: &Path) {
     fs::write(project.join("conversation.jsonl"), content).unwrap();
 }
 
+/// `MAX_MESSAGES + 1` distinct in-range rows for one selected client, all on a
+/// single key. Their label bytes (client + model + agent, plus any provider,
+/// per row) also exceed the bounded fold's 8 MiB `MAX_LABEL_BYTES`.
+fn write_large_in_range_claude_history(home: &Path) {
+    let project = home.join(".claude/projects/large");
+    fs::create_dir_all(&project).unwrap();
+    let mut content = String::new();
+    for index in 0..=262_144 {
+        writeln!(
+            content,
+            r#"{{"type":"assistant","timestamp":"2040-01-01T11:02:00.000Z","requestId":"req_large_{index}","message":{{"id":"msg_large_{index}","model":"claude-3-5-sonnet","usage":{{"input_tokens":2,"output_tokens":1}}}}}}"#
+        )
+        .unwrap();
+    }
+    fs::write(project.join("conversation.jsonl"), content).unwrap();
+}
+
 /// A selected client whose lifetime history dwarfs the requested interval:
 /// `MAX_MESSAGES + 1` rows a day *before* the window, one ancient row the fold
 /// rejects outright, and a single row actually inside the window.
@@ -636,6 +653,57 @@ fn source_fold_excludes_out_of_range_history_before_remote_validation() {
     assert_eq!(streamed.graph[0].input_tokens, 300);
     assert_eq!(streamed.graph[0].output_tokens, 70);
     assert_eq!(streamed.graph[0].message_count, 1);
+}
+
+/// The owner's own in-range history is not capped by count or label bytes in
+/// the streaming lane: `MAX_MESSAGES + 1` rows on one key fold to one row per
+/// page with exact totals.
+#[test]
+#[serial]
+fn source_fold_accepts_in_range_history_beyond_the_bounded_input_caps() {
+    const ROWS: u64 = 262_145;
+    const MAX_LABEL_BYTES: u64 = 8 * 1024 * 1024;
+    let roots = TempDir::new().unwrap();
+    let home = roots.path().join("home");
+    write_large_in_range_claude_history(&home);
+    let (context, _) = context(
+        &home,
+        &roots.path().join("config"),
+        &roots.path().join("data"),
+        &roots.path().join("source-cache"),
+        ScannerSettings::default(),
+    );
+    let query = query_for_clients(vec!["claude".to_owned()]);
+    let pricing = RemotePricingSnapshot::from_cache_root(roots.path().join("pricing"));
+
+    let result = aggregate_remote_usage_from_source_v1(&context, &query, &pricing);
+    assert!(
+        result.is_ok(),
+        "the owner's own history must not exceed a streaming input cap: {result:?}"
+    );
+    let streamed = result.unwrap();
+    assert_eq!(streamed.graph.len(), 1);
+    assert_eq!(streamed.models.len(), 1);
+    assert_eq!(streamed.hourly.len(), 1);
+    assert_eq!(streamed.agents.len(), 1);
+    let row = &streamed.graph[0];
+    assert_eq!(row.client, "claude");
+    assert_eq!(row.input_tokens, 2 * ROWS);
+    assert_eq!(row.output_tokens, ROWS);
+    assert_eq!(row.message_count, ROWS);
+    assert_eq!(streamed.models[0].message_count, ROWS);
+    assert_eq!(streamed.hourly[0].input_tokens, 2 * ROWS);
+    let agent = &streamed.agents[0];
+    assert_eq!(agent.message_count, ROWS);
+    // Label bytes the bounded fold would have charged, from the emitted key.
+    let per_row = agent.client.len()
+        + agent.model.as_ref().map_or(0, String::len)
+        + agent.provider.as_ref().map_or(0, String::len)
+        + agent.agent.len();
+    assert!(
+        per_row as u64 * ROWS > MAX_LABEL_BYTES,
+        "fixture must also exceed the bounded label cap ({per_row} bytes per row)"
+    );
 }
 
 /// The other half of the same defect, isolated: without the message flood the
