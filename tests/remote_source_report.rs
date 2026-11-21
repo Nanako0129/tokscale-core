@@ -255,9 +255,9 @@ fn remote_fingerprint_golden() {
     #[cfg(target_os = "macos")]
     let expected = "0b51665a7cc724b4d576daa68a71d4af28bdb704f11e0857a70a331aedbc750f";
     #[cfg(target_os = "linux")]
-    let expected = "LINUX_PLACEHOLDER_TO_BE_FILLED_FROM_CI";
+    let expected = "ed00d63e7ed92676b1c298b5033d87ea16ca72b9060627631b0a4787cc80a935";
     #[cfg(target_os = "windows")]
-    let expected = "WINDOWS_PLACEHOLDER_TO_BE_FILLED_FROM_CI";
+    let expected = "07a2d2a34b8dbec03f008fcf814451b2f73f44d971cfb2e7b721d2483cc88a45";
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let expected = actual.as_str();
     assert_eq!(
