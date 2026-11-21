@@ -228,6 +228,44 @@ fn remote_context_ignores_environment_and_cwd() {
     assert_eq!(first, second);
 }
 
+/// Pins the approved-scope fingerprint for one fixed set of inputs, so a
+/// change that silently moves every remote fingerprint (and so revokes every
+/// approved token) fails here. Comparing two API spellings against each other
+/// cannot catch that once one delegates to the other. The roots need not
+/// exist: the fingerprint is a pure function of the paths and settings.
+#[test]
+fn remote_fingerprint_golden() {
+    #[cfg(windows)]
+    let (home, config, data, cache) = (r"C:\h", r"C:\c", r"C:\d", r"C:\cache");
+    #[cfg(not(windows))]
+    let (home, config, data, cache) = ("/h", "/c", "/d", "/cache");
+    let fingerprint = RemoteSourceContextV1::preview_fingerprint(
+        Path::new(home),
+        Path::new(config),
+        Path::new(data),
+        Path::new(cache),
+        &ScannerSettings::default(),
+    )
+    .unwrap();
+    let actual: String = fingerprint
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    #[cfg(target_os = "macos")]
+    let expected = "0b51665a7cc724b4d576daa68a71d4af28bdb704f11e0857a70a331aedbc750f";
+    #[cfg(target_os = "linux")]
+    let expected = "LINUX_PLACEHOLDER_TO_BE_FILLED_FROM_CI";
+    #[cfg(target_os = "windows")]
+    let expected = "WINDOWS_PLACEHOLDER_TO_BE_FILLED_FROM_CI";
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let expected = actual.as_str();
+    assert_eq!(
+        actual, expected,
+        "remote fingerprint golden moved; actual = {actual}"
+    );
+}
+
 #[test]
 #[serial]
 fn remote_scope_token_rejects_every_effective_input_change() {
