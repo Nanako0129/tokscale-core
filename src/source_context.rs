@@ -726,18 +726,6 @@ impl ResolvedLocalSourceContext {
         self.identity
     }
 
-    /// Whether a discovered scan root may actually be scanned.
-    ///
-    /// Most roots are pure functions of the approved roots and need no check.
-    /// A few are not: a `cc-mirror` variant's `configDir` and a Crush
-    /// registry's `data_dir` are *file contents* under the home directory, and
-    /// both accept an absolute path, so whatever can write those files chooses
-    /// a scan root. Locally that is only as privileged as the app already is.
-    /// Under an injected remote context it is an escape: the caller never sees
-    /// the root, cannot approve it, and it cannot be fingerprinted because it
-    /// does not exist until the scan reads the file — yet whatever is parsed
-    /// there is folded into a bundle sent to a peer.
-    ///
     /// Whether duplicate selection must ignore the report filter.
     ///
     /// The OpenCode lane otherwise lets a filtered-out authoritative copy
