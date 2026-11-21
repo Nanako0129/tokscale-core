@@ -266,6 +266,114 @@ fn remote_fingerprint_golden() {
     );
 }
 
+/// `None` is the existing API: same fingerprint, and a token approved through
+/// `preview_fingerprint` opens the `_with_xdg_data_home` constructor.
+#[test]
+fn remote_xdg_data_home_none_matches_existing_api() {
+    let roots = TempDir::new().unwrap();
+    let (home, config, data, cache) = (
+        roots.path().join("home"),
+        roots.path().join("config"),
+        roots.path().join("data"),
+        roots.path().join("cache"),
+    );
+    let settings = ScannerSettings::default();
+    let existing =
+        RemoteSourceContextV1::preview_fingerprint(&home, &config, &data, &cache, &settings)
+            .unwrap();
+    let with_none = RemoteSourceContextV1::preview_fingerprint_with_xdg_data_home(
+        &home, &config, &data, None, &cache, &settings,
+    )
+    .unwrap();
+    assert_eq!(existing, with_none);
+    let token = RemoteSourceScopeTokenV1::new(existing, 3);
+    let context = RemoteSourceContextV1::new_with_xdg_data_home(
+        &home, &config, &data, None, &cache, settings, token,
+    )
+    .unwrap();
+    assert_eq!(context.fingerprint(), existing);
+}
+
+#[test]
+fn remote_xdg_data_home_must_be_absolute_and_non_empty() {
+    let roots = TempDir::new().unwrap();
+    let (home, config, data, cache) = (
+        roots.path().join("home"),
+        roots.path().join("config"),
+        roots.path().join("data"),
+        roots.path().join("cache"),
+    );
+    for xdg in [Path::new(""), Path::new("relative-xdg")] {
+        assert_eq!(
+            RemoteSourceContextV1::preview_fingerprint_with_xdg_data_home(
+                &home,
+                &config,
+                &data,
+                Some(xdg),
+                &cache,
+                &ScannerSettings::default(),
+            ),
+            Err(RemoteSourceContextError::InvalidRoots)
+        );
+    }
+}
+
+/// An OpenCode JSON message under a separate XDG data root that sits outside
+/// home, config, data and cache. That lane goes through the scanner's root
+/// admission (`push`), so this is what fails if the XDG root is fingerprinted
+/// but not admitted. Without the separate root the same tree is a sibling of
+/// the platform data root and is not reported.
+#[test]
+#[serial]
+fn source_fold_reports_opencode_under_a_separate_xdg_data_home() {
+    let roots = TempDir::new().unwrap();
+    let (home, config, data, cache) = (
+        roots.path().join("home"),
+        roots.path().join("config"),
+        roots.path().join("data"),
+        roots.path().join("source-cache"),
+    );
+    let xdg = roots.path().join("xdg");
+    let message_dir = xdg.join("opencode/storage/message/project-1");
+    fs::create_dir_all(&message_dir).unwrap();
+    fs::write(
+        message_dir.join("msg_xdg.json"),
+        r#"{"id":"msg-xdg","sessionID":"session-xdg","role":"assistant","modelID":"claude-3-5-sonnet","providerID":"anthropic","cost":0,"tokens":{"input":40,"output":9,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":2208988800000}}"#,
+    )
+    .unwrap();
+    let query = query_for_clients(vec!["opencode".to_owned()]);
+    let pricing = RemotePricingSnapshot::from_cache_root(roots.path().join("pricing"));
+
+    let settings = ScannerSettings::default();
+    let fingerprint = RemoteSourceContextV1::preview_fingerprint_with_xdg_data_home(
+        &home,
+        &config,
+        &data,
+        Some(&xdg),
+        &cache,
+        &settings,
+    )
+    .unwrap();
+    let separate = RemoteSourceContextV1::new_with_xdg_data_home(
+        &home,
+        &config,
+        &data,
+        Some(&xdg),
+        &cache,
+        settings,
+        RemoteSourceScopeTokenV1::new(fingerprint, 1),
+    )
+    .unwrap();
+    let bundle = aggregate_remote_usage_from_source_v1(&separate, &query, &pricing).unwrap();
+    assert_eq!(bundle.graph.len(), 1);
+    assert_eq!(bundle.graph[0].client, "opencode");
+    assert_eq!(bundle.graph[0].input_tokens, 40);
+
+    let (without, _) = context(&home, &config, &data, &cache, ScannerSettings::default());
+    let bundle = aggregate_remote_usage_from_source_v1(&without, &query, &pricing).unwrap();
+    assert!(bundle.graph.is_empty());
+}
+
 #[test]
 #[serial]
 fn remote_scope_token_rejects_every_effective_input_change() {

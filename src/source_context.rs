@@ -89,10 +89,31 @@ impl RemoteSourceContextV1 {
         source_cache_dir: &Path,
         scanner_settings: &ScannerSettings,
     ) -> Result<RemoteSourceFingerprintV1, RemoteSourceContextError> {
+        Self::preview_fingerprint_with_xdg_data_home(
+            home_dir,
+            platform_config_dir,
+            platform_data_dir,
+            None,
+            source_cache_dir,
+            scanner_settings,
+        )
+    }
+
+    /// [`Self::preview_fingerprint`] with a separate XDG data root; see
+    /// [`Self::new_with_xdg_data_home`].
+    pub fn preview_fingerprint_with_xdg_data_home(
+        home_dir: &Path,
+        platform_config_dir: &Path,
+        platform_data_dir: &Path,
+        xdg_data_home: Option<&Path>,
+        source_cache_dir: &Path,
+        scanner_settings: &ScannerSettings,
+    ) -> Result<RemoteSourceFingerprintV1, RemoteSourceContextError> {
         let local = ResolvedLocalSourceContext::from_remote_explicit(
             home_dir,
             platform_config_dir,
             platform_data_dir,
+            xdg_data_home,
             source_cache_dir,
             scanner_settings,
         )?;
@@ -111,15 +132,42 @@ impl RemoteSourceContextV1 {
         scanner_settings: ScannerSettings,
         approved_scope: RemoteSourceScopeTokenV1,
     ) -> Result<Self, RemoteSourceContextError> {
-        let home_dir = home_dir.as_ref();
-        let platform_config_dir = platform_config_dir.as_ref();
-        let platform_data_dir = platform_data_dir.as_ref();
-        let source_cache_dir = source_cache_dir.as_ref();
-        let local = ResolvedLocalSourceContext::from_remote_explicit(
+        Self::new_with_xdg_data_home(
             home_dir,
             platform_config_dir,
             platform_data_dir,
+            None,
             source_cache_dir,
+            scanner_settings,
+            approved_scope,
+        )
+    }
+
+    /// [`Self::new`] with a separate XDG data root.
+    ///
+    /// `None` is exactly `new`: `XDG_DATA_HOME` resolves to
+    /// `platform_data_dir`. `Some(x)` (non-empty and absolute, else
+    /// `InvalidRoots`) resolves `XDG_DATA_HOME` to `x` instead, while
+    /// `platform_data_dir` keeps feeding `LOCALAPPDATA` on Windows and the
+    /// platform local-data root. This lets a Windows caller hand over both
+    /// `%LOCALAPPDATA%` and `home\.local\share`, which a local scan reads as two
+    /// different roots. `x` is part of the fingerprint through the resolved
+    /// environment paths, and a scan admits roots beneath it.
+    pub fn new_with_xdg_data_home(
+        home_dir: impl AsRef<Path>,
+        platform_config_dir: impl AsRef<Path>,
+        platform_data_dir: impl AsRef<Path>,
+        xdg_data_home: Option<&Path>,
+        source_cache_dir: impl AsRef<Path>,
+        scanner_settings: ScannerSettings,
+        approved_scope: RemoteSourceScopeTokenV1,
+    ) -> Result<Self, RemoteSourceContextError> {
+        let local = ResolvedLocalSourceContext::from_remote_explicit(
+            home_dir.as_ref(),
+            platform_config_dir.as_ref(),
+            platform_data_dir.as_ref(),
+            xdg_data_home,
+            source_cache_dir.as_ref(),
             &scanner_settings,
         )?;
         let fingerprint = RemoteSourceFingerprintV1(
@@ -348,7 +396,8 @@ pub struct ResolvedLocalSourceContext {
     /// This context was injected by a remote caller rather than captured from
     /// the local machine. Two rules follow from it, both of which exist
     /// because a remote bundle leaves the machine: scanning is confined to the
-    /// approved roots (`admits_scan_root`), and duplicate selection must not
+    /// approved roots, including a separately given XDG data root
+    /// (`admits_scan_root`), and duplicate selection must not
     /// depend on the report filter (`selection_ignores_report_filter`).
     injected_remote: bool,
     identity: [u8; 32],
@@ -417,13 +466,19 @@ impl ResolvedLocalSourceContext {
         home_dir: &Path,
         platform_config_dir: &Path,
         platform_data_local_dir: &Path,
+        xdg_data_home: Option<&Path>,
         source_cache_dir: &Path,
         scanner_settings: &ScannerSettings,
     ) -> Result<Self, RemoteSourceContextError> {
+        // `None` means "the platform data root", exactly as before this
+        // parameter existed, so every identity built without it stays
+        // byte-identical.
+        let xdg_data_home = xdg_data_home.unwrap_or(platform_data_local_dir);
         for path in [
             home_dir,
             platform_config_dir,
             platform_data_local_dir,
+            xdg_data_home,
             source_cache_dir,
         ] {
             if !path.is_absolute() || path.as_os_str().is_empty() {
@@ -469,7 +524,7 @@ impl ResolvedLocalSourceContext {
         // environment roots.  They never come from process state.
         source_env_paths.insert(
             ENV_XDG_DATA_HOME,
-            ResolvedPathInput::unavailable(platform_data_local_dir.clone()),
+            ResolvedPathInput::unavailable(xdg_data_home.to_path_buf()),
         );
         source_env_paths.insert(
             ENV_XDG_CONFIG_HOME,
@@ -491,6 +546,11 @@ impl ResolvedLocalSourceContext {
         // what an approved source-scope token binds to — for no effect. Worse,
         // on macOS it would aim `APPDATA` at a real `Application Support` tree
         // instead of the inert `home/AppData/Roaming` placeholder it is now.
+        //
+        // `LOCALAPPDATA` takes the platform data root even when a separate XDG
+        // data root was given: on Windows those are two directories
+        // (`%LOCALAPPDATA%` and `home\.local\share`), and the XDG one only
+        // feeds `XDG_DATA_HOME` above.
         #[cfg(windows)]
         {
             source_env_paths.insert(
@@ -678,8 +738,6 @@ impl ResolvedLocalSourceContext {
     /// does not exist until the scan reads the file — yet whatever is parsed
     /// there is folded into a bundle sent to a peer.
     ///
-    /// So a confined context admits a root only beneath something the
-    /// fingerprint already covers.
     /// Whether duplicate selection must ignore the report filter.
     ///
     /// The OpenCode lane otherwise lets a filtered-out authoritative copy
@@ -691,6 +749,23 @@ impl ResolvedLocalSourceContext {
         self.injected_remote
     }
 
+    /// Whether a discovered scan root may actually be scanned.
+    ///
+    /// Most roots are pure functions of the approved roots and need no check.
+    /// A few are not: a `cc-mirror` variant's `configDir` and a Crush
+    /// registry's `data_dir` are *file contents* under the home directory, and
+    /// both accept an absolute path, so whatever can write those files chooses
+    /// a scan root. Locally that is only as privileged as the app already is.
+    /// Under an injected remote context it is an escape: the caller never sees
+    /// the root, cannot approve it, and it cannot be fingerprinted because it
+    /// does not exist until the scan reads the file — yet whatever is parsed
+    /// there is folded into a bundle sent to a peer.
+    ///
+    /// So a confined context admits a root only beneath something the
+    /// fingerprint already covers. The XDG data root is read back from the
+    /// hashed environment paths rather than stored separately, so what is
+    /// admitted is exactly what was fingerprinted; without a separate XDG
+    /// root it is the platform data root, and the list is unchanged.
     pub(crate) fn admits_scan_root(&self, path: &Path) -> bool {
         if !self.injected_remote {
             return true;
@@ -706,6 +781,7 @@ impl ResolvedLocalSourceContext {
             Some(self.home_dir.as_path()),
             self.platform_config_dir.as_deref(),
             self.platform_data_local_dir.as_deref(),
+            self.source_env_path(ENV_XDG_DATA_HOME),
             self.source_cache_dir.as_deref(),
         ]
         .into_iter()
@@ -2854,6 +2930,7 @@ mod tests {
                 &root.join(name).join("home"),
                 &root.join(name).join("config"),
                 &root.join(name).join("data"),
+                None,
                 &root.join(name).join("cache"),
                 &ScannerSettings::default(),
             )
@@ -2885,6 +2962,7 @@ mod tests {
                 &root.join("home"),
                 &root.join("config"),
                 &root.join("data"),
+                None,
                 &root.join("cache"),
                 &ScannerSettings {
                     excluded_scan_paths: BTreeMap::from([("claude".to_string(), excluded)]),
@@ -2897,6 +2975,118 @@ mod tests {
             Err(RemoteSourceContextError::InvalidScannerSettings)
         ));
         assert!(build(vec![root.join("home/work-d"), PathBuf::new()]).is_ok());
+    }
+
+    /// A separate XDG data root `x` (deliberately not the platform data root
+    /// `data`) moves only `XDG_DATA_HOME` and the XdgData client roots; the
+    /// platform data root stays `data`. It is fingerprinted and admitted.
+    #[test]
+    fn remote_xdg_data_home_is_separate_fingerprinted_and_admitted() {
+        let root = fixture_root();
+        let (home, config, data, cache) = (
+            root.join("home"),
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+        );
+        let x = root.join("xdg");
+        assert_ne!(x, data);
+        let build = |xdg: Option<&Path>| {
+            ResolvedLocalSourceContext::from_remote_explicit(
+                &home,
+                &config,
+                &data,
+                xdg,
+                &cache,
+                &ScannerSettings::default(),
+            )
+            .unwrap()
+        };
+        let separate = build(Some(&x));
+        let default = build(None);
+
+        assert_eq!(
+            separate.source_env_path(ENV_XDG_DATA_HOME),
+            Some(x.as_path())
+        );
+        assert_eq!(separate.resolve_client_root(PathRoot::XdgData).unwrap(), x);
+        assert!(separate
+            .resolve_client_path(ClientId::OpenCode)
+            .unwrap()
+            .starts_with(&x));
+        assert_eq!(
+            separate.platform_data_local_dir.as_deref(),
+            Some(data.as_path())
+        );
+        #[cfg(windows)]
+        assert_eq!(separate.data_local_dir(), Some(data.as_path()));
+        assert_eq!(
+            default.source_env_path(ENV_XDG_DATA_HOME),
+            Some(data.as_path())
+        );
+
+        let fingerprint = |xdg: Option<&Path>| {
+            RemoteSourceContextV1::preview_fingerprint_with_xdg_data_home(
+                &home,
+                &config,
+                &data,
+                xdg,
+                &cache,
+                &ScannerSettings::default(),
+            )
+            .unwrap()
+        };
+        assert_ne!(fingerprint(Some(&x)), fingerprint(None));
+        assert_ne!(
+            fingerprint(Some(&x)),
+            fingerprint(Some(&root.join("xdg-2")))
+        );
+        assert_eq!(fingerprint(Some(&data)), fingerprint(None));
+
+        assert!(separate.admits_scan_root(&x.join("opencode/storage/message")));
+        assert!(!separate.admits_scan_root(&root.join("xdg-sibling/opencode")));
+        assert!(!separate.admits_scan_root(&x.join("../xdg-sibling")));
+        assert!(!default.admits_scan_root(&x.join("opencode/storage/message")));
+        assert!(default.admits_scan_root(&data.join("opencode/storage/message")));
+    }
+
+    /// Windows: with a separate XDG root, `LOCALAPPDATA` and the Zed
+    /// local-data database stay under the platform data root while the
+    /// XdgData clients move to the XDG root.
+    #[cfg(windows)]
+    #[test]
+    fn remote_windows_xdg_data_home_keeps_localappdata() {
+        let root = fixture_root();
+        let data = root.join("redirected/Local");
+        let x = root.join("profile/home/.local/share");
+        let context = ResolvedLocalSourceContext::from_remote_explicit(
+            &root.join("profile/home"),
+            &root.join("redirected/Roaming"),
+            &data,
+            Some(&x),
+            &root.join("syrtis-cache"),
+            &ScannerSettings::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            context.source_env_path(ENV_LOCALAPPDATA),
+            Some(data.as_path())
+        );
+        // The scanner's Zed candidate is `data_local_dir()/Zed/threads/threads.db`.
+        assert!(context
+            .data_local_dir()
+            .unwrap()
+            .join("Zed/threads/threads.db")
+            .starts_with(&data));
+        assert!(context
+            .resolve_client_path(ClientId::Zed)
+            .unwrap()
+            .starts_with(&x));
+        assert!(context
+            .resolve_client_path(ClientId::OpenCode)
+            .unwrap()
+            .starts_with(&x));
     }
 
     /// A redirected Windows profile: the approved platform roots are nowhere
@@ -2917,6 +3107,7 @@ mod tests {
             &home,
             &config,
             &data,
+            None,
             &root.join("syrtis-cache"),
             &ScannerSettings::default(),
         )
@@ -2957,6 +3148,7 @@ mod tests {
             &home,
             &config,
             &data,
+            None,
             &dir.path().join("syrtis-cache"),
             &ScannerSettings::default(),
         )
