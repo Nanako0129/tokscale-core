@@ -10852,7 +10852,12 @@ mod tests {
                     .find(|b| shard(b) == shard(a))
                     .map(|b| (a.clone(), b.clone()))
             })
-            .expect("two of 300 paths share a shard");
+            .unwrap_or_else(|| {
+                panic!(
+                    "no two of the {} scanned paths share a shard (300 written)",
+                    paths.len()
+                )
+            });
         let c = paths
             .iter()
             .find(|p| shard(p) != shard(&a))
