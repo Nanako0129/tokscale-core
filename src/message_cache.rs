@@ -79,6 +79,25 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Shard files a cache read on this thread, as (namespace, index), in order.
+    static SHARD_READS: std::cell::RefCell<Vec<(&'static str, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drains this thread's shard-read log.
+#[cfg(test)]
+pub(crate) fn take_shard_reads() -> Vec<(&'static str, usize)> {
+    SHARD_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+}
+
+/// The shard index `path` lands in under `identity`.
+#[cfg(test)]
+pub(crate) fn shard_index_for_test(identity: CacheIdentity, path: &Path) -> usize {
+    CacheKey::new(identity, path).shard().index
+}
+
 /// Drains this thread's lazy namespace-read log.
 #[cfg(test)]
 pub(crate) fn take_namespace_reads() -> Vec<&'static str> {
@@ -1732,10 +1751,38 @@ impl SourceMessageCache {
         Self::load_with_root_and_limit(cache_dir(), max_shard_bytes, false)
     }
 
+    /// Like [`Self::load`], but reads only the shards that `sources` map to.
+    /// Admit rules, lock and size limit are `load`'s, via the same
+    /// [`Self::read_shard`]. Sources not listed are simply absent from memory:
+    /// `save_if_dirty` re-reads every shard it rewrites from disk, so their
+    /// entries survive a save. A source that is looked up but not listed
+    /// misses (re-parse; for a history-retaining lane, retained turns are
+    /// missing from that call's output), so the list must cover every lookup.
+    /// Unlike `load`, a stale or invalid shard that is not read is not queued
+    /// for rewrite here.
+    pub(crate) fn load_for_sources(sources: &[(CacheIdentity, &Path)]) -> Self {
+        Self::load_with_root_and_limit_for(cache_dir(), MAX_CACHE_SHARD_BYTES, false, Some(sources))
+    }
+
     fn load_with_root_and_limit(
         cache_root: Option<PathBuf>,
         max_shard_bytes: u64,
         cache_root_is_resolved: bool,
+    ) -> Self {
+        Self::load_with_root_and_limit_for(
+            cache_root,
+            max_shard_bytes,
+            cache_root_is_resolved,
+            None,
+        )
+    }
+
+    /// `only`: `None` reads every namespace, `Some` just those sources' shards.
+    fn load_with_root_and_limit_for(
+        cache_root: Option<PathBuf>,
+        max_shard_bytes: u64,
+        cache_root_is_resolved: bool,
+        only: Option<&[(CacheIdentity, &Path)]>,
     ) -> Self {
         let failed_load = || Self {
             cache_root: if cache_root_is_resolved {
@@ -1786,8 +1833,27 @@ impl SourceMessageCache {
             cache_root_is_resolved,
             ..Self::default()
         };
-        for identity in CacheIdentity::all() {
-            cache.read_namespace(&shard_root, identity, max_shard_bytes);
+        match only {
+            None => {
+                for identity in CacheIdentity::all() {
+                    cache.read_namespace(&shard_root, identity, max_shard_bytes);
+                }
+            }
+            Some(sources) => {
+                let mut read: HashSet<CacheShardKey> = HashSet::new();
+                for (identity, path) in sources {
+                    let shard_key = CacheKey::new(*identity, path).shard();
+                    // Each shard once, however many sources map to it.
+                    if read.insert(shard_key.clone()) {
+                        cache.read_shard(
+                            &shard_path(&shard_root, &shard_key),
+                            shard_key,
+                            *identity,
+                            max_shard_bytes,
+                        );
+                    }
+                }
+            }
         }
 
         cache.dirty = !cache.rewrite_shards.is_empty();
@@ -1821,35 +1887,52 @@ impl SourceMessageCache {
                 namespace: identity.namespace.to_string(),
                 index,
             };
-            let path = dir_entry.path();
-            match read_shard_with_limit(&path, identity, max_shard_bytes) {
-                ShardReadStatus::Loaded(entries) => {
-                    for entry in entries {
-                        let key = CacheKey::from_entry(&entry);
-                        // A migratable entry is kept: `get` hides it from
-                        // readers that want a whole source, and it holds
-                        // the only copy of turns compaction took out of
-                        // the file. Keeping it leaves the shard clean.
-                        if key.shard() == shard_key
-                            && (entry.identity_is_current() || entry.is_migratable())
-                        {
-                            self.entries.insert(key, entry);
-                        } else {
-                            self.rewrite_shards.insert(shard_key.clone());
-                        }
-                    }
-                }
-                ShardReadStatus::Missing => {}
-                ShardReadStatus::Stale => {
-                    self.rewrite_shards.insert(shard_key);
-                }
-                ShardReadStatus::Invalid(error) => {
-                    warn_cache_failure_once("source message cache shard is invalid", &path, &error);
-                    self.rewrite_shards.insert(shard_key);
-                }
-            }
+            self.read_shard(&dir_entry.path(), shard_key, identity, max_shard_bytes);
         }
         self.dirty |= !self.rewrite_shards.is_empty();
+    }
+
+    /// Reads one shard file into `entries` with the admit rules shared by every
+    /// loader; the caller holds the shared cache lock.
+    fn read_shard(
+        &mut self,
+        path: &Path,
+        shard_key: CacheShardKey,
+        identity: CacheIdentity,
+        max_shard_bytes: u64,
+    ) {
+        #[cfg(test)]
+        SHARD_READS.with(|reads| {
+            reads
+                .borrow_mut()
+                .push((identity.namespace, shard_key.index))
+        });
+        match read_shard_with_limit(path, identity, max_shard_bytes) {
+            ShardReadStatus::Loaded(entries) => {
+                for entry in entries {
+                    let key = CacheKey::from_entry(&entry);
+                    // A migratable entry is kept: `get` hides it from
+                    // readers that want a whole source, and it holds
+                    // the only copy of turns compaction took out of
+                    // the file. Keeping it leaves the shard clean.
+                    if key.shard() == shard_key
+                        && (entry.identity_is_current() || entry.is_migratable())
+                    {
+                        self.entries.insert(key, entry);
+                    } else {
+                        self.rewrite_shards.insert(shard_key.clone());
+                    }
+                }
+            }
+            ShardReadStatus::Missing => {}
+            ShardReadStatus::Stale => {
+                self.rewrite_shards.insert(shard_key);
+            }
+            ShardReadStatus::Invalid(error) => {
+                warn_cache_failure_once("source message cache shard is invalid", path, &error);
+                self.rewrite_shards.insert(shard_key);
+            }
+        }
     }
 
     pub(crate) fn insert(&mut self, entry: CachedSourceEntry) {
@@ -7605,5 +7688,61 @@ mod tests {
         lazy.ensure_namespace_loaded(identity);
         assert_eq!(take_namespace_reads(), vec!["cursor"]);
         assert!(lazy.entries.is_empty());
+    }
+
+    /// Loading for no sources reads nothing, yet an insert + save afterwards
+    /// still keeps the shard's other entries: `save_if_dirty` merges onto the
+    /// shard it re-reads from disk. The control is the same shard read back
+    /// by a full `load()`, which holds all three entries.
+    #[test]
+    #[serial_test::serial]
+    fn test_a_save_after_an_empty_source_load_keeps_the_shards_other_entries() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let gemini = CacheIdentity::for_client(ClientId::Gemini);
+
+        let sources = TempDir::new().unwrap();
+        let mut by_shard: HashMap<usize, Vec<PathBuf>> = HashMap::new();
+        for i in 0..1500 {
+            let path = sources.path().join(format!("s{i}.json"));
+            fs::write(&path, format!("{i}")).unwrap();
+            by_shard
+                .entry(CacheKey::new(gemini, &path).shard().index)
+                .or_default()
+                .push(path);
+        }
+        let same_shard = by_shard
+            .into_values()
+            .find(|paths| paths.len() >= 3)
+            .expect("three of 1500 paths share a shard");
+
+        let mut seed = SourceMessageCache::load();
+        seed.insert(test_entry(gemini, &same_shard[0], "a"));
+        seed.insert(test_entry(gemini, &same_shard[1], "b"));
+        seed.save_if_dirty();
+        take_shard_reads();
+
+        let mut bounded = SourceMessageCache::load_for_sources(&[]);
+        assert!(
+            take_shard_reads().is_empty(),
+            "an empty key set reads no shard"
+        );
+        assert!(bounded.get(gemini, &same_shard[0]).is_none());
+        bounded.insert(test_entry(gemini, &same_shard[2], "c"));
+        bounded.save_if_dirty();
+
+        let reloaded = SourceMessageCache::load();
+        for (path, name) in [
+            (&same_shard[0], "a"),
+            (&same_shard[1], "b"),
+            (&same_shard[2], "c"),
+        ] {
+            let entry = reloaded
+                .get(gemini, path)
+                .unwrap_or_else(|| panic!("entry {name} is gone from the shard"));
+            assert_eq!(entry.messages[0].session_id, name);
+        }
+
+        restore_cache_env(prev_env);
     }
 }
