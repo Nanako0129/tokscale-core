@@ -32,6 +32,20 @@ the existing streaming scanner, source cache, parser, deduplication, and
 pricing flow into the remote report fold. They do not alter parser semantics,
 the materialized compatibility lane, or the remote wire/report schema.
 
+`RemoteSourceContextV1::new_with_xdg_data_home` and
+`preview_fingerprint_with_xdg_data_home` take one more root, the XDG data root.
+`None` is the original `new` / `preview_fingerprint` (they delegate with it):
+`XDG_DATA_HOME` takes the platform data root, and every fingerprint is
+unchanged. `Some(x)` must be absolute and non-empty; `XDG_DATA_HOME` then takes
+`x`, while the platform data root keeps feeding `LOCALAPPDATA` on Windows and
+the platform local-data root (Zed's Windows database). This lets a Windows
+caller pass `%LOCALAPPDATA%` and `home\.local\share` separately, as a local
+scan reads them. `x` is fingerprinted through the resolved environment paths
+(no new descriptor field, no `RESOLVER_CONTRACT_VERSION` bump) and remote root
+admission (`admits_scan_root`) reads it back from there.
+`tests/remote_source_report.rs::remote_fingerprint_golden` pins one remote
+fingerprint per OS.
+
 The producer pre-filters the scan with the same client and timezone-aware date
 range the fold applies, so a client's history outside the requested interval
 never reaches the fold's per-field validation. The fold keeps that gate as its
