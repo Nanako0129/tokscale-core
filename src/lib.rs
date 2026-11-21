@@ -10926,7 +10926,10 @@ mod tests {
     fn test_a_modified_after_parse_reads_only_the_shards_of_the_sources_it_scans() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let source_root = source_home.path().canonicalize().unwrap();
+        // As given, not canonicalized. With a canonicalized home the scan
+        // returned no files on the Windows CI lane; canonicalize yields a
+        // `\\?\` path there, which is the likely reason (not verified).
+        let source_root = source_home.path().to_path_buf();
         let _env = EnvGuard::set(&[
             ("HOME", cache_home.path().as_os_str()),
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
@@ -11012,7 +11015,10 @@ mod tests {
     fn test_a_modified_after_parse_keeps_retained_history_of_a_scanned_claude_file() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let source_root = source_home.path().canonicalize().unwrap();
+        // As given, not canonicalized. With a canonicalized home the scan
+        // returned no files on the Windows CI lane; canonicalize yields a
+        // `\\?\` path there, which is the likely reason (not verified).
+        let source_root = source_home.path().to_path_buf();
         let _env = EnvGuard::set(&[
             ("HOME", cache_home.path().as_os_str()),
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
