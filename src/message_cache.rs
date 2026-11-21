@@ -1635,6 +1635,9 @@ pub(crate) struct SourceMessageCache {
     /// Namespaces already read (or attempted, so a failing read is not
     /// retried per file) by a lazy cache.
     loaded_namespaces: HashSet<&'static str>,
+    /// Set by [`Self::load_for_sources`]: the only shards it read. A lookup
+    /// outside them would miss silently, so debug builds assert on it.
+    bounded_shards: Option<HashSet<CacheShardKey>>,
 }
 
 impl SourceMessageCache {
@@ -1733,6 +1736,18 @@ impl SourceMessageCache {
         );
     }
 
+    /// A bounded cache holds only the shards it was asked for; a lookup of a
+    /// key outside them would miss silently, so the caller's key list is wrong.
+    fn debug_assert_listed(&self, key: &CacheKey) {
+        debug_assert!(
+            self.bounded_shards
+                .as_ref()
+                .is_none_or(|shards| shards.contains(&key.shard())),
+            "{:?} looked up but not listed in load_for_sources",
+            key.path.to_path_buf()
+        );
+    }
+
     pub(crate) fn load() -> Self {
         Self::load_with_root_and_limit(cache_dir(), MAX_CACHE_SHARD_BYTES, false)
     }
@@ -1758,8 +1773,11 @@ impl SourceMessageCache {
     /// entries survive a save. A source that is looked up but not listed
     /// misses (re-parse; for a history-retaining lane, retained turns are
     /// missing from that call's output), so the list must cover every lookup.
-    /// Unlike `load`, a stale or invalid shard that is not read is not queued
-    /// for rewrite here.
+    /// Two things a full `load` does that this does not, both for unread
+    /// shards: a stale or invalid shard is not queued for rewrite, and
+    /// `prune_missing_files()` only sees entries of the shards that were read,
+    /// so entries of deleted sources in unread shards stay on disk until a
+    /// full load.
     pub(crate) fn load_for_sources(sources: &[(CacheIdentity, &Path)]) -> Self {
         Self::load_with_root_and_limit_for(cache_dir(), MAX_CACHE_SHARD_BYTES, false, Some(sources))
     }
@@ -1853,6 +1871,7 @@ impl SourceMessageCache {
                         );
                     }
                 }
+                cache.bounded_shards = Some(read);
             }
         }
 
@@ -1946,6 +1965,7 @@ impl SourceMessageCache {
     pub(crate) fn get(&self, identity: CacheIdentity, path: &Path) -> Option<&CachedSourceEntry> {
         self.debug_assert_loaded(identity);
         let key = CacheKey::new(identity, path);
+        self.debug_assert_listed(&key);
         self.entries.get(&key).filter(|entry| {
             entry.parser_namespace == identity.namespace
                 && entry.parser_version == identity.parser_version
@@ -1962,10 +1982,12 @@ impl SourceMessageCache {
         path: &Path,
     ) -> &[UnifiedMessage] {
         self.debug_assert_loaded(identity);
+        let key = CacheKey::new(identity, path);
+        self.debug_assert_listed(&key);
         // No version filter: `load` admits only current-or-migratable entries
         // and `insert` builds current ones.
         self.entries
-            .get(&CacheKey::new(identity, path))
+            .get(&key)
             .map_or(&[][..], |entry| entry.messages.as_slice())
     }
 
@@ -7727,7 +7749,6 @@ mod tests {
             take_shard_reads().is_empty(),
             "an empty key set reads no shard"
         );
-        assert!(bounded.get(gemini, &same_shard[0]).is_none());
         bounded.insert(test_entry(gemini, &same_shard[2], "c"));
         bounded.save_if_dirty();
 
@@ -7744,5 +7765,45 @@ mod tests {
         }
 
         restore_cache_env(prev_env);
+    }
+
+    /// A bounded cache must not answer for a key whose shard it never read:
+    /// debug builds assert, since the miss would otherwise be silent.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial]
+    fn test_a_lookup_outside_the_listed_sources_asserts_in_a_bounded_cache() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let gemini = CacheIdentity::for_client(ClientId::Gemini);
+        let source = write_temp_file(b"x");
+        let listed = write_temp_file(b"y");
+        // Find a listed path on a different shard than `source`.
+        let bounded = SourceMessageCache::load_for_sources(&[(gemini, listed.path())]);
+        let same_shard = CacheKey::new(gemini, source.path()).shard()
+            == CacheKey::new(gemini, listed.path()).shard();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bounded.get(gemini, source.path()).is_none()
+        }));
+        let listed_lookup = bounded.get(gemini, listed.path()).is_none();
+        restore_cache_env(prev_env);
+
+        assert!(
+            listed_lookup,
+            "control: a listed key is looked up without a panic"
+        );
+        if same_shard {
+            // 1 in 256: the two temp paths collided, so nothing to assert.
+            return;
+        }
+        let payload = outcome.expect_err("an unlisted key must assert");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("not listed in load_for_sources"),
+            "{message}"
+        );
     }
 }

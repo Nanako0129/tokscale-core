@@ -10823,24 +10823,47 @@ mod tests {
         );
     }
 
-    /// Shared fixture for the bounded-load tests: `count` Claude transcript
-    /// paths under `source_home` that land on distinct shards.
-    fn claude_home_with_distinct_shards(source_home: &Path, count: usize) -> Vec<PathBuf> {
+    /// Fixture for the bounded-load tests: three Claude transcripts, as paths
+    /// the scanner yields, where the first two share a shard and the third is
+    /// on another. The paths come from a scan of the real directory rather than
+    /// from a hand-built join, so their spelling (and so their shard) is the
+    /// one the parse looks up on every platform. Unused candidates are removed.
+    fn claude_fixture(source_home: &Path) -> [PathBuf; 3] {
         let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
         let dir = source_home.join(".claude").join("projects").join("p");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut shards = HashSet::new();
-        let mut paths = Vec::new();
-        for i in 0.. {
-            let path = dir.join(format!("session-{i}.jsonl"));
-            if shards.insert(message_cache::shard_index_for_test(identity, &path)) {
-                paths.push(path);
-                if paths.len() == count {
-                    return paths;
-                }
+        for i in 0..300 {
+            std::fs::write(dir.join(format!("session-{i}.jsonl")), "").unwrap();
+        }
+        let scanned = scanner::scan_all_clients_with_scanner_settings(
+            source_home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        let paths = scanned.get(ClientId::Claude).clone();
+        let shard = |p: &PathBuf| message_cache::shard_index_for_test(identity, p);
+        let (a, b) = paths
+            .iter()
+            .enumerate()
+            .find_map(|(i, a)| {
+                paths[i + 1..]
+                    .iter()
+                    .find(|b| shard(b) == shard(a))
+                    .map(|b| (a.clone(), b.clone()))
+            })
+            .expect("two of 300 paths share a shard");
+        let c = paths
+            .iter()
+            .find(|p| shard(p) != shard(&a))
+            .expect("a path on another shard")
+            .clone();
+        for path in &paths {
+            if *path != a && *path != b && *path != c {
+                std::fs::remove_file(path).unwrap();
             }
         }
-        unreachable!()
+        [a, b, c]
     }
 
     fn claude_line(id: &str, output: i64) -> String {
@@ -10885,10 +10908,14 @@ mod tests {
         outputs
     }
 
-    /// I1 + I2 + I3 for a `modified_after` call: it returns what the unbounded
-    /// load returns for the same sources, leaves the out-of-threshold source's
-    /// shard byte-identical on disk, and reads only the in-threshold source's
-    /// shard. `modified_after = None` is the control that reads both.
+    /// I1 + I2 + I3 for a `modified_after` call. Of three transcripts, `fresh`
+    /// is inside the threshold; `sibling` is outside it on the SAME shard as
+    /// `fresh`; `far` is outside it on another shard. The call returns only
+    /// what it scanned, reads only `fresh`'s shard (not `far`'s), and its save
+    /// of that shard keeps `sibling`'s entry equal on disk (the save merges onto
+    /// the shard it re-reads, so an entry the call never looked up survives).
+    /// `far`'s shard file is also byte-identical. `modified_after = None` is
+    /// the control that reads every shard.
     #[test]
     #[serial_test::serial]
     fn test_a_modified_after_parse_reads_only_the_shards_of_the_sources_it_scans() {
@@ -10900,34 +10927,44 @@ mod tests {
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
         let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
-        let paths = claude_home_with_distinct_shards(&source_root, 2);
-        let (fresh, old) = (&paths[0], &paths[1]);
-        std::fs::write(fresh, format!("{}\n", claude_line("fresh", 10))).unwrap();
-        std::fs::write(old, format!("{}\n", claude_line("old", 70))).unwrap();
+        let [fresh, sibling, far] = claude_fixture(&source_root);
+        std::fs::write(&fresh, format!("{}\n", claude_line("fresh", 10))).unwrap();
+        std::fs::write(&sibling, format!("{}\n", claude_line("sibling", 70))).unwrap();
+        std::fs::write(&far, format!("{}\n", claude_line("far", 90))).unwrap();
 
         let full = parse_local_clients(claude_local_options(&source_root, None)).unwrap();
-        assert_eq!(sorted_outputs(&full.messages), vec![10, 70]);
+        assert_eq!(sorted_outputs(&full.messages), vec![10, 70, 90]);
         // The first call found an empty cache; this one reads the shards it wrote.
         message_cache::take_shard_reads();
         parse_local_clients(claude_local_options(&source_root, None)).unwrap();
         let reads = message_cache::take_shard_reads();
-        let fresh_shard = message_cache::shard_index_for_test(identity, fresh);
-        let old_shard = message_cache::shard_index_for_test(identity, old);
+        let fresh_shard = message_cache::shard_index_for_test(identity, &fresh);
+        let far_shard = message_cache::shard_index_for_test(identity, &far);
         assert!(
-            reads.contains(&("claude", fresh_shard)) && reads.contains(&("claude", old_shard)),
+            reads.contains(&("claude", fresh_shard)) && reads.contains(&("claude", far_shard)),
             "control: an unbounded load reads both shards, got {reads:?}"
         );
 
-        set_mtime_ago(old, std::time::Duration::from_secs(2 * 3600));
-        let old_shard_path = crate::paths::get_cache_dir()
+        set_mtime_ago(&sibling, std::time::Duration::from_secs(2 * 3600));
+        set_mtime_ago(&far, std::time::Duration::from_secs(2 * 3600));
+        let far_shard_path = crate::paths::get_cache_dir()
             .join("source-message-cache-v2")
             .join("claude")
-            .join(format!("shard-{old_shard:02x}.bin"));
-        let old_shard_bytes = std::fs::read(&old_shard_path)
-            .unwrap_or_else(|e| panic!("the old source's shard is at {old_shard_path:?}: {e}"));
+            .join(format!("shard-{far_shard:02x}.bin"));
+        let far_shard_bytes = std::fs::read(&far_shard_path)
+            .unwrap_or_else(|e| panic!("the far source's shard is at {far_shard_path:?}: {e}"));
+        let sibling_entry = || {
+            let cache = message_cache::SourceMessageCache::load();
+            let entry = cache
+                .get(identity, &sibling)
+                .expect("the sibling's entry is on disk");
+            format!("{entry:?}")
+        };
+        let sibling_before = sibling_entry();
+        message_cache::take_shard_reads();
         // A change inside the threshold, so the call has a shard to save.
         std::fs::write(
-            fresh,
+            &fresh,
             format!(
                 "{}\n{}\n",
                 claude_line("fresh", 10),
@@ -10947,15 +10984,20 @@ mod tests {
         assert_eq!(
             message_cache::take_shard_reads(),
             vec![("claude", fresh_shard)],
-            "the bounded call reads only the shard of its one in-threshold source"
+            "the bounded call reads only the shard of its in-threshold source"
         );
         assert_eq!(
-            std::fs::read(&old_shard_path).unwrap(),
-            old_shard_bytes,
-            "the out-of-threshold source's shard must be untouched by the save"
+            std::fs::read(&far_shard_path).unwrap(),
+            far_shard_bytes,
+            "a shard the call never read must be untouched by the save"
+        );
+        assert_eq!(
+            sibling_entry(),
+            sibling_before,
+            "the save of fresh's shard must keep the unlisted sibling's entry"
         );
         let after = parse_local_clients(claude_local_options(&source_root, None)).unwrap();
-        assert_eq!(sorted_outputs(&after.messages), vec![10, 20, 70]);
+        assert_eq!(sorted_outputs(&after.messages), vec![10, 20, 70, 90]);
     }
 
     /// The Claude lane retains history, so its key list decides the output:
@@ -10970,12 +11012,13 @@ mod tests {
             ("HOME", cache_home.path().as_os_str()),
             ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
         ]);
-        let paths = claude_home_with_distinct_shards(&source_root, 2);
-        let (compacted, other) = (&paths[0], &paths[1]);
+        let [compacted, unused, other] = claude_fixture(&source_root);
+        std::fs::remove_file(&unused).unwrap();
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
         let live = claude_line("live", 10);
         let dropped = claude_line("dropped", 50);
-        std::fs::write(compacted, format!("{live}\n{dropped}\n")).unwrap();
-        std::fs::write(other, format!("{}\n", claude_line("other", 70))).unwrap();
+        std::fs::write(&compacted, format!("{live}\n{dropped}\n")).unwrap();
+        std::fs::write(&other, format!("{}\n", claude_line("other", 70))).unwrap();
         let outputs = |modified_after| {
             sorted_outputs(
                 &parse_local_clients(claude_local_options(&source_root, modified_after))
@@ -10984,19 +11027,27 @@ mod tests {
             )
         };
         assert_eq!(outputs(None), vec![10, 50, 70]);
-        std::fs::write(compacted, format!("{live}\n")).unwrap();
+        std::fs::write(&compacted, format!("{live}\n")).unwrap();
         assert_eq!(
             outputs(None),
             vec![10, 50, 70],
             "sanity: the unbounded load retains the compacted-away turn"
         );
 
-        set_mtime_ago(other, std::time::Duration::from_secs(2 * 3600));
+        set_mtime_ago(&other, std::time::Duration::from_secs(2 * 3600));
         message_cache::take_shard_reads();
         assert_eq!(
             outputs(Some(one_hour_ago_ms())),
             vec![10, 50],
             "the bounded load must still see the retained turn of the scanned file"
+        );
+        assert_eq!(
+            message_cache::take_shard_reads(),
+            vec![(
+                "claude",
+                message_cache::shard_index_for_test(identity, &compacted)
+            )],
+            "the bounded loader ran: it read only the compacted file's shard"
         );
     }
 
